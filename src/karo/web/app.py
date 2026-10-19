@@ -395,7 +395,7 @@ def _run_confirmed(request: Request, conn: sqlite3.Connection, link: approvals.L
 
 # Answers that tell the provider "received, don't send it again". A 401 is for a notice that isn't to be believed.
 _ACCEPTED = frozenset({"credited", "duplicate", "unknown"})
-CHECKOUT_GONE = "This checkout isn't available. Ask for a new payment link."
+CHECKOUT_GONE = "This checkout isn't available. Ask the main payer to send a reminder for a new link."
 
 
 def _standin(request: Request) -> StandInProvider | None:
@@ -419,14 +419,15 @@ def standin_checkout(tx_ref: str, request: Request, conn: sqlite3.Connection = D
         "standin_pay.html",
         headers=_PIN_PAGE_HEADERS,
         amount=str(amount),
-        paid=collection["status"] != "pending",
+        state=collection["status"],
     )
 
 
 @router.post("/standin/pay/{tx_ref}")
 def standin_pay(tx_ref: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     provider = _standin(request)
-    if provider is None or store.collection_by_tx_ref(conn, tx_ref) is None:
+    collection = None if provider is None else store.collection_by_tx_ref(conn, tx_ref)
+    if collection is None or collection["status"] == "failed":
         return _checkout_missing(request, conn)
     try:
         headers, body = provider.mark_paid(tx_ref)

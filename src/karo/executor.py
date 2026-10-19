@@ -13,8 +13,9 @@ A split commits its shares first, then asks each relative for their payment link
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Literal
 
@@ -26,7 +27,11 @@ from karo.money import Money
 from karo.providers.base import PayoutResult, Provider
 from karo.rules import Decision, Outcome
 
+logger = logging.getLogger(__name__)
+
 ExecutionStatus = Literal["executed", "failed", "pending", "blocked", "waiting", "not_confirmed", "unsupported"]
+
+LINKS_LATER = "Some payment links couldn't be sent yet; Karo will retry when you send reminders."
 
 ALLOWANCE_DAY = 1  # the demo's "1st of the month"; a chosen day comes later
 
@@ -88,9 +93,7 @@ def execute(
         raise RuntimeError("execute must not run inside a transaction.")
     step = _prepare(conn, provider.name, family_id=family_id, proposal_id=proposal_id, now=now)
     if isinstance(step, _SplitDone):
-        # Not inside _prepare's transaction: a link is a provider call, and the shares must be saved before it.
-        collections.request_all(conn, provider, family_id=family_id, fee_id=step.fee_id, now=now, base_url=base_url)
-        return step.outcome
+        return _ask_for_shares(conn, provider, step, family_id=family_id, now=now, base_url=base_url)
     if isinstance(step, ExecutionOutcome):
         return step
     if step.is_new:
@@ -104,6 +107,31 @@ def execute(
             # Providers deduplicate by reference, so if the first call did land this pays nothing twice.
             result = _send(provider, step)
     return _settle(conn, step, result, now)
+
+
+def _ask_for_shares(
+    conn: sqlite3.Connection, provider: Provider, done: _SplitDone, *, family_id: str, now: datetime, base_url: str
+) -> ExecutionOutcome:
+    """Not inside _prepare's transaction: a link is a provider call, and the shares must be saved before it.
+
+    The split is done whatever happens here. If the links fail partway the main payer is told, and sending reminders
+    asks again for every share still without one."""
+    try:
+        collections.request_all(conn, provider, family_id=family_id, fee_id=done.fee_id, now=now, base_url=base_url)
+    except Exception as error:
+        logger.exception("payment links failed after a split")
+        with db.transaction(conn):
+            audit.record(
+                conn,
+                at=now,
+                family_id=family_id,
+                actor="system",
+                event="collection.error",
+                data={"fee_id": done.fee_id, "error": type(error).__name__},
+            )
+            outbox.notify(conn, store.main_payer(conn, family_id).id, LINKS_LATER, now)
+        return replace(done.outcome, message=f"{done.outcome.message} {LINKS_LATER}")
+    return done.outcome
 
 
 def _send(provider: Provider, job: _PayoutJob) -> PayoutResult:

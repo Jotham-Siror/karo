@@ -484,6 +484,13 @@ def collection_by_tx_ref(conn: sqlite3.Connection, tx_ref: str) -> sqlite3.Row |
     return conn.execute("SELECT * FROM collections WHERE tx_ref = ?", (tx_ref,)).fetchone()
 
 
+def pending_collections(conn: sqlite3.Connection, family_id: str, share_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM collections WHERE family_id = ? AND share_id = ? AND status = 'pending' ORDER BY rowid",
+        (family_id, share_id),
+    ).fetchall()
+
+
 def latest_pending_collection(conn: sqlite3.Connection, family_id: str, share_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM collections WHERE family_id = ? AND share_id = ? AND status = 'pending' "

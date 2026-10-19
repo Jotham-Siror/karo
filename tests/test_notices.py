@@ -93,6 +93,22 @@ class Down(Wrapped):
         return self.inner.verify_collection(tx_ref)
 
 
+class Overlapping(Wrapped):
+    """While the first copy of a notice is being re-checked, a second copy of it arrives and is handled in full."""
+
+    def __init__(self, inner, conn, headers, body) -> None:
+        super().__init__(inner)
+        self.conn, self.headers, self.body = conn, headers, body
+        self.entered = False
+        self.second_copy: str | None = None
+
+    def verify_collection(self, tx_ref):
+        if not self.entered:
+            self.entered = True
+            self.second_copy = notices.handle_notice(self.conn, self, headers=self.headers, body=self.body, now=NOW)
+        return self.inner.verify_collection(tx_ref)
+
+
 class Watching(Wrapped):
     """Remembers whether a transaction was open on `conn` at each provider call."""
 
@@ -258,11 +274,28 @@ def test_when_every_share_is_paid_the_main_payer_is_told_to_pay_the_fees(conn, p
 
 
 def test_a_second_payment_on_a_paid_share_does_not_announce_the_fee_again(conn, provider):
-    # Catches: "All shares are in" (and fee.collected) repeating each time a stray extra payment lands.
+    # Catches: "All shares are in" (and fee.collected) repeating when a stray extra payment lands, as it could if a
+    # share ever held two live links (data from before the one-live-link rule).
     share_id = add_share(conn, new_fee(conn), "m_baraka", "3000.00")
-    first, second = ask(conn, provider, share_id), ask(conn, provider, share_id)
+    first = ask(conn, provider, share_id)
+    conn.execute(
+        "INSERT INTO collections SELECT 'col_clone', share_id, family_id, provider, 'karo-col_clone', link, "
+        "amount_minor, currency, credit_minor, credit_currency, status, provider_id, created_at, updated_at "
+        "FROM collections WHERE id = ?",
+        (first["id"],),
+    )
+    provider.create_collection(
+        tx_ref="karo-col_clone",
+        amount=local_of(first),
+        method="mpesa",
+        payer_name="Baraka",
+        payer_email="b@example.com",
+        payer_phone=None,
+        redirect_url=f"{BASE_URL}/paid",
+    )
+    second = conn.execute("SELECT * FROM collections WHERE id = 'col_clone'").fetchone()
     pay(conn, provider, first)
-    pay(conn, provider, second)
+    assert pay(conn, provider, second) == "credited"
     assert sum(ALL_IN in t for t in texts(conn, "m_amina")) == 1
     assert len(events(conn, "fee.collected")) == 1
 
@@ -342,20 +375,37 @@ def test_a_notice_that_could_not_be_confirmed_can_be_sent_again_once_it_can(conn
     collection = one_share(conn, provider)
     body = body_for(collection["tx_ref"])
     assert handle(conn, provider, sign(body), body) == "unverified"
+    assert count(conn, "provider_events") == 0
     headers, same_body = provider.mark_paid(collection["tx_ref"])
     assert same_body == body
     assert handle(conn, provider, headers, same_body) == "credited"
 
 
-def test_a_provider_failure_during_the_recheck_leaves_the_notice_to_be_retried(conn, provider):
-    # Catches: a dropped connection during the re-check turning the provider's retry into a "duplicate".
-    collection = one_share(conn, provider)
+def test_a_crash_during_the_recheck_leaves_no_trace_and_the_retry_credits_once(conn, provider):
+    # Catches: the event id saved before the payment is confirmed, so a crash mid-check turns the provider's retry
+    # into a "duplicate" and the payment is never credited.
+    share_id = add_share(conn, new_fee(conn), "m_baraka", "3000.00")
+    collection = ask(conn, provider, share_id)
     headers, body = provider.mark_paid(collection["tx_ref"])
     down = Down(provider)
     with pytest.raises(ConnectionError):
         handle(conn, down, headers, body)
-    assert ledger_rows(conn) == []
+    assert ledger_rows(conn) == [] and count(conn, "provider_events") == 0
     assert handle(conn, down, headers, body) == "credited"
+    assert handle(conn, down, headers, body) == "duplicate"
+    assert len(ledger_rows(conn)) == 1 and paid_of(conn, share_id) == gbp("3000.00").minor
+
+
+def test_a_copy_that_arrives_during_the_recheck_cannot_credit_a_second_time(conn, provider):
+    # Catches: two copies of one notice both passing the "seen it?" look before either has credited, and both paying.
+    share_id = add_share(conn, new_fee(conn), "m_baraka", "3000.00")
+    collection = ask(conn, provider, share_id)
+    headers, body = provider.mark_paid(collection["tx_ref"])
+    overlapping = Overlapping(provider, conn, headers, body)
+    assert handle(conn, overlapping, headers, body) == "duplicate"
+    assert overlapping.second_copy == "credited"
+    assert len(ledger_rows(conn)) == 1 and paid_of(conn, share_id) == gbp("3000.00").minor
+    assert len(texts(conn, "m_amina")) == 1 and count(conn, "provider_events") == 1
 
 
 @pytest.mark.parametrize("tx_ref", ["karo-col_nobody", None])
@@ -380,6 +430,7 @@ def test_a_failure_part_way_leaves_nothing_half_credited(conn, provider):
         handle(conn, provider, headers, body)
     assert conn.execute("SELECT status FROM collections").fetchone()[0] == "pending"
     assert ledger_rows(conn) == [] and paid_of(conn, share_id) == 0 and texts(conn, "m_amina") == []
+    assert count(conn, "provider_events") == 0
     conn.execute("DROP TRIGGER boom")
     assert handle(conn, provider, headers, body) == "credited"
 

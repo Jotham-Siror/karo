@@ -2,8 +2,10 @@
 {% block title %}Stand-in checkout (simulated, no real money) · Karo{% endblock %}
 {% block content %}
 <h1>Stand-in checkout (simulated, no real money)</h1>
-{% if paid %}
+{% if state == "succeeded" %}
 <p class="notice info">This payment has already been made.</p>
+{% elif state == "failed" %}
+<p class="notice bad">This link is no longer valid. Ask the main payer to send a reminder for a new link.</p>
 {% else %}
 <p class="summary">Amount to pay: {{ amount }}</p>
 <form method="post" class="card">

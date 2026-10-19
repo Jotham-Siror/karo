@@ -19,6 +19,7 @@ PIN = "4821"
 PEPPER = "test-pepper"
 BASE_URL = "https://karo.example"
 SHARES = (("m_baraka", "3000.00"), ("m_nakato", "2000.00"), ("m_amina", "1000.00"))
+LINKS_LATER = "Some payment links couldn't be sent yet; Karo will retry when you send reminders."
 
 
 def gbp(amount: str) -> Money:
@@ -69,6 +70,25 @@ class Recording:
         self.calls.append(kwargs)
         self.in_transaction.append(self.conn.in_transaction)
         return self.inner.create_collection(**kwargs)
+
+
+class Flaky(Recording):
+    """The `fail_on`th request for a link fails like a dropped connection. The others go through."""
+
+    def __init__(self, inner, conn, *, fail_on: int) -> None:
+        super().__init__(inner, conn)
+        self.fail_on = fail_on
+
+    def create_collection(self, **kwargs):
+        if len(self.calls) + 1 == self.fail_on:
+            self.calls.append(kwargs)
+            raise ConnectionError("connection dropped")
+        return super().create_collection(**kwargs)
+
+
+def restarted() -> StandInProvider:
+    """A stand-in that has lost every payment it knew of, as after a restart."""
+    return StandInProvider.from_config("standin-test-secret", BASE_URL)
 
 
 def new_fee(conn, family_id: str = FAM) -> str:
@@ -341,11 +361,91 @@ def test_running_a_split_twice_asks_for_the_links_once(conn, provider):
     assert count(conn, "collections") == 3
 
 
+# --- a share that has no working link ----------------------------------------------------------
+
+
+def live_links(conn, share_id: str) -> list:
+    return conn.execute("SELECT * FROM collections WHERE share_id = ? AND status = 'pending'", (share_id,)).fetchall()
+
+
+def share_of(conn, member_id: str) -> str:
+    return conn.execute("SELECT id FROM shares WHERE member_id = ?", (member_id,)).fetchone()[0]
+
+
+def test_a_split_where_one_link_request_fails_still_counts_and_says_so(conn, provider):
+    # Catches: a split that is saved but whose result says "being processed" (or crashes) when links never went out.
+    flaky = Flaky(provider, conn, fail_on=2)
+    _, proposal_id = confirmed_split(conn)
+    outcome = run(conn, flaky, proposal_id)
+    assert outcome.status == "executed" and outcome.message.endswith(LINKS_LATER)
+    assert "processed" not in outcome.message
+    assert count(conn, "shares") == 3 and count(conn, "collections") == 1
+    assert texts(conn, "m_amina")[-1] == LINKS_LATER
+    (logged,) = events(conn, "collection.error")
+    assert logged["data"]["error"] == "ConnectionError"
+
+
+def test_reminders_give_a_share_that_has_no_link_a_working_one(conn, provider):
+    # Catches: a share stranded for good after a failed link request, because reminders skipped it.
+    fee_id, proposal_id = confirmed_split(conn)
+    run(conn, Flaky(provider, conn, fail_on=2), proposal_id)
+    assert live_links(conn, share_of(conn, "m_nakato")) == []
+    assert remind(conn, provider, fee_id) == 3
+    for member_id in ("m_nakato", "m_amina"):
+        (link,) = live_links(conn, share_of(conn, member_id))
+        assert provider.verify_collection(link["tx_ref"]).status == "pending"
+        assert [t for t in texts(conn, member_id) if link["link"] in t]
+    assert not any(t.startswith("Reminder") for m in ("m_nakato", "m_amina") for t in texts(conn, m))
+
+
+def test_asking_again_asks_only_the_shares_without_a_live_link(conn, provider):
+    # Catches: a retry that sends a second link to everyone who already has one.
+    fee_id, proposal_id = confirmed_split(conn)
+    run(conn, Flaky(provider, conn, fail_on=2), proposal_id)
+    asked = collections.request_all(conn, provider, family_id=FAM, fee_id=fee_id, now=NOW, base_url=BASE_URL)
+    assert asked == 2
+    assert [len(live_links(conn, share_of(conn, m))) for m in ("m_baraka", "m_nakato", "m_amina")] == [1, 1, 1]
+    assert collections.request_all(conn, provider, family_id=FAM, fee_id=fee_id, now=NOW, base_url=BASE_URL) == 0
+    assert count(conn, "collections") == 3
+
+
+def test_a_link_the_provider_has_lost_is_replaced_and_the_old_one_failed(conn, provider):
+    # Catches: a share left holding a dead link after a restart, or holding two live links that could both be paid.
+    share_id = add_share(conn, new_fee(conn), "m_nakato", "2000.00")
+    old_id = request(conn, provider, share_id)
+    new_id = request(conn, restarted(), share_id)
+    assert new_id is not None and new_id != old_id
+    status = {r["id"]: r["status"] for r in conn.execute("SELECT id, status FROM collections")}
+    assert status == {old_id: "failed", new_id: "pending"}
+    assert [e["data"]["collection_id"] for e in events(conn, "collection.failed")] == [old_id]
+
+
+def test_a_link_the_provider_still_knows_is_not_replaced(conn, provider):
+    # Catches: asking twice giving a share two live links, so it could be paid twice.
+    recording = Recording(provider, conn)
+    share_id = add_share(conn, new_fee(conn), "m_nakato", "2000.00")
+    first = request(conn, recording, share_id)
+    assert request(conn, recording, share_id) is None
+    assert len(recording.calls) == 1 and count(conn, "collections") == 1
+    assert conn.execute("SELECT status FROM collections WHERE id = ?", (first,)).fetchone()[0] == "pending"
+
+
+def test_a_link_whose_payment_is_not_yet_booked_is_not_replaced(conn, provider):
+    # Catches: replacing a link that has just been paid (the notice not arrived yet) and asking the payer to pay again.
+    share_id = add_share(conn, new_fee(conn), "m_nakato", "2000.00")
+    collection_id = request(conn, provider, share_id)
+    provider.mark_paid(conn.execute("SELECT tx_ref FROM collections").fetchone()[0])
+    assert request(conn, provider, share_id) is None
+    assert conn.execute("SELECT status FROM collections WHERE id = ?", (collection_id,)).fetchone()[0] == "pending"
+
+
 # --- reminders ---------------------------------------------------------------------------------
 
 
-def remind(conn, fee_id: str, family_id: str = FAM, **kw) -> int:
-    return collections.send_reminders(conn, family_id=family_id, fee_id=fee_id, now=NOW, **kw)
+def remind(conn, provider, fee_id: str, family_id: str = FAM, **kw) -> int:
+    return collections.send_reminders(
+        conn, provider, family_id=family_id, fee_id=fee_id, now=NOW, base_url=BASE_URL, **kw
+    )
 
 
 def test_reminders_go_only_to_members_who_still_owe(conn, provider):
@@ -353,56 +453,89 @@ def test_reminders_go_only_to_members_who_still_owe(conn, provider):
     fee_id = run_split(conn, provider)
     conn.execute("UPDATE shares SET paid_minor = amount_minor WHERE member_id = 'm_baraka'")
     before = {m: len(texts(conn, m)) for m in ("m_baraka", "m_nakato", "m_amina")}
-    assert remind(conn, fee_id) == 2
+    assert remind(conn, provider, fee_id) == 2
     assert len(texts(conn, "m_baraka")) == before["m_baraka"]
     assert len(texts(conn, "m_nakato")) == before["m_nakato"] + 1
     assert len(texts(conn, "m_amina")) == before["m_amina"] + 1
 
 
-def test_a_reminder_says_what_is_left_and_carries_the_latest_pending_link(conn, provider):
-    # Catches: a reminder for the full share after part-payment, or one with an old link instead of the newest.
+def test_a_reminder_says_what_is_left_and_carries_the_shares_link(conn, provider):
+    # Catches: a reminder for the full share after part-payment, or one without the link to pay with.
     fee_id = new_fee(conn)
     share_id = add_share(conn, fee_id, "m_nakato", "2000.00", paid="500.00")
-    first, second = request(conn, provider, share_id), request(conn, provider, share_id)
-    link = {c: conn.execute("SELECT link FROM collections WHERE id = ?", (c,)).fetchone()[0] for c in (first, second)}
-    assert link[first] != link[second]
-    assert remind(conn, fee_id) == 1
+    collection_id = request(conn, provider, share_id)
+    link = conn.execute("SELECT link FROM collections WHERE id = ?", (collection_id,)).fetchone()[0]
+    assert remind(conn, provider, fee_id) == 1
     assert texts(conn, "m_nakato")[-1] == (
-        f"Reminder: your share GBP 1,500.00 for University of Westbridge is still due. Pay here: {link[second]}"
+        f"Reminder: your share GBP 1,500.00 for University of Westbridge is still due. Pay here: {link}"
     )
 
 
-@pytest.mark.parametrize("status", ["succeeded", "failed"])
-def test_a_used_or_failed_link_is_not_sent_as_a_reminder(conn, provider, status):
-    # Catches: a reminder carrying a link that has already been used or has failed, which pays nothing.
+def test_a_dead_link_is_replaced_before_the_reminder_not_sent_again(conn, provider):
+    # Catches: a reminder that re-sends a link the provider no longer has, which can never be paid.
     fee_id = new_fee(conn)
-    request(conn, provider, add_share(conn, fee_id, "m_nakato", "2000.00"))
-    conn.execute("UPDATE collections SET status = ?", (status,))
-    assert remind(conn, fee_id) == 0
+    share_id = add_share(conn, fee_id, "m_nakato", "2000.00")
+    old_id = request(conn, provider, share_id)
+    old_link = conn.execute("SELECT link FROM collections WHERE id = ?", (old_id,)).fetchone()[0]
+    assert remind(conn, restarted(), fee_id) == 1
+    (fresh,) = live_links(conn, share_id)
+    assert fresh["id"] != old_id and fresh["link"] in texts(conn, "m_nakato")[-1]
+    assert not any(old_link in t for t in texts(conn, "m_nakato")[1:])
     assert not any(t.startswith("Reminder") for t in texts(conn, "m_nakato"))
 
 
-def test_a_member_with_no_link_yet_gets_no_reminder(conn, provider):
-    # Catches: a reminder to "pay here" with nothing after it.
+def test_a_failed_collection_is_not_sent_as_a_reminder(conn, provider):
+    # Catches: a reminder carrying a link already marked failed.
     fee_id = new_fee(conn)
+    share_id = add_share(conn, fee_id, "m_nakato", "2000.00")
+    request(conn, provider, share_id)
+    conn.execute("UPDATE collections SET status = 'failed'")
+    assert remind(conn, provider, fee_id) == 1
+    (fresh,) = live_links(conn, share_id)
+    assert fresh["link"] in texts(conn, "m_nakato")[-1]
+
+
+def test_a_member_with_no_link_yet_is_sent_one(conn, provider):
+    # Catches: a share with no link at all getting silence, so it can never be paid.
+    fee_id = new_fee(conn)
+    share_id = add_share(conn, fee_id, "m_nakato", "2000.00")
+    assert remind(conn, provider, fee_id) == 1
+    (link,) = live_links(conn, share_id)
+    assert link["link"] in texts(conn, "m_nakato")[-1]
+
+
+def test_a_frozen_family_is_sent_no_new_links_but_old_ones_are_still_reminded(conn, provider):
+    # Catches: asking relatives to send money while all money movement is frozen, just because it came as a reminder.
+    fee_id = new_fee(conn)
+    with_link = add_share(conn, fee_id, "m_baraka", "3000.00")
+    request(conn, provider, with_link)
     add_share(conn, fee_id, "m_nakato", "2000.00")
-    assert remind(conn, fee_id) == 0
-    assert texts(conn, "m_nakato") == []
+    conn.execute("UPDATE families SET frozen = 1 WHERE id = ?", (FAM,))
+    assert remind(conn, provider, fee_id) == 1
+    assert texts(conn, "m_nakato") == [] and count(conn, "collections") == 1
 
 
 def test_reminders_for_another_familys_fee_go_nowhere(conn, provider):
     # Catches: one family's fee id being used to message another family's relatives.
     fee_id = run_split(conn, provider)
     before = count(conn, "outbox")
-    assert remind(conn, fee_id, family_id=OTHER) == 0
+    assert remind(conn, provider, fee_id, family_id=OTHER) == 0
     assert count(conn, "outbox") == before
 
 
 def test_each_reminder_is_audited_with_who_asked(conn, provider):
     # Catches: reminders sent with no record of who asked for them or who received them.
     fee_id = run_split(conn, provider)
-    assert remind(conn, fee_id, actor="m_amina") == 3
+    assert remind(conn, provider, fee_id, actor="m_amina") == 3
     logged = events(conn, "reminder.sent")
     assert sorted(e["data"]["member_id"] for e in logged) == ["m_amina", "m_baraka", "m_nakato"]
     assert {e["actor"] for e in logged} == {"m_amina"}
     assert not any(r["link"] in json.dumps(logged) for r in collection_rows(conn))
+
+
+def test_reminders_refuse_to_run_inside_a_transaction(conn, provider):
+    # Catches: reminders that can re-issue links (provider calls) while holding the write lock.
+    fee_id = run_split(conn, provider)
+    with db.transaction(conn):
+        with pytest.raises(RuntimeError, match="transaction"):
+            remind(conn, provider, fee_id)

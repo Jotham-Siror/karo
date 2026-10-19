@@ -824,7 +824,7 @@ def test_a_checkout_the_stand_in_has_forgotten_is_not_found_rather_than_a_crash(
     asked = ask_for_a_share(site)
     restarted = make_site()
     response = restarted.client.post(checkout_path(asked))
-    assert response.status_code == 404
+    assert response.status_code == 404 and "Ask the main payer to send a reminder for a new link" in response.text
     assert share_paid(restarted, asked) == 0
 
 
@@ -896,12 +896,8 @@ def test_a_webhook_for_a_provider_this_app_does_not_use_is_not_found(site):
     assert share_paid(site, asked) == 0
 
 
-def test_confirming_a_split_on_the_pin_page_sends_the_payment_links(site):
-    # Catches: the PIN page running the split without the app's own address, so payers come back to the wrong page.
-    # The page hides an error from the executor, so a missing link is how a failure would show.
-    return_pages = []
-    create = site.provider.create_collection
-    site.provider.create_collection = lambda **kw: return_pages.append(kw["redirect_url"]) or create(**kw)
+def split_token(site) -> str:
+    """Has Amina's agent propose a split of a GBP 6,000 fee between Baraka and Nakato. Returns her confirm token."""
     with site.connect() as conn:
         now = clock.now(conn)
         payee = store.load_state(conn, FAM, now).trusted_payees[0].payee
@@ -924,10 +920,50 @@ def test_confirming_a_split_on_the_pin_page_sends_the_payment_links(site):
         row = conn.execute(
             "SELECT text FROM outbox WHERE member_id = 'm_amina' AND text LIKE '%/confirm/%' ORDER BY id DESC LIMIT 1"
         ).fetchone()
-    token = re.search(r"/confirm/(\S+)", row["text"]).group(1)
-    page = enter(site, token)
+    return re.search(r"/confirm/(\S+)", row["text"]).group(1)
+
+
+def test_confirming_a_split_on_the_pin_page_sends_the_payment_links(site):
+    # Catches: the PIN page running the split without the app's own address, so payers come back to the wrong page.
+    # The page hides an error from the executor, so a missing link is how a failure would show.
+    return_pages = []
+    create = site.provider.create_collection
+    site.provider.create_collection = lambda **kw: return_pages.append(kw["redirect_url"]) or create(**kw)
+    page = enter(site, split_token(site))
     assert page.status_code == 200 and "Asked Baraka, Nakato" in words(page) and PROCESSING not in words(page)
     for member_id in ("m_baraka", "m_nakato"):
         links = site.query("SELECT text FROM outbox WHERE member_id = ? AND text LIKE '%/standin/pay/%'", member_id)
         assert len(links) == 1
     assert return_pages == [f"{BASE_URL}/paid"] * 2
+
+
+class DropsTheSecondLink(StandInProvider):
+    def create_collection(self, **kwargs):
+        if self._amounts:
+            raise ConnectionError("connection dropped")
+        return super().create_collection(**kwargs)
+
+
+def test_a_split_whose_links_partly_fail_is_done_and_says_what_is_left(make_site):
+    # Catches: a split that is saved but reported as "being processed" when some links never went out.
+    site = make_site(provider=DropsTheSecondLink.from_config(SECRET, BASE_URL))
+    page = enter(site, split_token(site))
+    text = words(page)
+    assert page.status_code == 200 and "<h1>Done</h1>" in page.text
+    assert "Some payment links couldn't be sent yet; Karo will retry when you send reminders." in text
+    assert PROCESSING not in text
+    assert status_of_only_proposal(site) == "executed"
+    assert len(site.query("SELECT id FROM shares")) == 2 and len(site.query("SELECT id FROM collections")) == 1
+    told = site.query("SELECT text FROM outbox WHERE member_id = 'm_amina' AND text LIKE 'Some payment links%'")
+    assert len(told) == 1
+
+
+def test_a_link_that_was_replaced_says_so_and_cannot_be_paid(site):
+    # Catches: a replaced link still showing a Pay button (or "already paid"), so a payer pays a share twice.
+    asked = ask_for_a_share(site)
+    with site.connect() as conn:
+        conn.execute("UPDATE collections SET status = 'failed'")
+    page = site.client.get(checkout_path(asked))
+    assert page.status_code == 200 and "<button" not in page.text and "no longer valid" in page.text
+    assert site.client.post(checkout_path(asked)).status_code == 404
+    assert share_paid(site, asked) == 0

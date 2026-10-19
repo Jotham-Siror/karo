@@ -740,6 +740,16 @@ def test_reminders_for_a_fee_of_another_family_are_refused(conn, provider):
     assert events(conn, "reminder.sent") == []
 
 
+def test_a_share_with_no_link_is_given_one_when_the_main_payer_sends_reminders(conn, provider):
+    # Catches: a share stranded with no payment link, because the reminder tool skipped anyone it had nothing to send.
+    fee_id = collecting_fee(conn, provider)
+    conn.execute("DELETE FROM collections WHERE share_id = 'sh_b'")
+    result = run_tool("send_reminders", {"fee_id": fee_id}, ctx_for(conn, provider))
+    assert result["reminders_sent"] == 2
+    (link,) = conn.execute("SELECT link FROM collections WHERE share_id = 'sh_b' AND status = 'pending'").fetchall()
+    assert link["link"] in texts(conn, "m_baraka")[-1] and link["link"] not in json.dumps(result)
+
+
 def test_reminders_say_so_when_everyone_has_paid(conn, provider):
     # Bug caught: "Reminded 0 people." sounding like a success when there was nobody to remind.
     fee_id = collecting_fee(conn, provider)

@@ -33,10 +33,31 @@ def _blocked(
     )
 
 
+def _fail(conn: sqlite3.Connection, old: sqlite3.Row, now: datetime) -> None:
+    conn.execute(
+        "UPDATE collections SET status = 'failed', updated_at = ? "
+        "WHERE id = ? AND family_id = ? AND status = 'pending'",
+        (iso(now), old["id"], old["family_id"]),
+    )
+    audit.record(
+        conn,
+        at=now,
+        family_id=old["family_id"],
+        actor="system",
+        event="collection.failed",
+        data={"collection_id": old["id"], "share_id": old["share_id"], "reason": "The provider lost this link."},
+    )
+
+
 def request_share(
     conn: sqlite3.Connection, provider: Provider, *, family_id: str, share_id: str, now: datetime, base_url: str
 ) -> str | None:
-    """Asks the share's owner to pay what is left of it. Returns the collection id, or None if nothing was asked."""
+    """Asks the share's owner to pay what is left of it. Returns the collection id, or None if nothing was asked.
+
+    Nothing is asked when the rules block it, when nothing is left to pay, or when the share already has a live link.
+    A link is live unless the provider says it has failed (the stand-in says so for one it has forgotten, as after a
+    restart). A dead one is marked failed as the new one is saved, so a share never holds two live links.
+    """
     if conn.in_transaction:
         raise RuntimeError("request_share must not run inside a transaction.")
     share = store.get_share(conn, family_id, share_id)
@@ -61,6 +82,10 @@ def request_share(
         _blocked(conn, family_id, share_id, payer.id, proposals.block_reasons(decision), now)
         return None
 
+    pending = store.pending_collections(conn, family_id, share_id)
+    if any(provider.verify_collection(old["tx_ref"]).status != "failed" for old in pending):
+        return None
+
     contact = store.member_contact(conn, family_id, payer.id)
     country = countries.get(contact["country"])
     method = country.collect_methods[0]
@@ -81,6 +106,8 @@ def request_share(
     what = "the fees" if fee is None else f"the {fee['payee_name']} fee"
     stamp = iso(now)
     with db.transaction(conn):
+        for old in pending:
+            _fail(conn, old, now)
         conn.execute(
             "INSERT INTO collections (id, share_id, family_id, provider, tx_ref, link, amount_minor, currency, "
             "credit_minor, credit_currency, status, created_at, updated_at) "
@@ -124,7 +151,9 @@ def request_share(
 def request_all(
     conn: sqlite3.Connection, provider: Provider, *, family_id: str, fee_id: str, now: datetime, base_url: str
 ) -> int:
-    """Asks for every share of the fee that still has something to pay. Returns how many were asked."""
+    """Asks for every share of the fee that has something left to pay and no live link. Returns how many were asked.
+
+    Safe to run again after a partial failure: a share that already has a live link is left alone."""
     asked = 0
     for share in store.shares_for_fee(conn, family_id, fee_id):
         collection_id = request_share(
@@ -136,18 +165,39 @@ def request_all(
 
 
 def send_reminders(
-    conn: sqlite3.Connection, *, family_id: str, fee_id: str, now: datetime, actor: str = "system"
+    conn: sqlite3.Connection,
+    provider: Provider,
+    *,
+    family_id: str,
+    fee_id: str,
+    now: datetime,
+    base_url: str,
+    actor: str = "system",
 ) -> int:
-    """Reminds each member who still owes on the fee, with their newest unpaid link. Returns how many were sent."""
+    """Reminds each member who still owes on the fee. Returns how many people were messaged.
+
+    A share with no live link is given a new one first (its own message is the notice, so it gets no second one).
+    That is a provider call, so this must not run inside a transaction."""
+    if conn.in_transaction:
+        raise RuntimeError("send_reminders must not run inside a transaction.")
     fee = store.get_fee(conn, family_id, fee_id)
     if fee is None:
         return 0
+    fresh = {
+        share["id"]
+        for share in store.shares_for_fee(conn, family_id, fee_id)
+        if request_share(conn, provider, family_id=family_id, share_id=share["id"], now=now, base_url=base_url)
+        is not None
+    }
     sent = 0
     with db.transaction(conn):
         for share in store.shares_for_fee(conn, family_id, fee_id):
             remaining = _remaining(share)
             pending = store.latest_pending_collection(conn, family_id, share["id"])
             if remaining.minor <= 0 or pending is None:
+                continue
+            if share["id"] in fresh:
+                sent += 1
                 continue
             outbox.notify(
                 conn,

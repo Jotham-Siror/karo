@@ -381,7 +381,13 @@ def _request_unfreeze(ctx: ToolContext, _args: dict) -> dict:
 def _send_reminders(ctx: ToolContext, args: dict) -> dict:
     fee = _fee(ctx, args["fee_id"])
     sent = collections.send_reminders(
-        ctx.conn, family_id=ctx.family_id, fee_id=fee["id"], now=ctx.now, actor=ctx.member.id
+        ctx.conn,
+        ctx.provider,
+        family_id=ctx.family_id,
+        fee_id=fee["id"],
+        now=ctx.now,
+        base_url=ctx.base_url,
+        actor=ctx.member.id,
     )
     if sent == 0:
         return {"reminders_sent": 0, "message": "Nobody needed a reminder: everyone has paid, or has no link yet."}
@@ -509,7 +515,8 @@ _TOOLS: tuple[_Tool, ...] = (
     _Tool(
         "send_reminders",
         "Remind the relatives who have not yet paid their share of a fee. Each gets a message with their own payment "
-        "link; Karo sends it and you never see the links. Call it only when the main payer asks for a reminder.",
+        "link, and anyone whose link is missing or no longer works is sent a new one. Karo sends the messages and you "
+        "never see the links. Call it only when the main payer asks for a reminder.",
         _object(fee_id=_text("The id of the fee, from record_invoice or get_status.")),
         _send_reminders,
         _MAIN_PAYER,
