@@ -1,0 +1,320 @@
+"""The background tick: what has to happen because time has passed.
+
+For each family, in this order: payouts left pending are asked about again, waiting requests whose wait is over are
+made again, the monthly allowance is paid, and late shares are reminded. Money still moves only through the executor,
+and the allowance only because the main payer's PIN already approved the standing order behind it.
+
+An error from the provider or the network on one item is audited (by type only) and the item is left for the next
+tick, so it never stops the items after it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
+
+from karo import audit, clock, collections, db, executor, outbox, proposals, quotes, store
+from karo.domain import Kind, StandingOrder
+from karo.proposals import ProposalOutcome
+from karo.providers.base import Provider
+from karo.rules import Outcome
+
+logger = logging.getLogger(__name__)
+
+REMIND_AFTER = timedelta(hours=24)  # how long a payment link goes unpaid before the first reminder
+REMIND_EVERY = timedelta(hours=24)
+
+# The demo button runs a tick while the background one may be running. Two at once would both find no allowance run
+# yet this month and make one each.
+_ONE_TICK_AT_A_TIME = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _Run:
+    conn: sqlite3.Connection
+    provider: Provider
+    family_id: str
+    now: datetime
+    base_url: str
+
+
+def tick(conn: sqlite3.Connection, provider: Provider, *, now: datetime, base_url: str) -> None:
+    if conn.in_transaction:
+        # Each step calls the provider, and a provider call must never be made while the write lock is held.
+        raise RuntimeError("tick must not run inside a transaction.")
+    with _ONE_TICK_AT_A_TIME:
+        for row in conn.execute("SELECT id FROM families ORDER BY rowid").fetchall():
+            run = _Run(conn, provider, row["id"], now, base_url)
+            _reconcile_payouts(run)
+            _renew_waiting(run)
+            _pay_allowance(run)
+            _remind_late_shares(run)
+
+
+@contextmanager
+def _isolated(run: _Run, step: str, subject_id: str) -> Iterator[None]:
+    try:
+        yield
+    except Exception as error:
+        logger.exception("scheduler step %s failed for %s", step, subject_id)
+        audit.record(
+            run.conn,
+            at=run.now,
+            family_id=run.family_id,
+            actor="system",
+            event="scheduler.error",
+            data={"step": step, "subject_id": subject_id, "error": type(error).__name__},
+        )
+
+
+# --- payouts left pending ---------------------------------------------------------------------
+
+
+def _reconcile_payouts(run: _Run) -> None:
+    older_than = clock.iso(run.now - executor.RECONCILE_GRACE)
+    rows = run.conn.execute(
+        "SELECT id, proposal_id FROM payouts WHERE family_id = ? AND status = 'pending' AND updated_at < ? "
+        "ORDER BY rowid",
+        (run.family_id, older_than),
+    ).fetchall()
+    for row in rows:
+        with _isolated(run, "payout", row["id"]):
+            _execute(run, row["proposal_id"])
+
+
+def _execute(run: _Run, proposal_id: str) -> None:
+    executor.execute(
+        run.conn,
+        run.provider,
+        family_id=run.family_id,
+        proposal_id=proposal_id,
+        now=run.now,
+        base_url=run.base_url,
+    )
+
+
+# --- requests that were waiting out a delay ---------------------------------------------------
+
+
+def _renew_waiting(run: _Run) -> None:
+    rows = run.conn.execute(
+        "SELECT id, decision_json FROM proposals WHERE family_id = ? AND status = 'waiting' ORDER BY created_at, rowid",
+        (run.family_id,),
+    ).fetchall()
+    for row in rows:
+        ends = _wait_ends(row["decision_json"])
+        if ends is not None and run.now >= ends:
+            with _isolated(run, "waiting", row["id"]):
+                _renew(run, row["id"])
+
+
+def _wait_ends(decision_json: str) -> datetime | None:
+    ends = [clock.parse(r["until"]) for r in json.loads(decision_json) if r["outcome"] == Outcome.WAIT and r["until"]]
+    return max(ends, default=None)
+
+
+def _renew(run: _Run, old_id: str) -> None:
+    """Asks again for what was waiting. The old quote ran out long ago, and a PIN only approves one exact proposal,
+    so the new request gets a new quote and, if it needs one, a new PIN link."""
+    old, _ = store.get_proposal(run.conn, run.family_id, old_id)
+    quote_id = None
+    if old.quote is not None:
+        quote = quotes.create_quote(
+            run.conn,
+            run.provider,
+            family_id=run.family_id,
+            source_currency=old.quote.source.currency,
+            target=old.quote.target,
+            now=run.now,
+        )
+        quote_id = quote.id
+    # One transaction, so a crash can't leave a replacement with the old request still waiting: that would be
+    # replaced again, and the main payer sent a second link.
+    with db.transaction(run.conn):
+        outcome = proposals.propose(
+            run.conn,
+            family_id=run.family_id,
+            actor=store.member(run.conn, run.family_id, old.requested_by),
+            kind=old.kind,
+            now=run.now,
+            base_url=run.base_url,
+            amount=old.amount,
+            payee=old.payee,
+            quote_id=quote_id,
+            share_id=old.share_id,
+            standing_order_id=old.standing_order_id,
+            fee_id=old.fee_id,
+            split=old.split,
+        )
+        store.update_proposal(run.conn, run.family_id, old_id, status="failed", now=run.now)
+        audit.record(
+            run.conn,
+            at=run.now,
+            family_id=run.family_id,
+            actor="system",
+            event="proposal.superseded",
+            data={"old_id": old_id, "new_id": outcome.proposal_id},
+        )
+    if outcome.status == "awaiting_pin":
+        what = _what(run, outcome)
+        _say(
+            run,
+            f"The wait is over for: {what}. The price you approved has expired, so Karo needs a new PIN "
+            "confirmation. A new link was just sent.",
+        )
+    elif outcome.status == "confirmed":
+        _execute(run, outcome.proposal_id)
+    else:
+        _explain_stop(run, outcome)
+
+
+def _what(run: _Run, outcome: ProposalOutcome) -> str:
+    p, _ = store.get_proposal(run.conn, run.family_id, outcome.proposal_id)
+    return proposals.summary(p, store.load_state(run.conn, run.family_id, run.now))
+
+
+def _say(run: _Run, text: str) -> None:
+    outbox.notify(run.conn, store.main_payer(run.conn, run.family_id).id, text, run.now)
+
+
+def _explain_stop(run: _Run, outcome: ProposalOutcome) -> None:
+    """Tells the main payer why a request made by the scheduler is not running, in the executor's own words."""
+    what = _what(run, outcome)
+    if outcome.status == "blocked":
+        _say(run, f"Stopped: {what}. {proposals.block_reasons(outcome.decision)}")
+        return
+    reasons = " ".join(r.reason for r in outcome.decision.results if r.outcome is Outcome.WAIT)
+    when = proposals.when_text(outcome.decision.until, store.family_config(run.conn, run.family_id).timezone)
+    _say(run, f"Not yet: {what}. {reasons} It can run after {when}.")
+
+
+# --- the monthly allowance --------------------------------------------------------------------
+
+
+def _pay_allowance(run: _Run) -> None:
+    config = store.family_config(run.conn, run.family_id)
+    local = run.now.astimezone(config.timezone)
+    window = _month_window(local)
+    if _already_paid(run, window):
+        return
+    for order in store.load_state(run.conn, run.family_id, run.now).standing_orders:
+        if local.day >= order.day_of_month:
+            with _isolated(run, "allowance", order.id):
+                _run_order(run, order, config.policy.home_currency, window)
+
+
+def _month_window(local: datetime) -> tuple[str, str]:
+    """The family's local month as stored timestamps: from its start up to, not including, the next one."""
+    first = local.date().replace(day=1)
+    following = (first + timedelta(days=32)).replace(day=1)
+    start = datetime.combine(first, time.min, tzinfo=local.tzinfo)
+    end = datetime.combine(following, time.min, tzinfo=local.tzinfo)
+    return clock.iso(start), clock.iso(end)
+
+
+def _already_paid(run: _Run, window: tuple[str, str]) -> bool:
+    row = run.conn.execute(
+        "SELECT 1 FROM payouts WHERE family_id = ? AND kind = 'allowance_run' AND created_at >= ? AND created_at < ?",
+        (run.family_id, *window),
+    ).fetchone()
+    return row is not None
+
+
+def _run_order(run: _Run, order: StandingOrder, home_currency: str, window: tuple[str, str]) -> None:
+    # A run made this month counts as the month's attempt whatever became of it, or a run the cap stops would be
+    # made and announced again every 30 seconds. One a crash left confirmed is the exception: nothing came of it yet.
+    attempt = run.conn.execute(
+        "SELECT id, status FROM proposals WHERE family_id = ? AND kind = ? AND created_at >= ? AND created_at < ? "
+        "AND json_extract(payload_json, '$.standing_order_id') = ? ORDER BY rowid DESC LIMIT 1",
+        (run.family_id, Kind.ALLOWANCE_RUN.value, *window, order.id),
+    ).fetchone()
+    if attempt is None:
+        outcome = _propose_run(run, order, home_currency)
+        if outcome.status != "confirmed":
+            _explain_stop(run, outcome)
+            return
+        proposal_id = outcome.proposal_id
+    elif attempt["status"] == "confirmed":
+        proposal_id = attempt["id"]
+    else:
+        return
+    _execute(run, proposal_id)
+
+
+def _propose_run(run: _Run, order: StandingOrder, home_currency: str) -> ProposalOutcome:
+    quote = quotes.create_quote(
+        run.conn,
+        run.provider,
+        family_id=run.family_id,
+        source_currency=home_currency,
+        target=order.amount,
+        now=run.now,
+    )
+    # Proposed as the main payer, the one member the rules accept for a run, so the proposal log names her. The
+    # executor runs it with nobody behind it, as the scheduler's, and this entry says so.
+    outcome = proposals.propose(
+        run.conn,
+        family_id=run.family_id,
+        actor=store.main_payer(run.conn, run.family_id),
+        kind=Kind.ALLOWANCE_RUN,
+        now=run.now,
+        base_url=run.base_url,
+        amount=quote.target,
+        payee=order.payee,
+        quote_id=quote.id,
+        standing_order_id=order.id,
+    )
+    audit.record(
+        run.conn,
+        at=run.now,
+        family_id=run.family_id,
+        actor="system",
+        event="allowance.scheduled",
+        data={"standing_order_id": order.id, "proposal_id": outcome.proposal_id},
+    )
+    return outcome
+
+
+# --- reminders --------------------------------------------------------------------------------
+
+
+def _remind_late_shares(run: _Run) -> None:
+    for fee_id, share_id in _late_shares(run):
+        with _isolated(run, "reminder", share_id):
+            collections.send_reminders(
+                run.conn,
+                run.provider,
+                family_id=run.family_id,
+                fee_id=fee_id,
+                share_id=share_id,
+                now=run.now,
+                base_url=run.base_url,
+            )
+
+
+def _late_shares(run: _Run) -> Iterator[tuple[str, str]]:
+    """(fee id, share id) of each share still owing whose link is a day old and who wasn't reminded in the last day."""
+    for fee in store.fees(run.conn, run.family_id):
+        for share in store.shares_for_fee(run.conn, run.family_id, fee["id"]):
+            if share["paid_minor"] >= share["amount_minor"]:
+                continue
+            link = store.latest_pending_collection(run.conn, run.family_id, share["id"])
+            if link is None or clock.parse(link["created_at"]) > run.now - REMIND_AFTER:
+                continue
+            if not _reminded_since(run, share["id"], run.now - REMIND_EVERY):
+                yield fee["id"], share["id"]
+
+
+def _reminded_since(run: _Run, share_id: str, since: datetime) -> bool:
+    row = run.conn.execute(
+        "SELECT 1 FROM audit WHERE family_id = ? AND event = 'reminder.sent' AND at >= ? "
+        "AND json_extract(data_json, '$.share_id') = ? LIMIT 1",
+        (run.family_id, clock.iso(since), share_id),
+    ).fetchone()
+    return row is not None
