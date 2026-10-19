@@ -155,11 +155,11 @@ def _payee_from(name: str, details_json: str) -> Payee:
     return Payee.of(name, **json.loads(details_json))
 
 
-def _trusted_payees(conn: sqlite3.Connection, family_id: str) -> tuple[TrustedPayee, ...]:
+def _trusted_payees(conn: sqlite3.Connection, family_id: str, source: str | None = None) -> tuple[TrustedPayee, ...]:
     rows = conn.execute(
         "SELECT id, family_id, name, details_json, trusted_since FROM trusted_payees "
-        "WHERE family_id = ? ORDER BY rowid",
-        (family_id,),
+        "WHERE family_id = ? AND (? IS NULL OR source = ?) ORDER BY rowid",
+        (family_id, source, source),
     )
     return tuple(
         TrustedPayee(
@@ -167,6 +167,11 @@ def _trusted_payees(conn: sqlite3.Connection, family_id: str) -> tuple[TrustedPa
         )
         for r in rows
     )
+
+
+def added_payees(conn: sqlite3.Connection, family_id: str) -> tuple[TrustedPayee, ...]:
+    """The trusted payees the family added itself, as opposed to the institutions from the directory."""
+    return _trusted_payees(conn, family_id, "added")
 
 
 def _shares(conn: sqlite3.Connection, family_id: str) -> tuple[Share, ...]:
@@ -399,6 +404,16 @@ def update_proposal(
 def get_proposal(conn: sqlite3.Connection, family_id: str, proposal_id: str) -> tuple[Proposal, sqlite3.Row] | None:
     row = conn.execute("SELECT * FROM proposals WHERE id = ? AND family_id = ?", (proposal_id, family_id)).fetchone()
     return None if row is None else (proposal_from_json(row["payload_json"]), row)
+
+
+def open_proposals(conn: sqlite3.Connection, family_id: str) -> list[tuple[Proposal, sqlite3.Row]]:
+    """Proposals still on their way: held for a PIN, waiting out a delay, or approved and not yet run."""
+    rows = conn.execute(
+        "SELECT * FROM proposals WHERE family_id = ? AND status IN ('awaiting_pin', 'waiting', 'confirmed') "
+        "ORDER BY created_at, rowid",
+        (family_id,),
+    ).fetchall()
+    return [(proposal_from_json(r["payload_json"]), r) for r in rows]
 
 
 # --- fees and shares -------------------------------------------------------------------------
