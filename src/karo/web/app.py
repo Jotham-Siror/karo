@@ -1,7 +1,8 @@
 """The web door: login, chat, the PIN page, the log view and the demo controls.
 
-One SQLite connection per request, never shared between requests. Anything that waits on the AI or the payment
-provider runs in a worker thread, so a slow call doesn't hold up the page for everyone else.
+One SQLite connection per request, never shared between requests; the scheduler's tick opens its own. Anything that
+waits on the AI or the payment provider runs in a worker thread, so a slow call doesn't hold up the page for everyone
+else.
 """
 
 from __future__ import annotations
@@ -9,13 +10,16 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import re
 import sqlite3
-from collections.abc import Iterator
-from contextlib import closing
-from datetime import datetime
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, closing
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, Depends, FastAPI, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +28,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 
-from karo import approvals, audit, clock, db, executor, notices, outbox, proposals, seed, store
+from karo import approvals, audit, clock, db, executor, notices, outbox, proposals, scheduler, seed, store
 from karo.agent.claude import Claude, ClaudeClient
 from karo.config import Settings, load_settings
 from karo.doors import base
@@ -42,6 +46,7 @@ TEMPLATES = Jinja2Templates(directory=_HERE / "templates")  # autoescape is on b
 WEB = outbox.WEB
 SESSION_SECONDS = 12 * 60 * 60
 MAX_ADVANCE_HOURS = 720
+TICK_SECONDS = 30
 _HOURS = re.compile(r"[0-9]{1,4}")
 _MESSAGE_KEY = re.compile(r"message([0-9]+)")
 # Deep Chat adds the id; it only has to be unique per browser message. Anything else is ignored rather than trusted.
@@ -500,6 +505,34 @@ def demo_advance(request: Request, hours: str = Form(""), conn: sqlite3.Connecti
     return RedirectResponse("/demo", status_code=303)
 
 
+def first_of_next_month_at_nine(now: datetime, tz: ZoneInfo) -> datetime:
+    local = now.astimezone(tz)
+    return datetime(local.year + local.month // 12, local.month % 12 + 1, 1, 9, 0, tzinfo=tz)
+
+
+@router.post("/demo/next-month", dependencies=[Depends(require_demo)])
+def demo_next_month(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    state = request.app.state
+    tz = store.family_config(conn, seed.FAMILY_ID).timezone
+    now = clock.now(conn)
+    target = first_of_next_month_at_nine(now, tz)
+    # Rounded up, so the clock never lands a moment before 09:00. A fixed target, so the hours limit doesn't apply.
+    seconds = math.ceil((target.astimezone(UTC) - now).total_seconds())
+    with db.transaction(conn):
+        clock.advance(conn, seconds)
+        audit.record(
+            conn,
+            at=clock.now(conn),
+            family_id=None,
+            actor="demo",
+            event="demo.advanced",
+            data={"seconds": seconds, "to": clock.iso(target)},
+        )
+    scheduler.tick(conn, state.provider, now=clock.now(conn), base_url=state.settings.public_base_url)
+    request.session["flash"] = f"The demo clock moved to {proposals.when_text(target, tz)}. Karo ran its checks."
+    return RedirectResponse("/demo", status_code=303)
+
+
 @router.post("/demo/reset", dependencies=[Depends(require_demo)])
 def demo_reset(request: Request):
     # No connection here: the file is deleted, and an open connection would keep it from being deleted on Windows.
@@ -524,6 +557,12 @@ def ensure_database(settings: Settings) -> None:
             seed.seed_demo(conn, pin=settings.demo_pin, pepper=settings.pin_pepper, now=clock.now(conn))
 
 
+def run_scheduled_tick(settings: Settings, provider: Provider) -> None:
+    # Its own connection, opened and closed here: the scheduler's thread must never share one with a request.
+    with closing(db.connect(settings.db_path)) as conn:
+        scheduler.tick(conn, provider, now=clock.now(conn), base_url=settings.public_base_url)
+
+
 def build_provider(settings: Settings) -> Provider:
     if settings.provider != "standin":
         raise RuntimeError(f"KARO_PROVIDER={settings.provider!r} is not available yet. Use 'standin'.")
@@ -531,7 +570,13 @@ def build_provider(settings: Settings) -> Provider:
     return StandInProvider.from_config(settings.standin_secret, settings.public_base_url)
 
 
-def create_app(settings: Settings, *, client: Claude | None = None, provider: Provider | None = None) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    client: Claude | None = None,
+    provider: Provider | None = None,
+    start_scheduler: bool = False,
+) -> FastAPI:
     if client is None:
         settings.require("anthropic_api_key")
         client = ClaudeClient(settings.anthropic_api_key)
@@ -541,8 +586,30 @@ def create_app(settings: Settings, *, client: Claude | None = None, provider: Pr
     # On the logger, not in a uvicorn flag, so a plain `uvicorn karo.web.app:app` is covered too.
     logging.getLogger("uvicorn.access").addFilter(_HIDE_TOKENS)
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if not start_scheduler:
+            yield
+            return
+        background = BackgroundScheduler(timezone=UTC)
+        # One at a time: a tick that outlasts 30 seconds must not be started a second time on top of itself.
+        background.add_job(
+            run_scheduled_tick,
+            "interval",
+            seconds=TICK_SECONDS,
+            args=[settings, provider],
+            max_instances=1,
+            coalesce=True,
+        )
+        background.start()
+        try:
+            yield
+        finally:
+            # Not waited for: a tick cut short is safe, because a payout is two commits and the next tick reconciles it.
+            background.shutdown(wait=False)
+
     # No /docs or /openapi.json: they would list every route to anyone who asks.
-    app = FastAPI(title="Karo", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Karo", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings = settings
     app.state.client = client
     app.state.provider = provider
@@ -569,5 +636,5 @@ def __getattr__(name: str):
     if name != "app":
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     if _app is None:
-        _app = create_app(load_settings())
+        _app = create_app(load_settings(), start_scheduler=True)
     return _app

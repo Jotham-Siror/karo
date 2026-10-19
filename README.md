@@ -23,7 +23,7 @@ Fill in `.env` (see `.env.example`), then:
 uv run uvicorn karo.web.app:app --port 8000
 ```
 
-Open http://localhost:8000 and log in with `KARO_DEMO_PASSWORD`. The first start creates `data/karo.db` and seeds the demo families with `DEMO_PIN`. `/log` shows the audit log, and `/demo` has the demo clock and a reset button.
+Open http://localhost:8000 and log in with `KARO_DEMO_PASSWORD`. The first start creates `data/karo.db` and seeds the demo families with `DEMO_PIN`. `/log` shows the audit log, and `/demo` has the demo clock (with a jump to the 1st of next month, to show the allowance) and a reset button.
 
 ## Tests
 

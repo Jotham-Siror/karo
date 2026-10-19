@@ -14,6 +14,7 @@ import sys
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import FastAPI
@@ -25,7 +26,8 @@ from karo.config import Settings
 from karo.domain import Kind, Payee
 from karo.money import Money
 from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
-from karo.web.app import HideConfirmTokens, create_app
+from karo.web import app as web_app
+from karo.web.app import HideConfirmTokens, create_app, run_scheduled_tick
 
 FAM = "fam_otieno"
 PIN = "4821"
@@ -726,6 +728,130 @@ def test_reset_starts_the_demo_again_from_a_fresh_database(site):
         assert not [e for e in audit.events(conn, None) if e["event"] == "family.frozen"]
         assert approvals.verify_pin(conn, FAM, "m_amina", PIN, PEPPER, clock.now(conn)).ok
     assert site.client.get("/chat").status_code == 200  # the browser stays logged in
+
+
+NAIROBI = ZoneInfo("Africa/Nairobi")
+
+
+def set_up_an_allowance(site) -> None:
+    """Funds, and an approved standing order of GBP 500 to the student, as if set earlier."""
+    with site.connect() as conn:
+        funds = Money.parse("5000000", "KES")
+        ledger.post(conn, family_id=FAM, at=clock.now(conn), amount=funds, kind="collection", ref="funds")
+        conn.execute(
+            "INSERT INTO standing_orders (id, family_id, payee_id, amount_minor, currency, day_of_month, approved_by, "
+            "active) VALUES ('so_web', ?, 'tp_jabali', 50000, 'GBP', 1, 'm_amina', 1)",
+            (FAM,),
+        )
+
+
+def test_the_demo_page_offers_the_jump_to_next_month(site):
+    # Catches: a demo with no way to show the monthly allowance without waiting a month.
+    site.login()
+    assert "Jump to the 1st of next month" in site.client.get("/demo").text
+
+
+def test_the_jump_needs_the_demo_password_session(site):
+    # Catches: anyone being able to move the clock a month and set off the scheduler.
+    assert site.client.post("/demo/next-month").status_code == 303
+    with site.connect() as conn:
+        assert clock.offset(conn) == 0
+
+
+def test_the_jump_lands_on_nine_on_the_first_of_next_month_and_runs_a_tick(site):
+    # Catches: a jump that lands in the wrong month or timezone, or moves the clock without Karo noticing.
+    set_up_an_allowance(site)
+    site.login()
+    with site.connect() as conn:
+        before = clock.now(conn).astimezone(NAIROBI)
+    response = site.client.post("/demo/next-month")
+    assert response.status_code == 303 and response.headers["location"] == "/demo"
+    with site.connect() as conn:
+        after = clock.now(conn).astimezone(NAIROBI)
+        assert (after.year, after.month) == (before.year + before.month // 12, before.month % 12 + 1)
+        assert (after.day, after.hour, after.minute) == (1, 9, 0)
+        assert [r["kind"] for r in conn.execute("SELECT kind FROM payouts")] == ["allowance_run"]
+        (moved,) = [e for e in audit.events(conn, None) if e["event"] == "demo.advanced"]
+        assert moved["actor"] == "demo"
+    assert "1st of next month" in site.client.get("/demo").text
+
+
+def test_the_jump_is_not_held_to_the_hours_limit(site):
+    # Catches: the 720-hour limit on the hours box stopping the jump in a 31-day month from the 1st.
+    site.login()
+    with site.connect() as conn:
+        clock.advance(conn, 3600 * 24 * 45)
+    assert site.client.post("/demo/next-month").status_code == 303
+
+
+class FakeScheduler:
+    """Stands in for APScheduler's BackgroundScheduler, so no test starts a thread."""
+
+    made: list = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.jobs: list = []
+        self.started = self.stopped = False
+        FakeScheduler.made.append(self)
+
+    def add_job(self, func, trigger, **kwargs) -> None:
+        self.jobs.append((func, trigger, kwargs))
+
+    def start(self) -> None:
+        self.started = True
+
+    def shutdown(self, wait: bool = True) -> None:
+        self.stopped = True
+
+
+@pytest.fixture
+def fake_scheduler(monkeypatch):
+    FakeScheduler.made = []
+    monkeypatch.setattr(web_app, "BackgroundScheduler", FakeScheduler)
+    return FakeScheduler.made
+
+
+def test_an_app_made_by_default_starts_no_scheduler(settings, fake_scheduler):
+    # Catches: every test app, and every second app in one process, starting a clock-driven thread that pays people.
+    app = create_app(settings, client=FakeClaude([]), provider=StandInProvider.from_config(SECRET, BASE_URL))
+    with TestClient(app):
+        pass
+    assert fake_scheduler == []
+
+
+def test_a_started_server_ticks_every_30_seconds_and_stops_the_scheduler_at_shutdown(settings, fake_scheduler):
+    # Catches: a scheduler that never starts, ticks at the wrong pace, or outlives the server.
+    provider = StandInProvider.from_config(SECRET, BASE_URL)
+    app = create_app(settings, client=FakeClaude([]), provider=provider, start_scheduler=True)
+    assert fake_scheduler == []  # building the app starts nothing; the server's startup does
+    with TestClient(app):
+        (background,) = fake_scheduler
+        assert background.started and not background.stopped
+        ((func, trigger, options),) = background.jobs
+        assert (func, trigger, options["seconds"]) == (run_scheduled_tick, "interval", 30)
+        assert options["args"] == [settings, provider]
+        assert options["max_instances"] == 1  # a slow tick must not be overlapped by the next
+    assert background.stopped
+
+
+def test_the_uvicorn_entry_asks_for_the_scheduler(settings, monkeypatch):
+    # Catches: `uvicorn karo.web.app:app` serving the demo with no allowance runs, reminders or reconciling.
+    asked = {}
+    monkeypatch.setattr(web_app, "load_settings", lambda: settings)
+    monkeypatch.setattr(web_app, "create_app", lambda given, **options: asked.update(options) or FastAPI())
+    monkeypatch.setattr(web_app, "_app", None)
+    assert isinstance(web_app.app, FastAPI)
+    assert asked == {"start_scheduler": True}
+
+
+def test_a_scheduled_tick_follows_the_demo_clock_on_its_own_connection(site):
+    # Catches: a tick that reads real time, so a fast-forwarded demo never sends the reminder it is meant to show.
+    ask_for_a_share(site)
+    with site.connect() as conn:
+        clock.advance(conn, 25 * 3600)
+    run_scheduled_tick(site.settings, site.provider)
+    reminders = [r["text"] for r in site.query("SELECT text FROM outbox WHERE member_id = 'm_baraka'")]
+    assert len([t for t in reminders if t.startswith("Reminder:")]) == 1
 
 
 # --- money in: the stand-in checkout and the provider's notices -----------------------------------
