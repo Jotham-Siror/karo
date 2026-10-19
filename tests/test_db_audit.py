@@ -229,6 +229,28 @@ def test_verify_detects_a_rewritten_link_to_the_previous_row(db_path, conn):
     assert audit.verify(conn) == (False, target)
 
 
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        pytest.param("not json", id="text-that-is-not-json"),
+        pytest.param(b"\xff\xfe\xfa", id="bytes-that-are-not-text"),
+        pytest.param("[" * 100_000 + "]" * 100_000, id="absurdly-deep-nesting"),
+    ],
+)
+def test_verify_reports_a_row_whose_stored_data_cannot_be_read(db_path, conn, garbage):
+    # Bug caught: verify crashing on a tampered row's unreadable data instead of returning (False, seq) for it.
+    record(conn, "a")
+    target = record(conn, "b", data={"amount": 100})
+    record(conn, "c")
+    attacker = db.connect(db_path)
+    try:
+        attacker.execute("DROP TRIGGER audit_no_update")
+        attacker.execute("UPDATE audit SET data_json = ? WHERE seq = ?", (garbage, target))
+    finally:
+        attacker.close()
+    assert audit.verify(conn) == (False, target)
+
+
 def test_chain_continues_across_a_fresh_connection(db_path):
     # Bug caught: keeping the chain head in memory, so every restart forked the chain from GENESIS.
     first_conn = db.connect(db_path)

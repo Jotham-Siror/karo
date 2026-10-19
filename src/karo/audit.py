@@ -65,7 +65,12 @@ def record(conn: sqlite3.Connection, *, at: datetime, family_id: str | None, act
 def verify(conn: sqlite3.Connection) -> tuple[bool, int | None]:
     prev_hash = GENESIS
     for row in conn.execute("SELECT * FROM audit ORDER BY seq"):
-        expected = _hash(prev_hash, row["at"], row["family_id"], row["actor"], row["event"], row["data_json"])
+        try:
+            expected = _hash(prev_hash, row["at"], row["family_id"], row["actor"], row["event"], row["data_json"])
+        except (ValueError, RecursionError):
+            # Verifying is the one place that reads stored text nobody vouches for: JSON that does not parse
+            # (JSONDecodeError and UnicodeDecodeError are both ValueErrors) or nests absurdly deep is a bad row, not a crash.
+            return False, row["seq"]
         if row["prev_hash"] != prev_hash or row["hash"] != expected:
             return False, row["seq"]
         prev_hash = row["hash"]
