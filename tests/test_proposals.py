@@ -74,9 +74,15 @@ def add_trusted_payee(conn, payee_id: str, name: str, details: dict, since: date
     return Payee.of(name, **details)
 
 
-def new_fee(conn, amount: str = "6000.00") -> str:
+def new_fee(conn, amount: str = "6000.00", payee: Payee | None = None) -> str:
     return store.insert_fee(
-        conn, family_id=FAM, payee=westbridge(conn), amount=gbp(amount), due_date=None, invoice_ref="INV-77", now=NOW
+        conn,
+        family_id=FAM,
+        payee=payee or westbridge(conn),
+        amount=gbp(amount),
+        due_date=None,
+        invoice_ref="INV-77",
+        now=NOW,
     )
 
 
@@ -150,14 +156,15 @@ def test_a_fee_payment_waits_for_the_pin_and_the_link_goes_to_the_main_payer(con
 
 def test_the_outcome_message_never_carries_the_confirm_link(conn, provider):
     # Bug caught: the AI relays the outcome message, so a link here would leak the PIN page to the chat.
-    outcome = propose_fee_payment(conn, provider)
+    outcome = propose_fee_payment(conn, provider, fee_id=new_fee(conn))
+    assert outcome.status == "awaiting_pin"
     assert "/confirm/" not in outcome.message
     assert "http" not in outcome.message
 
 
 def test_nobody_but_the_main_payer_and_no_log_sees_the_link(conn, provider):
     # Bug caught: the confirm URL (it carries the token) leaking to a relative, the student or the audit log.
-    propose_fee_payment(conn, provider)
+    propose_fee_payment(conn, provider, fee_id=new_fee(conn))
     for other in ("m_baraka", "m_nakato", "m_jabali"):
         assert texts(conn, other) == []
     token = re.search(r"/confirm/(\S+)", texts(conn, "m_amina")[0]).group(1)
@@ -168,7 +175,7 @@ def test_nobody_but_the_main_payer_and_no_log_sees_the_link(conn, provider):
 
 def test_the_stored_digest_is_the_one_the_pin_will_approve(conn, provider):
     # Bug caught: a proposal stored with a digest that differs from its content, so the PIN approves nothing.
-    outcome = propose_fee_payment(conn, provider)
+    outcome = propose_fee_payment(conn, provider, fee_id=new_fee(conn))
     stored, row = store.get_proposal(conn, FAM, outcome.proposal_id)
     assert row["digest"] == stored.digest()
     assert stored.requested_by == "m_amina"
@@ -176,7 +183,7 @@ def test_the_stored_digest_is_the_one_the_pin_will_approve(conn, provider):
 
 def test_the_proposal_and_every_rule_result_are_audited(conn, provider):
     # Bug caught: a decision with no record of which rules ran and why.
-    outcome = propose_fee_payment(conn, provider)
+    outcome = propose_fee_payment(conn, provider, fee_id=new_fee(conn))
     (created,) = events(conn, "proposal.created")
     assert created["data"]["kind"] == "pay_fee"
     assert created["data"]["requested_by"] == "m_amina"
@@ -192,7 +199,7 @@ def test_a_new_payee_wait_still_asks_for_the_pin_and_says_when_it_can_run(conn, 
     # Bug caught: a waiting payment told "confirm now" with no hint it can't run yet, or a time shown in UTC.
     details = {"country": "GB", "currency": "GBP", "sort_code": "11-22-33", "account_number": "87654321"}
     payee = add_trusted_payee(conn, "tp_hall", "Hall of Residence", details, NOW - timedelta(hours=1))
-    outcome = propose_fee_payment(conn, provider, payee=payee, target="1000.00")
+    outcome = propose_fee_payment(conn, provider, payee=payee, target="1000.00", fee_id=new_fee(conn, "1000.00", payee))
     assert outcome.status == "awaiting_pin"
     assert outcome.decision.verdict is Outcome.WAIT
     (message,) = texts(conn, "m_amina")
@@ -206,7 +213,7 @@ def test_a_changed_payee_is_blocked_and_the_main_payer_is_warned(conn, provider)
     fake = Payee.of(
         "University of Westbridge", country="GB", currency="GBP", sort_code="99-99-99", account_number="00000001"
     )
-    outcome = propose_fee_payment(conn, provider, payee=fake)
+    outcome = propose_fee_payment(conn, provider, payee=fake, fee_id=new_fee(conn))
     assert outcome.status == "blocked"
     assert proposal_row(conn, outcome.proposal_id)["status"] == "blocked"
     (warning,) = texts(conn, "m_amina")
@@ -219,7 +226,7 @@ def test_a_changed_payee_is_blocked_and_the_main_payer_is_warned(conn, provider)
 
 def test_a_blocked_proposal_says_why_and_gets_no_link(conn, provider):
     # Bug caught: the agent being told "done" for something the rules refused, or a PIN link for a blocked proposal.
-    outcome = propose_fee_payment(conn, provider, actor="m_baraka")
+    outcome = propose_fee_payment(conn, provider, actor="m_baraka", fee_id=new_fee(conn))
     assert outcome.status == "blocked"
     assert "Only the main payer" in outcome.message
     assert conn.execute("SELECT COUNT(*) FROM confirm_links").fetchone()[0] == 0
@@ -249,9 +256,34 @@ def test_another_familys_quote_is_not_found(conn, provider):
     foreign = quotes.create_quote(
         conn, provider, family_id=OTHER, source_currency="KES", target=gbp("6000.00"), now=NOW
     )
-    outcome = propose_fee_payment(conn, provider, quote_id=foreign.id)
+    outcome = propose_fee_payment(conn, provider, quote_id=foreign.id, fee_id=new_fee(conn))
     assert outcome.status == "blocked"
     assert "wasn't found" in outcome.message
+
+
+def test_a_fee_payment_with_no_fee_is_blocked(conn, provider):
+    # Bug caught: a PAY_FEE with no fee_id skipped every fee check (amount, payee, paid) and reached the PIN page.
+    outcome = propose_fee_payment(conn, provider, fee_id=None)
+    assert outcome.status == "blocked"
+    assert "This needs an invoice recorded first." in outcome.message
+    assert conn.execute("SELECT COUNT(*) FROM confirm_links").fetchone()[0] == 0
+
+
+def test_a_split_with_no_fee_is_blocked(conn):
+    # Bug caught: a SPLIT with no fee_id skipped the whole-fee and already-asked checks and asked relatives for money.
+    outcome = proposals.propose(
+        conn,
+        family_id=FAM,
+        actor=member(conn, "m_amina"),
+        kind=Kind.SPLIT,
+        now=NOW,
+        base_url=BASE_URL,
+        amount=gbp("6000.00"),
+        split=(("m_baraka", gbp("3500.00")), ("m_nakato", gbp("2500.00"))),
+    )
+    assert outcome.status == "blocked"
+    assert "This needs an invoice recorded first." in outcome.message
+    assert conn.execute("SELECT COUNT(*) FROM confirm_links").fetchone()[0] == 0
 
 
 def test_an_unknown_fee_is_blocked(conn, provider):
@@ -528,6 +560,6 @@ def test_freezing_one_family_leaves_the_other_running(conn):
 def test_balances_are_unchanged_by_proposing(conn, provider):
     # Bug caught: proposing moving money. Only the executor may.
     ledger.post(conn, family_id=FAM, at=NOW, amount=kes("5000000"), kind="collection", ref="seed")
-    propose_fee_payment(conn, provider)
+    propose_fee_payment(conn, provider, fee_id=new_fee(conn))
     assert ledger.balance(conn, FAM, "KES") == kes("5000000")
     assert conn.execute("SELECT COUNT(*) FROM payouts").fetchone()[0] == 0

@@ -59,6 +59,9 @@ def audit_decision(
 def fee_blocks(conn: sqlite3.Connection, p: Proposal, state: FamilyState) -> tuple[RuleResult, ...]:
     """Fee checks the rule checker can't make: they need the fees table, which is not part of the family's state."""
     if p.fee_id is None:
+        # Without a fee, none of the checks below can run, so a split or a payment must not go ahead without one.
+        if p.kind in (Kind.SPLIT, Kind.PAY_FEE):
+            return (_fee_block("This needs an invoice recorded first."),)
         return ()
     fee = store.get_fee(conn, p.family_id, p.fee_id)
     if fee is None:

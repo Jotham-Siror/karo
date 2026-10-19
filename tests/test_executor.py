@@ -180,11 +180,11 @@ def fund(conn, amount: Money = FUNDS) -> None:
     ledger.post(conn, family_id=FAM, at=NOW, amount=amount, kind="collection", ref="test-funds")
 
 
-def new_fee(conn, amount: str = "6000.00") -> str:
+def new_fee(conn, amount: str = "6000.00", payee: Payee | None = None) -> str:
     return store.insert_fee(
         conn,
         family_id=FAM,
-        payee=trusted(conn, "tp_westbridge"),
+        payee=payee or trusted(conn, "tp_westbridge"),
         amount=gbp(amount),
         due_date=None,
         invoice_ref="INV-77",
@@ -207,8 +207,10 @@ def propose(conn, provider, kind: Kind, *, actor: str = "m_amina", target: str |
 
 
 def propose_fee(conn, provider, *, fee_id: str | None = None, payee: Payee | None = None, target: str = "6000.00"):
+    payee = payee or trusted(conn, "tp_westbridge")
+    # A fee payment is refused without an invoice, so a test that doesn't care about the fee gets one that fits.
     return propose(
-        conn, provider, Kind.PAY_FEE, target=target, payee=payee or trusted(conn, "tp_westbridge"), fee_id=fee_id
+        conn, provider, Kind.PAY_FEE, target=target, payee=payee, fee_id=fee_id or new_fee(conn, target, payee)
     )
 
 
