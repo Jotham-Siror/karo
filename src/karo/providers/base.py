@@ -87,7 +87,10 @@ class Provider(Protocol):
         self, *, reference: str, amount: Money, debit_currency: str, payee: Payee, narration: str
     ) -> PayoutResult: ...
 
-    def payout_status(self, *, reference: str, provider_id: str | None) -> PayoutResult: ...
+    def payout_status(self, *, reference: str, provider_id: str | None) -> PayoutResult:
+        """`pending` with no provider_id means the provider has no record of this reference. It must not say `failed`
+        for that: a payout still being sent isn't visible yet, and `failed` makes Karo refund money that is leaving."""
+        ...
 
     def parse_notice(self, headers: Mapping[str, str], body: bytes) -> Notice | None:
         """None unless the notice is genuinely from this provider."""

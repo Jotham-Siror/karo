@@ -55,11 +55,12 @@ def provider() -> StandInProvider:
 
 
 class CrashingProvider:
-    """Raises from `payout` like a dropped connection. With `sent=True` the inner provider got the payment first."""
+    """The first `payout` raises like a dropped connection; later calls go through. With `sent=True` the inner
+    provider got that first payment before the connection dropped."""
 
     name = "standin"
 
-    def __init__(self, inner: StandInProvider, *, sent: bool) -> None:
+    def __init__(self, inner, *, sent: bool) -> None:
         self.inner = inner
         self.sent = sent
         self.payout_calls = 0
@@ -67,6 +68,8 @@ class CrashingProvider:
 
     def payout(self, **kwargs) -> PayoutResult:
         self.payout_calls += 1
+        if self.payout_calls > 1:
+            return self.inner.payout(**kwargs)
         if self.sent:
             self.inner.payout(**kwargs)
         raise ConnectionError("connection dropped")
@@ -129,6 +132,26 @@ class WatchingProvider:
             self.write_lock_free = True
         finally:
             other.close()
+        return self.inner.payout(**kwargs)
+
+    def payout_status(self, **kwargs) -> PayoutResult:
+        return self.inner.payout_status(**kwargs)
+
+
+class RivalDuringPayout:
+    """While the first caller's `payout` is in flight, a second execute for the same proposal runs."""
+
+    name = "standin"
+
+    def __init__(self, inner: StandInProvider, conn, proposal_id: str, rival_now: datetime) -> None:
+        self.inner = inner
+        self.conn = conn
+        self.proposal_id = proposal_id
+        self.rival_now = rival_now
+        self.rival = None
+
+    def payout(self, **kwargs) -> PayoutResult:
+        self.rival = run(self.conn, self.inner, self.proposal_id, now=self.rival_now)
         return self.inner.payout(**kwargs)
 
     def payout_status(self, **kwargs) -> PayoutResult:
@@ -279,23 +302,131 @@ def test_executing_twice_pays_once(conn, provider):
     assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
 
 
-def test_a_crash_before_the_provider_got_the_payment_is_reconciled_not_repeated(conn, provider):
-    # Bug caught: a crash mid-payment makes the retry call payout again.
+def test_a_retry_right_after_a_crash_leaves_the_payment_alone(conn, provider):
+    # Bug caught: a retry that finds no record reads it as failed and refunds a payout that may still be in flight.
     fund(conn)
     crashing = CrashingProvider(provider, sent=False)
     proposal_id = confirmed_fee_payment(conn, provider)
     with pytest.raises(ConnectionError):
         run(conn, crashing, proposal_id)
     assert count(conn, "payouts") == 1  # the row and the debit were already committed
+    before = (count(conn, "audit"), count(conn, "ledger"), conn.execute("SELECT updated_at FROM payouts").fetchone()[0])
+
+    retry = run(conn, crashing, proposal_id, now=NOW + timedelta(seconds=119))
+
+    assert retry.status == "pending"
+    assert (crashing.payout_calls, crashing.status_calls) == (1, 1)
+    after = (count(conn, "audit"), count(conn, "ledger"), conn.execute("SELECT updated_at FROM payouts").fetchone()[0])
+    assert after == before
+    assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
+    assert status_of(conn, proposal_id) == "confirmed"
+
+
+def test_a_payment_lost_in_a_crash_is_sent_again_after_two_minutes_under_the_same_reference(conn, provider):
+    # Bug caught: a payment that never reached the provider is never sent (the debit stands forever), or is
+    # sent under a new reference that could pay twice.
+    fund(conn)
+    crashing = CrashingProvider(provider, sent=False)
+    fee_id = new_fee(conn)
+    proposal_id = confirmed_fee_payment(conn, provider, fee_id=fee_id)
+    with pytest.raises(ConnectionError):
+        run(conn, crashing, proposal_id)
+
+    retry = run(conn, crashing, proposal_id, now=NOW + timedelta(minutes=2))
+
+    assert retry.status == "executed"
+    assert (crashing.payout_calls, crashing.status_calls) == (2, 1)
+    assert provider.payout_calls == 1
+    assert provider.payout_status(reference=f"karo-{proposal_id}", provider_id=None).status == "succeeded"
+    assert count(conn, "payouts") == 1
+    assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
+    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM ledger WHERE ref != 'test-funds' ORDER BY seq")]
+    assert kinds == ["payout"]
+    assert store.get_fee(conn, FAM, fee_id)["status"] == "paid"
+
+
+def test_a_second_execute_during_an_in_flight_payout_neither_refunds_nor_pays_twice(conn, provider):
+    # Bug caught: the rival reads "no record yet" as failed and refunds, the payout then lands unrecorded,
+    # the fee stays open and a new proposal pays it again.
+    fund(conn)
+    fee_id = new_fee(conn)
+    proposal_id = confirmed_fee_payment(conn, provider, fee_id=fee_id)
+    racing = RivalDuringPayout(provider, conn, proposal_id, rival_now=NOW + timedelta(seconds=30))
+
+    first = run(conn, racing, proposal_id)
+
+    assert racing.rival.status == "pending"
+    assert first.status == "executed"
+    assert provider.payout_calls == 1
+    assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
+    assert [r["kind"] for r in conn.execute("SELECT kind FROM ledger WHERE ref != 'test-funds'")] == ["payout"]
+    assert status_of(conn, proposal_id) == "executed"
+    assert store.get_fee(conn, FAM, fee_id)["status"] == "paid"
+    assert propose_fee(conn, provider, fee_id=fee_id).status == "blocked"
+
+
+def test_a_rival_that_sends_again_after_two_minutes_cannot_make_the_provider_pay_twice(conn, provider):
+    # Bug caught: re-sending a slow payout without the same reference pays the fee twice, or records it twice.
+    fund(conn)
+    proposal_id = confirmed_fee_payment(conn, provider)
+    racing = RivalDuringPayout(provider, conn, proposal_id, rival_now=NOW + timedelta(minutes=2))
+
+    first = run(conn, racing, proposal_id)
+
+    assert (racing.rival.status, first.status) == ("executed", "executed")
+    assert provider.payout_calls == 1
+    assert len(events(conn, "payout.sent")) == 1
+    assert len([t for t in texts(conn, "m_amina") if t.startswith("Paid ")]) == 1
     assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
 
-    retry = run(conn, crashing, proposal_id)
 
-    assert crashing.payout_calls == 1  # only the call that crashed
-    assert crashing.status_calls == 1
-    assert retry.status == "failed"  # the provider has no record of it, so nothing was paid
-    assert ledger.balance(conn, FAM, "KES") == FUNDS  # and the debit was given back
+def test_a_payout_the_provider_knows_is_never_sent_again_however_old(conn, provider):
+    # Bug caught: re-sending a payment the provider already has, only because it is still pending after a while.
+    fund(conn)
+    scripted = ScriptedProvider(status="pending")
+    proposal_id = confirmed_fee_payment(conn, provider)
+    assert run(conn, scripted, proposal_id).status == "pending"
+
+    again = run(conn, scripted, proposal_id, now=NOW + timedelta(hours=1))
+
+    assert again.status == "pending"
+    assert len(scripted.payouts) == 1
+    assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
+
+
+def test_a_payout_the_provider_reports_failed_is_refunded_on_a_later_check(conn, provider):
+    # Bug caught: a payout the provider says failed leaving the family out of pocket.
+    fund(conn)
+    scripted = ScriptedProvider(status="pending")
+    proposal_id = confirmed_fee_payment(conn, provider)
+    run(conn, scripted, proposal_id)
+    scripted.status = "failed"
+
+    result = run(conn, scripted, proposal_id, now=NOW + timedelta(minutes=1))
+
+    assert result.status == "failed"
+    assert ledger.balance(conn, FAM, "KES") == FUNDS
     assert status_of(conn, proposal_id) == "failed"
+
+
+def test_a_freeze_holds_the_re_send_of_a_lost_payment(conn, provider):
+    # Bug caught: money leaving after STOP because the re-send after a crash skipped the freeze.
+    fund(conn)
+    crashing = CrashingProvider(provider, sent=False)
+    proposal_id = confirmed_fee_payment(conn, provider)
+    with pytest.raises(ConnectionError):
+        run(conn, crashing, proposal_id)
+    proposals.freeze(conn, family_id=FAM, actor=member(conn, "m_baraka"), now=NOW)
+    later = NOW + timedelta(minutes=5)
+
+    held = run(conn, crashing, proposal_id, now=later)
+
+    assert held.status == "blocked"
+    assert crashing.payout_calls == 1
+    assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
+    conn.execute("UPDATE families SET frozen = 0 WHERE id = ?", (FAM,))
+    assert run(conn, crashing, proposal_id, now=later).status == "executed"
+    assert provider.payout_calls == 1
 
 
 def test_a_crash_after_the_provider_paid_is_settled_without_paying_again(conn, provider):
@@ -332,7 +463,8 @@ def test_a_retry_still_reconciles_when_the_debit_leaves_too_little_for_the_rules
 def test_two_callers_settling_the_same_failed_payout_return_the_money_once(conn, provider):
     # Bug caught: a retry racing another retry gives the debit back twice, so the family's balance grows.
     fund(conn)
-    crashing = CrashingProvider(provider, sent=False)
+    scripted = ScriptedProvider(status="failed")
+    crashing = CrashingProvider(scripted, sent=False)
     proposal_id = confirmed_fee_payment(conn, provider)
     with pytest.raises(ConnectionError):
         run(conn, crashing, proposal_id)
@@ -340,11 +472,11 @@ def test_two_callers_settling_the_same_failed_payout_return_the_money_once(conn,
     class Rival:
         """While this caller waits for the provider's answer, a rival caller settles the same payout first."""
 
-        name = "standin"
+        name = "scripted"
 
         def payout_status(self, **kwargs) -> PayoutResult:
-            assert run(conn, provider, proposal_id).status == "failed"
-            return provider.payout_status(**kwargs)
+            assert run(conn, scripted, proposal_id).status == "failed"
+            return scripted.payout_status(**kwargs)
 
     assert run(conn, Rival(), proposal_id).status == "failed"
     assert ledger.balance(conn, FAM, "KES") == FUNDS
@@ -416,9 +548,26 @@ def test_a_freeze_after_the_pin_blocks_the_payment_and_tells_the_main_payer(conn
     assert provider.payout_calls == 0
     assert count(conn, "payouts") == 0
     assert ledger.balance(conn, FAM, "KES") == FUNDS
+    assert status_of(conn, proposal_id) == "blocked"
     assert "frozen" in texts(conn, "m_amina")[-1]
     checked = [e for e in events(conn, "rules.checked") if e["data"]["stage"] == "execute"]
     assert [r["rule"] for r in checked[0]["data"]["results"] if r["outcome"] == "block"] == ["freeze"]
+
+
+def test_a_payment_blocked_at_execution_needs_a_fresh_pin_once_the_freeze_is_lifted(conn, provider):
+    # Bug caught: a freeze then an unfreeze inside the quote window lets a payment run on a PIN given before the
+    # freeze, with no new decision from the main payer.
+    fund(conn)
+    proposal_id = confirmed_fee_payment(conn, provider)
+    proposals.freeze(conn, family_id=FAM, actor=member(conn, "m_baraka"), now=NOW)
+    assert run(conn, provider, proposal_id).status == "blocked"
+    conn.execute("UPDATE families SET frozen = 0 WHERE id = ?", (FAM,))
+
+    again = run(conn, provider, proposal_id)
+
+    assert again.status == "not_confirmed"
+    assert provider.payout_calls == 0
+    assert count(conn, "payouts") == 0
 
 
 def test_an_expired_quote_is_rechecked_at_execution(conn, provider):
@@ -455,7 +604,8 @@ def test_a_new_payee_still_inside_its_wait_does_not_run(conn, provider):
     assert result.status == "waiting"
     assert "Tue 20 Oct, 11:00" in result.message
     assert provider.payout_calls == 0
-    assert status_of(conn, proposal_id) == "confirmed"
+    assert status_of(conn, proposal_id) == "waiting"
+    assert run(conn, provider, proposal_id).status == "not_confirmed"
     assert "new payee" in texts(conn, "m_amina")[-1]
 
 
@@ -637,6 +787,38 @@ def test_a_split_becomes_shares_that_add_up_to_the_fee(conn, provider):
     assert store.get_fee(conn, FAM, fee_id)["status"] == "collecting"
     assert status_of(conn, outcome.proposal_id) == "executed"
     assert len(events(conn, "split.created")) == 1
+
+
+def test_a_second_split_confirmed_before_the_first_ran_is_blocked_at_execution(conn, provider):
+    # Bug caught: relatives asked for the same fee twice because the second split was only checked when proposed.
+    fee_id = new_fee(conn)
+    split = (("m_baraka", gbp("3500.00")), ("m_nakato", gbp("2500.00")))
+    propose(conn, provider, Kind.SPLIT, amount=gbp("6000.00"), fee_id=fee_id, split=split)
+    first = confirm(conn)
+    propose(conn, provider, Kind.SPLIT, amount=gbp("6000.00"), fee_id=fee_id, split=split)
+    second = confirm(conn)
+    assert run(conn, provider, first).status == "executed"
+
+    result = run(conn, provider, second)
+
+    assert result.status == "blocked"
+    assert "already been asked" in result.message
+    assert len(store.shares_for_fee(conn, FAM, fee_id)) == 2
+    assert status_of(conn, second) == "blocked"
+
+
+def test_a_fee_edited_after_the_proposal_blocks_the_payment(conn, provider):
+    # Bug caught: paying an amount that no longer matches the invoice because the fee was only checked when proposed.
+    fund(conn)
+    fee_id = new_fee(conn)
+    proposal_id = confirmed_fee_payment(conn, provider, fee_id=fee_id)
+    conn.execute("UPDATE fees SET amount_minor = 700000 WHERE id = ?", (fee_id,))
+
+    result = run(conn, provider, proposal_id)
+
+    assert result.status == "blocked"
+    assert "full amount" in result.message
+    assert provider.payout_calls == 0
 
 
 def test_each_relative_is_told_their_own_share(conn, provider):

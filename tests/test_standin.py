@@ -5,6 +5,8 @@ import hmac
 import json
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 import pytest
@@ -274,12 +276,29 @@ def test_payout_status_returns_the_stored_result(provider):
     assert provider.payout_status(reference="ref-1", provider_id=made.provider_id) == made
 
 
-def test_payout_status_for_an_unknown_reference_is_failed_with_a_message(provider):
-    # Bug caught: an unknown reference reported as succeeded, or raising instead of answering.
+def test_payout_status_for_an_unknown_reference_is_pending_not_failed(provider):
+    # Bug caught: "not found" read as failed, so a payout still in flight is refunded and later paid unrecorded.
     result = provider.payout_status(reference="nope", provider_id=None)
-    assert (result.reference, result.status) == ("nope", "failed")
-    assert result.message
+    assert (result.reference, result.status, result.provider_id) == ("nope", "pending", None)
+    assert result.message == "not found"
     assert provider.payout_calls == 0
+
+
+def test_concurrent_payouts_with_one_reference_count_once(provider):
+    # Bug caught: two threads both passing the "already paid?" check and both paying the same reference.
+    class SlowLookup(dict):
+        """Widens the window between the check and the store, so an unlocked provider is caught every time."""
+
+        def get(self, key, default=None):
+            found = super().get(key, default)
+            time.sleep(0.02)
+            return found
+
+    provider._payouts = SlowLookup()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: pay_out(provider, "ref-race"), range(4)))
+    assert provider.payout_calls == 1
+    assert len({r.provider_id for r in results}) == 1
 
 
 # --- shape -----------------------------------------------------------------

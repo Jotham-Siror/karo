@@ -61,12 +61,26 @@ def fee_blocks(conn: sqlite3.Connection, p: Proposal) -> tuple[RuleResult, ...]:
         return ()
     fee = store.get_fee(conn, p.family_id, p.fee_id)
     if fee is None:
-        return (RuleResult("fee", Outcome.BLOCK, "That fee wasn't found."),)
+        return (_fee_block("That fee wasn't found."),)
     if fee["status"] == "paid":
-        return (RuleResult("fee", Outcome.BLOCK, "That fee has already been paid."),)
-    if p.kind is Kind.PAY_FEE and _payment_under_way(conn, p):
-        return (RuleResult("fee", Outcome.BLOCK, "A payment for that fee is already under way."),)
+        return (_fee_block("That fee has already been paid."),)
+    fee_amount = Money(fee["amount_minor"], fee["currency"])
+    if p.kind is Kind.SPLIT:
+        # The split rule makes the shares add up to p.amount, so p.amount being the whole fee makes them add up to it.
+        if p.amount != fee_amount:
+            return (_fee_block(f"The split has to cover the whole fee of {fee_amount}."),)
+        if fee["status"] != "open" or store.shares_for_fee(conn, p.family_id, p.fee_id):
+            return (_fee_block("Shares have already been asked for on that fee."),)
+    if p.kind is Kind.PAY_FEE:
+        if p.amount != fee_amount:
+            return (_fee_block(f"The payment has to be the fee's full amount of {fee_amount}."),)
+        if _payment_under_way(conn, p):
+            return (_fee_block("A payment for that fee is already under way."),)
     return ()
+
+
+def _fee_block(reason: str) -> RuleResult:
+    return RuleResult("fee", Outcome.BLOCK, reason)
 
 
 def _payment_under_way(conn: sqlite3.Connection, p: Proposal) -> bool:
@@ -106,7 +120,10 @@ def summary(p: Proposal, state: FamilyState) -> str:
                 return f"Convert money to get {p.amount}"
             return f"Convert {p.quote.source} into {p.quote.target}"
         case Kind.ADD_PAYEE:
-            return f"Add {payee} to the trusted payees"
+            # Every detail, because the PIN approves exactly this and the account is what makes a payee trusted.
+            pairs = p.payee.details if p.payee is not None else ()
+            details = ", ".join(f"{field.replace('_', ' ')} {value}" for field, value in pairs)
+            return f"Add {payee} to the trusted payees" + (f" ({details})" if details else "")
         case Kind.UNFREEZE:
             return "Unfreeze Karo so money can move again"
 

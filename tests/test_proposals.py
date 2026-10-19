@@ -270,6 +270,55 @@ def test_a_fee_that_is_already_paid_is_blocked(conn, provider):
     assert "already been paid" in outcome.message
 
 
+def test_a_split_that_does_not_cover_the_fee_is_blocked(conn):
+    # Bug caught: relatives asked for GBP 10,000 against a GBP 6,000 invoice.
+    outcome = proposals.propose(
+        conn,
+        family_id=FAM,
+        actor=member(conn, "m_amina"),
+        kind=Kind.SPLIT,
+        now=NOW,
+        base_url=BASE_URL,
+        amount=gbp("10000.00"),
+        fee_id=new_fee(conn),
+        split=(("m_baraka", gbp("6000.00")), ("m_nakato", gbp("4000.00"))),
+    )
+    assert outcome.status == "blocked"
+    assert "whole fee of GBP 6,000.00" in outcome.message
+    assert conn.execute("SELECT COUNT(*) FROM confirm_links").fetchone()[0] == 0
+
+
+def test_a_second_split_of_the_same_fee_is_blocked(conn):
+    # Bug caught: the same fee split twice, so relatives are asked to pay it twice over.
+    fee_id = new_fee(conn)
+    conn.execute(
+        "INSERT INTO shares (id, family_id, fee_id, member_id, amount_minor, currency, created_at) "
+        "VALUES ('sh_1', ?, ?, 'm_baraka', 600000, 'GBP', ?)",
+        (FAM, fee_id, clock.iso(NOW)),
+    )
+    conn.execute("UPDATE fees SET status = 'collecting' WHERE id = ?", (fee_id,))
+    outcome = proposals.propose(
+        conn,
+        family_id=FAM,
+        actor=member(conn, "m_amina"),
+        kind=Kind.SPLIT,
+        now=NOW,
+        base_url=BASE_URL,
+        amount=gbp("6000.00"),
+        fee_id=fee_id,
+        split=(("m_baraka", gbp("3500.00")), ("m_nakato", gbp("2500.00"))),
+    )
+    assert outcome.status == "blocked"
+    assert "already been asked" in outcome.message
+
+
+def test_a_fee_payment_for_another_amount_than_the_fee_is_blocked(conn, provider):
+    # Bug caught: a payment of one amount marking an invoice for a different amount as paid.
+    outcome = propose_fee_payment(conn, provider, fee_id=new_fee(conn), target="5000.00")
+    assert outcome.status == "blocked"
+    assert "full amount of GBP 6,000.00" in outcome.message
+
+
 def test_adding_a_payee_without_naming_one_is_blocked(conn):
     # Bug caught: an ADD_PAYEE proposal with nothing to add reaching the PIN page.
     outcome = proposals.propose(
@@ -372,6 +421,16 @@ def test_summary_of_a_split_names_who_pays_what(conn):
     assert "GBP 4,000.00" in text
     assert "Baraka GBP 2,500.00" in text and "Nakato GBP 1,500.00" in text
     assert "m_baraka" not in text
+
+
+def test_the_add_payee_summary_shows_the_name_and_every_bank_detail(conn):
+    # Bug caught: a PIN approving an account the main payer was never shown.
+    payee = Payee.of("Hall of Residence", country="GB", currency="GBP", sort_code="11-22-33", account_number="87654321")
+    p = Proposal(id="prop_a", family_id=FAM, kind=Kind.ADD_PAYEE, requested_by="m_amina", payee=payee)
+    text = proposals.summary(p, store.load_state(conn, FAM, NOW))
+    assert "Hall of Residence" in text
+    assert "account number 87654321" in text and "sort code 11-22-33" in text
+    assert "country GB" in text and "currency GBP" in text
 
 
 def test_every_kind_has_a_summary(conn):

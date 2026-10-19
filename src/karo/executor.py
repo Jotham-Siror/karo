@@ -13,10 +13,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
 from karo import approvals, audit, db, ledger, outbox, proposals, rules, store
+from karo import clock
 from karo.clock import iso
 from karo.domain import CheckContext, Confirmation, FamilyState, Kind, Member, Payee, Proposal, Stage, TrustedPayee
 from karo.money import Money
@@ -26,6 +27,10 @@ from karo.rules import Decision, Outcome
 ExecutionStatus = Literal["executed", "failed", "pending", "blocked", "waiting", "not_confirmed", "unsupported"]
 
 ALLOWANCE_DAY = 1  # the demo's "1st of the month"; a chosen day comes later
+
+# A payout row the provider has no record of is probably still being sent by another execute. Younger than this,
+# leave it alone; older, assume the call never left and send it again under the same reference.
+RECONCILE_GRACE = timedelta(minutes=2)
 
 _NOT_CONFIRMED = {
     "executed": "That has already been done.",
@@ -51,10 +56,12 @@ class _PayoutJob:
     payout_id: str
     reference: str
     provider_id: str | None
-    payee: Payee | None  # the stored record to pay; None when only asking for the status
+    payee: Payee | None  # the stored record to pay; None if the trusted payee is gone, which stops any re-send
     payee_name: str
     narration: str
-    is_new: bool  # False: the row is left from an earlier attempt, so ask the provider; never pay again
+    created_at: datetime
+    is_new: bool  # False: the row is left from an earlier attempt, so ask the provider before anything else
+    frozen: bool = False
 
 
 def execute(
@@ -66,18 +73,43 @@ def execute(
     step = _prepare(conn, provider.name, family_id=family_id, proposal_id=proposal_id, now=now)
     if isinstance(step, ExecutionOutcome):
         return step
-    p = step.proposal
     if step.is_new:
-        result = provider.payout(
-            reference=step.reference,
-            amount=p.amount,
-            debit_currency=p.quote.source.currency,
-            payee=step.payee,
-            narration=step.narration,
-        )
+        result = _send(provider, step)
     else:
         result = provider.payout_status(reference=step.reference, provider_id=step.provider_id)
+        if _provider_has_no_record(step, result):
+            held = _hold_back(step, now)
+            if held is not None:
+                return held
+            # Providers deduplicate by reference, so if the first call did land this pays nothing twice.
+            result = _send(provider, step)
     return _settle(conn, step, result, now)
+
+
+def _send(provider: Provider, job: _PayoutJob) -> PayoutResult:
+    p = job.proposal
+    return provider.payout(
+        reference=job.reference,
+        amount=p.amount,
+        debit_currency=p.quote.source.currency,
+        payee=job.payee,
+        narration=job.narration,
+    )
+
+
+def _provider_has_no_record(job: _PayoutJob, result: PayoutResult) -> bool:
+    # A provider that knows the transfer has an id for it. "Pending, no id" is "not found yet", never "failed".
+    return result.status == "pending" and result.provider_id is None and job.provider_id is None
+
+
+def _hold_back(job: _PayoutJob, now: datetime) -> ExecutionOutcome | None:
+    """None means the payment may be sent again. Anything else is the answer to give instead."""
+    if job.payee is None or now - job.created_at < RECONCILE_GRACE:
+        return _pending(job)
+    if job.frozen:
+        # The debit stays and the row stays pending, so a retry after the unfreeze sends it.
+        return ExecutionOutcome("blocked", "Karo is frozen, so this payment is on hold.", job.payout_id)
+    return None
 
 
 # --- step 1: checks, and for a payout the row and the debit -----------------------------------
@@ -102,7 +134,7 @@ def _prepare(
         if earlier is not None:
             # The rules already passed and the debit is posted. Asking the provider moves no money, and re-running
             # funds and the daily cap would count this same payment a second time and block the reconcile.
-            return _reconcile_job(p, state, earlier)
+            return _reconcile_job(conn, p, state, earlier)
 
         confirmation = approvals.confirmation_for(conn, family_id, proposal_id)
         actor = _actor(conn, p, confirmation)
@@ -129,6 +161,9 @@ def _stopped(
 ) -> ExecutionOutcome:
     main = store.main_payer(conn, p.family_id)
     what = proposals.summary(p, state)
+    # Not left `confirmed`: a payment stopped here, say by a freeze, needs a fresh PIN to run once it is lifted.
+    status = "blocked" if decision.verdict is Outcome.BLOCK else "waiting"
+    store.update_proposal(conn, p.family_id, p.id, status=status, decision=decision, now=now)
     if decision.verdict is Outcome.BLOCK:
         reasons = proposals.block_reasons(decision)
         outbox.notify(conn, main.id, f"Stopped: {what}. {reasons}", now)
@@ -224,20 +259,29 @@ def _start_payout(
             "debit": str(quote.source),
         },
     )
-    return _PayoutJob(p, payout_id, reference, None, target.payee, target.payee.name, _narration(conn, p), True)
+    return _PayoutJob(p, payout_id, reference, None, target.payee, target.payee.name, _narration(conn, p), now, True)
 
 
-def _reconcile_job(p: Proposal, state: FamilyState, earlier: sqlite3.Row) -> _PayoutJob:
+def _reconcile_job(conn: sqlite3.Connection, p: Proposal, state: FamilyState, earlier: sqlite3.Row) -> _PayoutJob:
     target = _matched(p, state)
-    name = p.payee.name if target is None else target.payee.name
-    return _PayoutJob(p, earlier["id"], earlier["reference"], earlier["provider_id"], None, name, "", False)
+    return _PayoutJob(
+        p,
+        earlier["id"],
+        earlier["reference"],
+        earlier["provider_id"],
+        None if target is None else target.payee,
+        p.payee.name if target is None else target.payee.name,
+        _narration(conn, p),
+        clock.parse(earlier["created_at"]),
+        False,
+        state.frozen,
+    )
 
 
 # --- step 3: the provider's answer ------------------------------------------------------------
 
 
 def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now: datetime) -> ExecutionOutcome:
-    p = job.proposal
     with db.transaction(conn):
         row = _payout_row(conn, job)
         # Another caller may have settled it while this one waited on the provider; then there is nothing to add.
@@ -248,11 +292,13 @@ def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
         return ExecutionOutcome("executed", _receipt(job, row["provider_id"], bool(row["simulated"])), job.payout_id)
     if row["status"] == "failed":
         return ExecutionOutcome("failed", _failure_text(job), job.payout_id)
-    return ExecutionOutcome(
-        "pending",
-        f"The payment of {p.amount} to {job.payee_name} is on its way. Reference {job.reference}.",
-        job.payout_id,
-    )
+    return _pending(job)
+
+
+def _pending(job: _PayoutJob) -> ExecutionOutcome:
+    p = job.proposal
+    message = f"The payment of {p.amount} to {job.payee_name} is on its way. Reference {job.reference}."
+    return ExecutionOutcome("pending", message, job.payout_id)
 
 
 def _payout_row(conn: sqlite3.Connection, job: _PayoutJob) -> sqlite3.Row:

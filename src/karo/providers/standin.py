@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 from collections.abc import Mapping
 from decimal import ROUND_CEILING, Decimal, localcontext
 from pathlib import Path
@@ -35,6 +36,7 @@ class StandInProvider:
         self._amounts: dict[str, Money] = {}
         self._paid: set[str] = set()
         self._payouts: dict[str, PayoutResult] = {}
+        self._payout_lock = threading.Lock()
         self.payout_calls = 0
 
     @classmethod
@@ -95,19 +97,24 @@ class StandInProvider:
     def payout(
         self, *, reference: str, amount: Money, debit_currency: str, payee: Payee, narration: str
     ) -> PayoutResult:
-        stored = self._payouts.get(reference)
-        if stored is not None:
-            return stored
-        self.payout_calls += 1
-        result = PayoutResult(reference, f"SI-{reference}", "succeeded", True, "Simulated payout. No real money moved.")
-        self._payouts[reference] = result
-        return result
+        # Held across the check and the store: two callers with one reference must make one payout.
+        with self._payout_lock:
+            stored = self._payouts.get(reference)
+            if stored is not None:
+                return stored
+            self.payout_calls += 1
+            result = PayoutResult(
+                reference, f"SI-{reference}", "succeeded", True, "Simulated payout. No real money moved."
+            )
+            self._payouts[reference] = result
+            return result
 
     def payout_status(self, *, reference: str, provider_id: str | None) -> PayoutResult:
         stored = self._payouts.get(reference)
         if stored is not None:
             return stored
-        return PayoutResult(reference, None, "failed", True, "No payout found for that reference.")
+        # Not "failed": a payout still being sent isn't visible yet either. Only a provider that says so fails one.
+        return PayoutResult(reference, None, "pending", True, "not found")
 
     def parse_notice(self, headers: Mapping[str, str], body: bytes) -> Notice | None:
         sent = {name.lower(): value for name, value in headers.items()}.get(SIGNATURE_HEADER)
