@@ -821,6 +821,25 @@ def test_a_fee_edited_after_the_proposal_blocks_the_payment(conn, provider):
     assert provider.payout_calls == 0
 
 
+def test_a_fee_whose_payee_is_changed_after_the_proposal_blocks_the_payment(conn, provider):
+    # Bug caught: paying the university's account for an invoice that now names someone else, because the
+    # payee was only matched to the fee when proposed.
+    fund(conn)
+    fee_id = new_fee(conn)
+    proposal_id = confirmed_fee_payment(conn, provider, fee_id=fee_id)
+    son = trusted(conn, "tp_jabali")
+    conn.execute(
+        "UPDATE fees SET payee_name = ?, payee_details_json = ? WHERE id = ?",
+        (son.name, json.dumps(dict(son.details)), fee_id),
+    )
+
+    result = run(conn, provider, proposal_id)
+
+    assert result.status == "blocked"
+    assert "payee doesn't match the invoice for this fee" in result.message
+    assert provider.payout_calls == 0
+
+
 def test_each_relative_is_told_their_own_share(conn, provider):
     # Bug caught: relatives not told what they owe, or told someone else's amount.
     outcome = propose(

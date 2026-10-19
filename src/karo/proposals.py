@@ -5,6 +5,7 @@ The confirm link goes to the main payer's outbox and nowhere else. The outcome t
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -55,7 +56,7 @@ def audit_decision(
     )
 
 
-def fee_blocks(conn: sqlite3.Connection, p: Proposal) -> tuple[RuleResult, ...]:
+def fee_blocks(conn: sqlite3.Connection, p: Proposal, state: FamilyState) -> tuple[RuleResult, ...]:
     """Fee checks the rule checker can't make: they need the fees table, which is not part of the family's state."""
     if p.fee_id is None:
         return ()
@@ -74,9 +75,22 @@ def fee_blocks(conn: sqlite3.Connection, p: Proposal) -> tuple[RuleResult, ...]:
     if p.kind is Kind.PAY_FEE:
         if p.amount != fee_amount:
             return (_fee_block(f"The payment has to be the fee's full amount of {fee_amount}."),)
+        if not _same_trusted_payee(
+            p.payee, Payee.of(fee["payee_name"], **json.loads(fee["payee_details_json"])), state
+        ):
+            return (_fee_block("This payment's payee doesn't match the invoice for this fee."),)
         if _payment_under_way(conn, p):
             return (_fee_block("A payment for that fee is already under way."),)
     return ()
+
+
+def _same_trusted_payee(claim: Payee | None, invoice: Payee, state: FamilyState) -> bool:
+    """Both resolve to one trusted payee. With no payee at all the trusted_payee rule already blocks."""
+    if claim is None:
+        return True
+    paying, _ = rules.match_payee(claim, state.trusted_payees)
+    owed, _ = rules.match_payee(invoice, state.trusted_payees)
+    return paying is not None and owed is not None and paying.id == owed.id
 
 
 def _fee_block(reason: str) -> RuleResult:
@@ -128,13 +142,15 @@ def summary(p: Proposal, state: FamilyState) -> str:
             return "Unfreeze Karo so money can move again"
 
 
-def _lookup_blocks(conn: sqlite3.Connection, p: Proposal, quote_id: str | None) -> tuple[RuleResult, ...]:
+def _lookup_blocks(
+    conn: sqlite3.Connection, p: Proposal, state: FamilyState, quote_id: str | None
+) -> tuple[RuleResult, ...]:
     blocks = []
     if quote_id is not None and p.quote is None:
         blocks.append(RuleResult("quote_lookup", Outcome.BLOCK, "That quote wasn't found."))
     if p.kind is Kind.ADD_PAYEE and p.payee is None:
         blocks.append(RuleResult("payee", Outcome.BLOCK, "There is no payee to add."))
-    return tuple(blocks) + fee_blocks(conn, p)
+    return tuple(blocks) + fee_blocks(conn, p, state)
 
 
 def _status_for(kind: Kind, verdict: Outcome) -> ProposalStatus:
@@ -194,7 +210,7 @@ def propose(
         )
         state = store.load_state(conn, family_id, now)
         checked = rules.check(p, state, CheckContext(now, Stage.PROPOSE, actor))
-        decision = Decision(_lookup_blocks(conn, p, quote_id) + checked.results)
+        decision = Decision(_lookup_blocks(conn, p, state, quote_id) + checked.results)
         status = _status_for(kind, decision.verdict)
 
         config = store.family_config(conn, family_id)

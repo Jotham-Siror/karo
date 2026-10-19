@@ -140,7 +140,7 @@ def _prepare(
         actor = _actor(conn, p, confirmation)
         by = "system" if confirmation is None else confirmation.member_id
         checked = rules.check(p, state, CheckContext(now, Stage.EXECUTE, actor, confirmation))
-        decision = Decision(proposals.fee_blocks(conn, p) + checked.results)
+        decision = Decision(proposals.fee_blocks(conn, p, state) + checked.results)
         proposals.audit_decision(conn, p=p, stage=Stage.EXECUTE, decision=decision, actor=by, now=now)
         if decision.verdict is not Outcome.PASS:
             return _stopped(conn, p, state, decision, now)

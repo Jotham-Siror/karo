@@ -319,6 +319,40 @@ def test_a_fee_payment_for_another_amount_than_the_fee_is_blocked(conn, provider
     assert "full amount of GBP 6,000.00" in outcome.message
 
 
+def test_a_fee_payment_to_another_trusted_account_than_the_invoices_is_blocked(conn, provider):
+    # Bug caught: the university fee paid to the son's trusted account (same amount), marking the invoice paid.
+    state = store.load_state(conn, FAM, NOW)
+    sons_account = next(t.payee for t in state.trusted_payees if t.id == "tp_jabali")
+    outcome = propose_fee_payment(conn, provider, payee=sons_account, fee_id=new_fee(conn))
+    assert outcome.status == "blocked"
+    assert "payee doesn't match the invoice for this fee" in outcome.message
+    assert conn.execute("SELECT COUNT(*) FROM confirm_links").fetchone()[0] == 0
+
+
+def test_the_invoices_own_payee_written_differently_still_matches(conn, provider):
+    # Bug caught: the payee check comparing names or text, so a fee for the university fails over a label or a hyphen.
+    claim = Payee.of(
+        "UNIVERSITY OF WESTBRIDGE (Fees Office)",
+        country="GB",
+        currency="GBP",
+        sort_code="204060",
+        account_number="4123 4567",
+    )
+    outcome = propose_fee_payment(conn, provider, payee=claim, fee_id=new_fee(conn))
+    assert outcome.status == "awaiting_pin"
+
+
+def test_a_fee_whose_invoice_payee_is_not_trusted_cannot_be_paid_to_a_trusted_one(conn, provider):
+    # Bug caught: an invoice from an unknown payee marked paid by a payment to the university's account.
+    stranger = Payee.of("Quick Fees Ltd", country="GB", currency="GBP", sort_code="99-99-99", account_number="00000001")
+    fee_id = store.insert_fee(
+        conn, family_id=FAM, payee=stranger, amount=gbp("6000.00"), due_date=None, invoice_ref=None, now=NOW
+    )
+    outcome = propose_fee_payment(conn, provider, fee_id=fee_id)
+    assert outcome.status == "blocked"
+    assert "payee doesn't match the invoice for this fee" in outcome.message
+
+
 def test_adding_a_payee_without_naming_one_is_blocked(conn):
     # Bug caught: an ADD_PAYEE proposal with nothing to add reaching the PIN page.
     outcome = proposals.propose(
