@@ -34,6 +34,16 @@ def record(conn, event="e", *, family_id="fam-1", data=None, at=NOW):
     return audit.record(conn, at=at, family_id=family_id, actor="system", event=event, data=data or {})
 
 
+def tamper(db_path, sql):
+    """Run `sql` on a second connection after dropping the append-only triggers, as someone holding the file would."""
+    attacker = db.connect(db_path)
+    try:
+        attacker.execute("DROP TRIGGER audit_no_update")
+        attacker.execute(sql)
+    finally:
+        attacker.close()
+
+
 def audit_rows(conn):
     return conn.execute("SELECT * FROM audit ORDER BY seq").fetchall()
 
@@ -251,6 +261,17 @@ def test_verify_reports_a_row_whose_stored_data_cannot_be_read(db_path, conn, ga
     assert audit.verify(conn) == (False, target)
 
 
+@pytest.mark.parametrize("column", ["data_json", "prev_hash", "hash", "actor", "event", "at", "family_id"])
+def test_verify_reports_a_row_with_invalid_utf8_in_any_column(db_path, conn, column):
+    # Bug caught: verify crashing while fetching a row whose TEXT column holds bytes that are not valid UTF-8.
+    record(conn, "a")
+    target = record(conn, "b", data={"amount": 100})
+    record(conn, "c")
+    # A Python bind parameter cannot store invalid UTF-8 as TEXT; only a SQL CAST can.
+    tamper(db_path, f"UPDATE audit SET {column} = CAST(X'FFFE' AS TEXT) WHERE seq = {target}")
+    assert audit.verify(conn) == (False, target)
+
+
 def test_chain_continues_across_a_fresh_connection(db_path):
     # Bug caught: keeping the chain head in memory, so every restart forked the chain from GENESIS.
     first_conn = db.connect(db_path)
@@ -344,3 +365,26 @@ def test_events_limit_keeps_the_newest(conn):
     for n in range(5):
         record(conn, f"e{n}")
     assert [e["event"] for e in audit.events(conn, limit=2)] == ["e4", "e3"]
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("data_json", "CAST(X'FFFE' AS TEXT)"),
+        ("data_json", "'not json'"),
+        ("actor", "CAST(X'FFFE' AS TEXT)"),
+    ],
+    ids=["data-invalid-utf8", "data-not-json", "other-column-invalid-utf8"],
+)
+def test_events_returns_a_tampered_row_as_unreadable_instead_of_raising(db_path, conn, column, value):
+    # Bug caught: one tampered row crashing the whole log view, hiding the very tampering it should show.
+    record(conn, "a", data={"n": 1})
+    target = record(conn, "b", data={"n": 2})
+    record(conn, "c", data={"n": 3})
+    tamper(db_path, f"UPDATE audit SET {column} = {value} WHERE seq = {target}")
+    events = audit.events(conn)
+    assert [e["seq"] for e in events] == [3, target, 1]
+    assert events[1]["data"] == {"unreadable": True}
+    assert events[0]["data"] == {"n": 3} and events[2]["data"] == {"n": 1}
+    assert {frozenset(e) for e in events} == {frozenset({"seq", "at", "family_id", "actor", "event", "data", "hash"})}
+
