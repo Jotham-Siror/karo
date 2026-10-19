@@ -87,12 +87,14 @@ def _examples(fair: Decimal, target: Money, source: str) -> list[Option]:
 def _line(pick: Option, examples: list[Option], markup: Decimal | None) -> str:
     """One sentence for the agent to repeat word for word."""
     line = f"{pick.name}: you pay {pick.you_pay} and {pick.they_receive} arrives in about a day"
+    if markup is None:
+        # Without the market rate the examples are priced from the provider's own cost, so they always come out
+        # dearer. Any saving claimed against them would be a claim against our own rate.
+        return line + "."
     wire = next((o for o in examples if o.name.startswith(_BANK_WIRE)), None)
     if wire is not None:
         saving = wire.you_pay.minor - pick.you_pay.minor
         gap = Money(abs(saving), pick.you_pay.currency)
         line += f", {gap} {'less' if saving >= 0 else 'more'} than a typical bank wire (example figures)"
-    if markup is not None:
-        side = "below" if markup < 0 else "above"
-        line += f"; its rate is {abs(markup)}% {side} the market rate ({rates.ATTRIBUTION})"
-    return line + "."
+    side = "below" if markup < 0 else "above"
+    return line + f"; its rate is {abs(markup)}% {side} the market rate ({rates.ATTRIBUTION})."

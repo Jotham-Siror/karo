@@ -239,13 +239,14 @@ def test_a_provider_dearer_than_the_bank_wire_says_how_much_more(conn, exchange_
     assert "less than" not in result.line and re.search(r"-\s*\d", result.line) is None
 
 
-def test_without_the_market_rate_the_line_drops_the_markup_and_the_attribution(conn, exchange_api):
-    # Bug caught: a markup claim made with no market rate behind it, or an attribution for a rate that wasn't used.
+def test_without_the_market_rate_the_line_makes_no_comparison_at_all(conn, exchange_api):
+    # Bug caught: a saving stated against our own rate (the examples are priced from it, so it is always "cheaper"),
+    # a markup claim with no market rate behind it, or an attribution for a rate that wasn't used.
     result = compare(conn, provider_at("0.0049"), exchange_api, mid=None)
     assert result.line == (
-        "Stand-in provider (simulated): you pay KES 1,224,489.80 and GBP 6,000.00 arrives in about a day, "
-        "KES 52,479.60 less than a typical bank wire (example figures)."
+        "Stand-in provider (simulated): you pay KES 1,224,489.80 and GBP 6,000.00 arrives in about a day."
     )
+    assert [o.is_example for o in result.options] == [False, True, True]  # the options are still there, as examples
 
 
 def test_a_family_not_paid_in_kes_gets_no_example_it_cannot_price(conn, exchange_api):
