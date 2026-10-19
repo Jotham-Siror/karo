@@ -1,0 +1,18 @@
+[
+  {
+    "name": "University of Westbridge",
+    "country": "GB",
+    "currency": "GBP",
+    "sort_code": "20-40-60",
+    "account_number": "41234567",
+    "test_data": true
+  },
+  {
+    "name": "Northvale College",
+    "country": "GB",
+    "currency": "GBP",
+    "sort_code": "30-11-22",
+    "account_number": "55501234",
+    "test_data": true
+  }
+]

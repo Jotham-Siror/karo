@@ -1,0 +1,34 @@
+{
+  "KE": {
+    "name": "Kenya",
+    "currency": "KES",
+    "timezone": "Africa/Nairobi",
+    "phone_region": "KE",
+    "collect_methods": [
+      {"id": "mpesa", "label": "M-Pesa", "flutterwave_option": "mpesa"},
+      {"id": "card", "label": "Card", "flutterwave_option": "card"}
+    ],
+    "payout_fields": ["phone"]
+  },
+  "UG": {
+    "name": "Uganda",
+    "currency": "UGX",
+    "timezone": "Africa/Kampala",
+    "phone_region": "UG",
+    "collect_methods": [
+      {"id": "mtn_ug", "label": "MTN Mobile Money", "flutterwave_option": "mobilemoneyuganda"},
+      {"id": "card", "label": "Card", "flutterwave_option": "card"}
+    ],
+    "payout_fields": ["phone"]
+  },
+  "GB": {
+    "name": "United Kingdom",
+    "currency": "GBP",
+    "timezone": "Europe/London",
+    "phone_region": "GB",
+    "collect_methods": [
+      {"id": "card", "label": "Card", "flutterwave_option": "card"}
+    ],
+    "payout_fields": ["sort_code", "account_number"]
+  }
+}
