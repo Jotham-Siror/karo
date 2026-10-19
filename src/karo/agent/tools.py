@@ -18,7 +18,7 @@ from karo import audit, db, outbox, proposals, quotes, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
-from karo.rules import Outcome
+from karo.rules import Outcome, RuleResult
 
 # Larger than any real fee, small enough that SQLite stores it as an INTEGER.
 _MAX_MINOR = 10**14
@@ -200,45 +200,101 @@ def _record_invoice(ctx: ToolContext, args: dict) -> dict:
         except ValueError as exc:
             raise _BadInput("due_date has to look like 2026-11-30, or be an empty string.") from exc
 
-    verdict = rules.check_payee(payee, store.load_state(ctx.conn, ctx.family_id, ctx.now))
+    # One transaction for the checks and the insert, so a repeat sent at the same moment can't slip between them.
     with db.transaction(ctx.conn):
-        if verdict.outcome is Outcome.BLOCK:
-            audit.record(
-                ctx.conn,
-                at=ctx.now,
-                family_id=ctx.family_id,
-                actor=ctx.member.id,
-                event="invoice.blocked",
-                data={
-                    "payee": payee.name,
-                    "details": dict(payee.details),
-                    "amount": str(amount),
-                    "reason": verdict.reason,
-                    "warned": verdict.warn,
-                },
-            )
-            if verdict.warn:
-                main = store.main_payer(ctx.conn, ctx.family_id)
-                outbox.notify(ctx.conn, main.id, f"Warning: {verdict.reason}", ctx.now)
-            return {"accepted": False, "reason": verdict.reason}
-        fee_id = store.insert_fee(
-            ctx.conn,
-            family_id=ctx.family_id,
-            payee=payee,
-            amount=amount,
-            due_date=due_date,
-            invoice_ref=args["invoice_ref"].strip() or None,
-            now=ctx.now,
-        )
-        audit.record(
-            ctx.conn,
-            at=ctx.now,
-            family_id=ctx.family_id,
-            actor=ctx.member.id,
-            event="invoice.recorded",
-            data={"fee_id": fee_id, "payee": payee.name, "amount": str(amount)},
-        )
+        return _file_invoice(ctx, payee, amount, due_date, args["invoice_ref"].strip())
+
+
+def _file_invoice(ctx: ToolContext, payee: Payee, amount: Money, due_date: str, ref: str) -> dict:
+    state = store.load_state(ctx.conn, ctx.family_id, ctx.now)
+    verdict = rules.check_payee(payee, state)
+    if verdict.outcome is Outcome.BLOCK:
+        return _refuse_invoice(ctx, payee, amount, verdict)
+    # After the payee check, so a fake copy of a real invoice is still caught and reported.
+    earlier = _earlier_fees(ctx, state, payee, ref)
+    paid = next((f for f in earlier if f["status"] == "paid"), None)
+    if paid is not None:
+        _audit_duplicate(ctx, paid, payee, ref, already_paid=True)
+        return {"accepted": False, "reason": "This invoice has already been paid."}
+    same = next((f for f in earlier if _fee_amount(f) == amount), None)
+    if same is not None:
+        _audit_duplicate(ctx, same, payee, ref, already_paid=False)
+        return {
+            "accepted": True,
+            "fee_id": same["id"],
+            "duplicate": True,
+            "amount": str(amount),
+            "payee": same["payee_name"],
+        }
+    fee_id = store.insert_fee(
+        ctx.conn,
+        family_id=ctx.family_id,
+        payee=payee,
+        amount=amount,
+        due_date=due_date,
+        invoice_ref=ref or None,
+        now=ctx.now,
+    )
+    audit.record(
+        ctx.conn,
+        at=ctx.now,
+        family_id=ctx.family_id,
+        actor=ctx.member.id,
+        event="invoice.recorded",
+        data={"fee_id": fee_id, "payee": payee.name, "amount": str(amount)},
+    )
     return {"accepted": True, "fee_id": fee_id, "amount": str(amount), "payee": payee.name}
+
+
+def _refuse_invoice(ctx: ToolContext, payee: Payee, amount: Money, verdict: RuleResult) -> dict:
+    audit.record(
+        ctx.conn,
+        at=ctx.now,
+        family_id=ctx.family_id,
+        actor=ctx.member.id,
+        event="invoice.blocked",
+        data={
+            "payee": payee.name,
+            "details": dict(payee.details),
+            "amount": str(amount),
+            "reason": verdict.reason,
+            "warned": verdict.warn,
+        },
+    )
+    if verdict.warn:
+        main = store.main_payer(ctx.conn, ctx.family_id)
+        outbox.notify(ctx.conn, main.id, f"Warning: {verdict.reason}", ctx.now)
+    return {"accepted": False, "reason": verdict.reason}
+
+
+def _earlier_fees(ctx: ToolContext, state: FamilyState, claim: Payee, ref: str) -> list[sqlite3.Row]:
+    """This family's fees with the same invoice reference from the same trusted payee as `claim`.
+
+    With no reference there is nothing to say two invoices are the same one, so none are returned."""
+    if not ref:
+        return []
+    claimed, _ = rules.match_payee(claim, state.trusted_payees)
+    earlier = []
+    for fee in store.fees(ctx.conn, ctx.family_id):
+        if (fee["invoice_ref"] or "").strip().casefold() != ref.casefold():
+            continue
+        owed, _ = rules.match_payee(
+            Payee.of(fee["payee_name"], **json.loads(fee["payee_details_json"])), state.trusted_payees
+        )
+        if owed is not None and claimed is not None and owed.id == claimed.id:
+            earlier.append(fee)
+    return earlier
+
+
+def _audit_duplicate(ctx: ToolContext, fee: sqlite3.Row, payee: Payee, ref: str, *, already_paid: bool) -> None:
+    audit.record(
+        ctx.conn,
+        at=ctx.now,
+        family_id=ctx.family_id,
+        actor=ctx.member.id,
+        event="invoice.duplicate",
+        data={"fee_id": fee["id"], "payee": payee.name, "invoice_ref": ref, "already_paid": already_paid},
+    )
 
 
 def _propose_split(ctx: ToolContext, args: dict) -> dict:
@@ -358,7 +414,8 @@ _TOOLS: tuple[_Tool, ...] = (
         "Record an invoice the main payer has received, whether it came as text, a PDF or a photo. Call it once per "
         "invoice and copy the payee name, bank details, amount and dates exactly as written: never correct or fill in "
         "a detail yourself. Karo checks the payee against the family's trusted payees and refuses an invoice whose "
-        "details have changed. Use an empty string for anything that does not apply.",
+        "details have changed. If the invoice was recorded before, you get that fee back with duplicate: true: use it "
+        "and do not record the invoice again. Use an empty string for anything that does not apply.",
         _object(
             payee_name=_text("The payee's name exactly as on the invoice, e.g. University of Westbridge."),
             payee_details=_object(

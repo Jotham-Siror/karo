@@ -321,6 +321,108 @@ def test_only_the_main_payer_can_record_an_invoice(conn, provider):
     assert count(conn, "fees") == 0
 
 
+# --- the same invoice sent twice ------------------------------------------------------------------
+
+
+def test_the_same_invoice_twice_gives_one_fee(conn, provider):
+    # Bug caught: a forwarded-again invoice becoming a second fee that could be split and paid a second time.
+    first = record(conn, provider)
+    second = record(conn, provider)
+    assert second["accepted"] is True and second["duplicate"] is True
+    assert second["fee_id"] == first["fee_id"]
+    assert second["amount"] == "GBP 6,000.00" and second["payee"] == "University of Westbridge"
+    assert "duplicate" not in first
+    assert count(conn, "fees") == 1
+    (duplicate,) = events(conn, "invoice.duplicate")
+    assert duplicate["data"]["fee_id"] == first["fee_id"]
+    assert len(events(conn, "invoice.recorded")) == 1
+
+
+def test_the_reference_is_compared_without_regard_to_case_or_spaces(conn, provider):
+    # Bug caught: "inv-77 " and "INV-77" read as two invoices, so the duplicate check is easy to slip past.
+    first = record(conn, provider)
+    second = record(conn, provider, invoice_ref="  inv-77 ")
+    assert second["duplicate"] is True and second["fee_id"] == first["fee_id"]
+    assert count(conn, "fees") == 1
+
+
+def test_an_invoice_being_collected_on_is_still_a_duplicate(conn, provider):
+    # Bug caught: re-recording a fee already split among relatives, which would let it be split a second time.
+    first = record(conn, provider)
+    conn.execute("UPDATE fees SET status = 'collecting' WHERE id = ?", (first["fee_id"],))
+    second = record(conn, provider)
+    assert second["duplicate"] is True and second["fee_id"] == first["fee_id"]
+    assert count(conn, "fees") == 1
+
+
+def test_the_same_reference_with_another_amount_is_a_new_fee(conn, provider):
+    # Bug caught: matching on the reference alone, so a corrected invoice is silently swallowed by the old one.
+    first = record(conn, provider)
+    second = record(conn, provider, amount="6500.00")
+    assert second["accepted"] is True and "duplicate" not in second
+    assert second["fee_id"] != first["fee_id"]
+    assert count(conn, "fees") == 2
+
+
+def test_the_same_reference_from_another_payee_is_a_new_fee(conn, provider):
+    # Bug caught: two institutions that both number an invoice "INV-77" being treated as one invoice.
+    other = WESTBRIDGE | {"sort_code": "30-11-22", "account_number": "55501234"}
+    add_trusted_payee(conn, "tp_northvale", "Northvale College", other)
+    first = record(conn, provider)
+    second = record(conn, provider, payee_name="Northvale College", payee_details=other)
+    assert second["accepted"] is True and "duplicate" not in second
+    assert second["fee_id"] != first["fee_id"]
+
+
+def test_invoices_with_no_reference_are_never_called_duplicates(conn, provider):
+    # Bug caught: every invoice without a reference collapsing into one, because "" equals ""; nothing says they match.
+    first = record(conn, provider, invoice_ref="")
+    second = record(conn, provider, invoice_ref="")
+    assert "duplicate" not in second and second["fee_id"] != first["fee_id"]
+    assert count(conn, "fees") == 2
+
+
+def test_an_invoice_that_has_already_been_paid_is_refused(conn, provider):
+    # Bug caught: an invoice paid last month recorded again as a fresh fee, and paid a second time.
+    first = record(conn, provider)
+    conn.execute("UPDATE fees SET status = 'paid' WHERE id = ?", (first["fee_id"],))
+    second = record(conn, provider)
+    assert second == {"accepted": False, "reason": "This invoice has already been paid."}
+    assert count(conn, "fees") == 1
+    (duplicate,) = events(conn, "invoice.duplicate")
+    assert duplicate["data"]["fee_id"] == first["fee_id"]
+
+
+def test_a_paid_reference_from_another_payee_does_not_block_a_new_invoice(conn, provider):
+    # Bug caught: "already paid" refusing a different institution's invoice just because the numbers coincide.
+    other = WESTBRIDGE | {"sort_code": "30-11-22", "account_number": "55501234"}
+    add_trusted_payee(conn, "tp_northvale", "Northvale College", other)
+    first = record(conn, provider)
+    conn.execute("UPDATE fees SET status = 'paid' WHERE id = ?", (first["fee_id"],))
+    second = record(conn, provider, payee_name="Northvale College", payee_details=other)
+    assert second["accepted"] is True
+
+
+def test_a_repeat_with_changed_bank_details_is_still_blocked_and_warned(conn, provider):
+    # Bug caught: the duplicate shortcut running before the payee check, so a fake copy of a real invoice gets through.
+    record(conn, provider)
+    fake = record(conn, provider, payee_details=WESTBRIDGE | {"account_number": "00000001"})
+    assert fake["accepted"] is False and "account number" in fake["reason"]
+    assert texts(conn, "m_amina")[0].startswith("Warning: ")
+    assert count(conn, "fees") == 1
+
+
+def test_another_familys_invoice_with_the_same_reference_is_not_a_duplicate(conn, provider):
+    # Bug caught: the duplicate check reading every family's fees, so one family's invoices block another's.
+    conn.execute(
+        "INSERT INTO fees (id, family_id, payee_name, payee_details_json, amount_minor, currency, invoice_ref, "
+        "created_at) VALUES ('fee_theirs', ?, 'University of Westbridge', ?, 600000, 'GBP', 'INV-77', ?)",
+        (OTHER, json.dumps(WESTBRIDGE), clock.iso(NOW)),
+    )
+    result = record(conn, provider)
+    assert result["accepted"] is True and "duplicate" not in result and result["fee_id"] != "fee_theirs"
+
+
 # --- propose_split ------------------------------------------------------------------------------
 
 
@@ -852,13 +954,25 @@ def test_a_tool_that_fails_is_flagged_as_an_error_to_the_ai(conn, provider):
     assert result["is_error"] is True and "family_id" in result["content"]
 
 
-def test_a_refusal_gives_the_polite_sentence_and_keeps_the_history_usable(conn, provider):
-    # Bug caught: a refused request crashing the turn, or leaving history the next request can't be built from.
-    fake = FakeClaude([refusal_response(), text_response("Hello again.")])
+def test_a_refusal_gives_the_polite_sentence_and_records_the_turn(conn, provider):
+    # Bug caught: a refused request crashing the turn, or leaving no record of what was asked and answered.
+    fake = FakeClaude([refusal_response()])
     assert say(conn, provider, fake, "something odd") == "Sorry, I can't help with that one."
+    (row,) = conn.execute("SELECT messages_json FROM conversations").fetchall()
+    assert [m["role"] for m in json.loads(row["messages_json"])] == ["user", "assistant"]
+
+
+def test_after_a_refusal_the_next_turn_starts_fresh_without_the_refused_message(conn, provider):
+    # Bug caught: the refused message (maybe a document) re-sent on every later turn, so each one is refused too.
+    refused = [PDF, {"type": "text", "text": "a refused request"}]
+    fake = FakeClaude([refusal_response(), text_response("Hello again.")])
+    assert say(conn, provider, fake, content=refused) == REFUSAL_REPLY
     assert say(conn, provider, fake, "hi") == "Hello again."
-    roles = [m["role"] for m in fake.requests[1]["messages"]]
-    assert roles == ["user", "assistant", "user"]
+    assert fake.requests[1]["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert "a refused request" not in json.dumps(fake.requests[1])
+    ended = conn.execute("SELECT active, messages_json FROM conversations ORDER BY rowid").fetchall()
+    assert [r["active"] for r in ended] == [0, 1]
+    assert "a refused request" in ended[0]["messages_json"]  # the record of the refused turn is kept
 
 
 def test_a_refused_turn_never_runs_the_tool_it_started_to_call(conn, provider):

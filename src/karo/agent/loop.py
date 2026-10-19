@@ -70,6 +70,8 @@ def _run_turn(
         if response.stop_reason == "refusal":
             reply = {"role": "assistant", "content": [{"type": "text", "text": REFUSAL_REPLY}]}
             _append(conn, conversation_id, messages, reply)
+            # The refused message would be re-sent, and refused again, on every later turn. The record of it stays.
+            conn.execute("UPDATE conversations SET active = 0 WHERE id = ?", (conversation_id,))
             return REFUSAL_REPLY
         # by_alias, because a fallback block's `from` field is `from_` in Python; exclude_none, because the API
         # rejects the null fields the SDK adds.
