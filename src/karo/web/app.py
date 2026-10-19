@@ -67,7 +67,27 @@ _RESULT_HEADINGS = {
     "blocked": ("Not allowed", "bad"),
 }
 
+_CONFIRM_PATH = re.compile(r"(/confirm/)[^\s/?#\"]+")
+
 router = APIRouter()
+
+
+class HideConfirmTokens(logging.Filter):
+    """The confirm token is a credential in the URL path, and uvicorn's access log prints the whole request line."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._mask(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._mask(arg) for arg in record.args)
+        return True
+
+    @staticmethod
+    def _mask(value):
+        return _CONFIRM_PATH.sub(r"\1<redacted>", value) if isinstance(value, str) else value
+
+
+# One shared instance: Logger.addFilter ignores a filter it already has, so building the app twice adds it once.
+_HIDE_TOKENS = HideConfirmTokens()
 
 
 class LoginRequired(Exception):
@@ -411,6 +431,7 @@ def demo_advance(request: Request, hours: str = Form(""), conn: sqlite3.Connecti
 def demo_reset(request: Request):
     # No connection here: the file is deleted, and an open connection would keep it from being deleted on Windows.
     settings = request.app.state.settings
+    settings.require("demo_pin", "pin_pepper")  # before the delete: without them the new database can't be seeded
     for suffix in ("", "-wal", "-shm"):
         Path(f"{settings.db_path}{suffix}").unlink(missing_ok=True)
     ensure_database(settings)
@@ -444,6 +465,8 @@ def create_app(settings: Settings, *, client: Claude | None = None, provider: Pr
     if provider is None:
         provider = build_provider(settings)
     ensure_database(settings)
+    # On the logger, not in a uvicorn flag, so a plain `uvicorn karo.web.app:app` is covered too.
+    logging.getLogger("uvicorn.access").addFilter(_HIDE_TOKENS)
 
     # No /docs or /openapi.json: they would list every route to anyone who asks.
     app = FastAPI(title="Karo", docs_url=None, redoc_url=None, openapi_url=None)

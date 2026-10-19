@@ -3,6 +3,7 @@
 import html
 import importlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ from karo.config import Settings
 from karo.domain import Kind, Payee
 from karo.money import Money
 from karo.providers.standin import StandInProvider
-from karo.web.app import create_app
+from karo.web.app import HideConfirmTokens, create_app
 
 FAM = "fam_otieno"
 PIN = "4821"
@@ -471,6 +472,39 @@ def test_the_pin_page_puts_what_needs_attention_ahead_of_the_checks_that_passed(
     assert text.index("Has to wait") < text.index("9 checks passed")
 
 
+class Collected(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+def test_the_access_log_does_not_carry_the_confirm_token(site):
+    # Catches: uvicorn's access log printing the one-time confirm token, which undoes storing only its hash.
+    access = logging.getLogger("uvicorn.access")
+    collected = Collected()
+    access.addHandler(collected)
+    try:
+        # The arguments uvicorn gives its access log: client, method, path with query, HTTP version, status.
+        for method in ("GET", "POST"):
+            path = "/confirm/abc123_-XYZ?x=1"
+            access.warning('%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", method, path, "1.1", 200)
+    finally:
+        access.removeHandler(collected)
+    expected = ['127.0.0.1:5000 - "%s /confirm/<redacted>?x=1 HTTP/1.1" 200' % method for method in ("GET", "POST")]
+    assert collected.lines == expected
+
+
+def test_making_the_app_twice_installs_one_token_filter(make_site):
+    # Catches: every create_app (each test, each reload) stacking another filter on the access log.
+    make_site()
+    make_site()
+    access = logging.getLogger("uvicorn.access")
+    assert sum(isinstance(f, HideConfirmTokens) for f in access.filters) == 1
+
+
 def test_the_pin_page_is_not_cached_or_framed_and_leaks_no_referrer(site):
     # Catches: the one-time link page being cached, framed by another site, or sent on in a Referer header.
     token = start(site)
@@ -666,6 +700,15 @@ def test_a_silly_number_of_hours_does_not_move_the_clock(site, hours):
     assert response.status_code == 400
     with site.connect() as conn:
         assert clock.offset(conn) == 0
+
+
+def test_reset_without_a_demo_pin_keeps_the_database(settings):
+    # Catches: a reset that deletes the database and then can't re-seed it, leaving nobody able to log in.
+    site = Site(replace(settings, demo_pin=None))
+    site.login()
+    with pytest.raises(RuntimeError, match="DEMO_PIN"):
+        site.client.post("/demo/reset")
+    assert site.query("SELECT COUNT(*) AS n FROM families")[0]["n"] == 2
 
 
 def test_reset_starts_the_demo_again_from_a_fresh_database(site):
