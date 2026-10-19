@@ -42,7 +42,7 @@ def gbp(amount: str) -> Money:
 
 
 def confirm_latest_link(conn) -> str:
-    """Follows the newest confirm link in the main payer's outbox, as she would, and enters the PIN. Returns the token."""
+    """Follows the newest confirm link in the main payer's outbox, as she would, and enters the PIN. Gives the token."""
     row = conn.execute(
         "SELECT text FROM outbox WHERE member_id = 'm_amina' AND text LIKE '%/confirm/%' ORDER BY id DESC LIMIT 1"
     ).fetchone()
