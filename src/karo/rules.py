@@ -78,7 +78,7 @@ def _block(rule: str, reason: str, **kw) -> RuleResult:
     return RuleResult(rule, Outcome.BLOCK, reason, **kw)
 
 
-def _home_value(p: Proposal, s: FamilyState) -> Money | None:
+def home_value_of(p: Proposal, s: FamilyState) -> Money | None:
     """What the proposal is worth in the family's home currency, from its own amount or its quote."""
     home = s.policy.home_currency
     if p.amount is not None and p.amount.currency == home:
@@ -145,13 +145,13 @@ def pin_lockout(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | No
 def home_value(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
     if p.kind not in VALUED:
         return None
-    if _home_value(p, s) is None:
+    if home_value_of(p, s) is None:
         return _block("home_value", f"Can't value this in {s.policy.home_currency}, so the limits can't be checked.")
     return _pass("home_value")
 
 
 def payment_cap(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
-    value = _home_value(p, s)
+    value = home_value_of(p, s)
     if p.kind not in OUTBOUND or value is None:
         return None
     cap = s.policy.payment_cap
@@ -161,7 +161,7 @@ def payment_cap(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | No
 
 
 def allowance_cap(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
-    value = _home_value(p, s)
+    value = home_value_of(p, s)
     if p.kind not in {Kind.ALLOWANCE_SET, Kind.ALLOWANCE_RUN} or value is None:
         return None
     cap = s.policy.allowance_monthly_cap
@@ -174,7 +174,7 @@ def allowance_cap(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | 
 
 
 def daily_cap(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
-    value = _home_value(p, s)
+    value = home_value_of(p, s)
     if p.kind not in OUTBOUND or value is None:
         return None
     cap = s.policy.daily_cap
@@ -196,7 +196,7 @@ def _norm_details(payee: Payee) -> dict[str, str]:
     return {k.casefold(): _VALUE_JUNK.sub("", v).upper() for k, v in payee.details}
 
 
-def _match(claim: Payee, trusted: tuple[TrustedPayee, ...]) -> tuple[TrustedPayee | None, TrustedPayee | None]:
+def match_payee(claim: Payee, trusted: tuple[TrustedPayee, ...]) -> tuple[TrustedPayee | None, TrustedPayee | None]:
     """Return (exact match on details, trusted payee with the same name but other details)."""
     details = _norm_details(claim)
     exact = next((t for t in trusted if _norm_details(t.payee) == details), None)
@@ -206,16 +206,13 @@ def _match(claim: Payee, trusted: tuple[TrustedPayee, ...]) -> tuple[TrustedPaye
     return None, namesake
 
 
-def trusted_payee(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
-    if p.kind not in TO_PAYEE:
-        return None
-    if p.payee is None:
-        return _block("trusted_payee", "No payee given.")
-    exact, namesake = _match(p.payee, s.trusted_payees)
+def check_payee(claim: Payee, state: FamilyState) -> RuleResult:
+    """The trusted_payee verdict for one payee. Also used to screen an invoice before any fee exists."""
+    exact, namesake = match_payee(claim, state.trusted_payees)
     if exact is not None:
         return _pass("trusted_payee", f"Matches trusted payee {exact.payee.name}.")
     if namesake is not None:
-        claimed, stored = _norm_details(p.payee), _norm_details(namesake.payee)
+        claimed, stored = _norm_details(claim), _norm_details(namesake.payee)
         changed = sorted(k for k in claimed.keys() | stored.keys() if claimed.get(k) != stored.get(k))
         fields = ", ".join(k.replace("_", " ") for k in changed)
         return _block(
@@ -224,14 +221,22 @@ def trusted_payee(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | 
             "This could be a fake invoice. Nothing was paid.",
             warn=True,
         )
-    return _block("trusted_payee", f"{p.payee.name} is not on the family's trusted payee list.")
+    return _block("trusted_payee", f"{claim.name} is not on the family's trusted payee list.")
+
+
+def trusted_payee(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
+    if p.kind not in TO_PAYEE:
+        return None
+    if p.payee is None:
+        return _block("trusted_payee", "No payee given.")
+    return check_payee(p.payee, s)
 
 
 def new_payee_wait(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | None:
-    value = _home_value(p, s)
+    value = home_value_of(p, s)
     if p.kind not in OUTBOUND or p.payee is None or value is None:
         return None
-    exact, _ = _match(p.payee, s.trusted_payees)
+    exact, _ = match_payee(p.payee, s.trusted_payees)
     if exact is None:
         return None  # trusted_payee already blocks it
     ready_at = exact.trusted_since + s.policy.new_payee_wait
@@ -309,7 +314,15 @@ def confirmation(p: Proposal, s: FamilyState, c: CheckContext) -> RuleResult | N
     if p.kind not in PIN_KINDS:
         return None
     conf = c.confirmation
-    if conf is None or main is None or conf.proposal_id != p.id or conf.member_id != main.id:
+    # The digest ties the PIN to the proposal's content, so an edit made after approval voids it.
+    approved = (
+        conf is not None
+        and main is not None
+        and conf.proposal_id == p.id
+        and conf.member_id == main.id
+        and conf.digest == p.digest()
+    )
+    if not approved:
         return _block("confirmation", "Needs the main payer's PIN confirmation for this exact proposal.")
     return _pass("confirmation")
 

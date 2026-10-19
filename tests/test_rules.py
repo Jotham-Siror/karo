@@ -3,6 +3,7 @@
 Every test names the bug it would catch. The checker is plain code: nothing here involves the AI.
 """
 
+import hashlib
 from dataclasses import replace
 from datetime import timedelta
 
@@ -27,7 +28,7 @@ from conftest import (
     quote,
 )
 from karo.domain import Kind, Payee, Proposal, TrustedPayee
-from karo.rules import Outcome, check
+from karo.rules import Outcome, check, check_payee, trusted_payee
 
 
 def blocked_by(decision) -> set[str]:
@@ -97,6 +98,65 @@ def test_confirmation_for_another_proposal_does_not_count(state):
     ctx = execute(p)
     ctx = replace(ctx, confirmation=replace(ctx.confirmation, proposal_id="p-other"))
     assert "confirmation" in blocked_by(check(p, state, ctx))
+
+
+def test_proposal_edited_after_the_pin_is_blocked(state):
+    # Bug caught: a proposal edited after the PIN (same id, new amount) still executing.
+    approved = fee_proposal()
+    edited = fee_proposal(amount=gbp("5000"), quote=quote(kes("825000"), gbp("5000")))
+    assert check(edited, state, execute(edited)).allowed  # the edit would pass if it had been confirmed itself
+    assert blocked_by(check(edited, state, execute(approved))) == {"confirmation"}
+
+
+# --- The digest pins down the exact proposal -------------------------------------------------
+
+
+def test_digest_is_stable_for_equal_proposals_and_changes_with_the_fee_link():
+    # Bug caught: a digest that ignores fee_id, so a PIN given for one fee could be reused on another.
+    assert fee_proposal().digest() == fee_proposal().digest()
+    assert fee_proposal(fee_id="fee-1").digest() != fee_proposal().digest()
+    assert fee_proposal(fee_id="fee-1").digest() != fee_proposal(fee_id="fee-2").digest()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"id": "p-other"},
+        {"family_id": "fam-other"},
+        {"kind": Kind.CONVERT},
+        {"requested_by": UNCLE.id},
+        {"amount": gbp("5999")},
+        {"payee": SON_ACCOUNT},
+        {"quote": quote(kes("990000"), gbp("6000"), qid="q-2")},
+        {"quote": quote(kes("990000"), gbp("6000"), family_id="fam-other")},
+        {"quote": quote(kes("990001"), gbp("6000"))},
+        {"quote": quote(kes("990000"), gbp("6001"))},
+        {"quote": quote(kes("990000"), gbp("6000"), expires_in=timedelta(minutes=14))},
+        {"share_id": "sh-baraka"},
+        {"standing_order_id": "so-1"},
+        {"fee_id": "fee-1"},
+        {"split": ((UNCLE.id, gbp("6000")),)},
+    ],
+    ids=[
+        "id", "family", "kind", "requested_by", "amount", "payee", "quote_id", "quote_family",
+        "quote_source", "quote_target", "quote_expiry", "share", "standing_order", "fee", "split",
+    ],
+)
+def test_changing_any_field_changes_the_digest(change):
+    # Bug caught: a field left out of the digest, so editing it after the PIN goes unnoticed.
+    assert fee_proposal(**change).digest() != fee_proposal().digest()
+
+
+def test_digest_is_the_sha256_of_the_canonical_json():
+    # Bug caught: a digest that varies between processes (hash(), set order) or drifts from the agreed format.
+    canonical = (
+        '{"amount":[600000,"GBP"],"family_id":"fam-otieno","fee_id":null,"id":"p-fee","kind":"pay_fee",'
+        '"payee":["University of Westbridge",[["account_number","41234567"],["country","GB"],'
+        '["currency","GBP"],["sort_code","20-40-60"]]],'
+        '"quote":["q-1","fam-otieno",[99000000,"KES"],[600000,"GBP"],"2026-10-19T09:15:00+00:00"],'
+        '"requested_by":"m-amina","share_id":null,"split":[],"standing_order_id":null}'
+    )
+    assert fee_proposal().digest() == hashlib.sha256(canonical.encode()).hexdigest()
 
 
 # --- Wrong PIN lockout -----------------------------------------------------------------------
@@ -179,6 +239,14 @@ def test_changed_bank_details_are_blocked_and_flagged_for_a_warning(state):
     decision = check(fee_proposal(payee=fake), state, propose())
     assert "trusted_payee" in blocked_by(decision)
     assert decision.warnings and "account number" in decision.warnings[0].reason
+
+
+def test_check_payee_gives_the_same_answer_as_the_rule_for_changed_details(state):
+    # Bug caught: invoice screening drifting from the payment rule, so a fake invoice is screened differently.
+    fake = Payee.of("University of Westbridge", country="GB", currency="GBP", sort_code="20-40-60", account_number="99887766")
+    screened = check_payee(fake, state)
+    assert screened == trusted_payee(fee_proposal(payee=fake), state, propose())
+    assert screened.outcome is Outcome.BLOCK and screened.warn and "account number" in screened.reason
 
 
 def test_payee_not_on_the_trusted_list_is_blocked(state):

@@ -113,5 +113,5 @@ def propose(actor: Member | None = MUM, now: datetime = NOW) -> CheckContext:
 
 
 def execute(proposal: Proposal, actor: Member | None = MUM, now: datetime = NOW, confirmed_by: Member | None = MUM):
-    confirmation = Confirmation(proposal.id, confirmed_by.id, now) if confirmed_by else None
+    confirmation = Confirmation(proposal.id, confirmed_by.id, proposal.digest(), now) if confirmed_by else None
     return CheckContext(now=now, stage=Stage.EXECUTE, actor=actor, confirmation=confirmation)

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from karo.clock import iso
 from karo.money import Money
 
 
@@ -100,6 +103,7 @@ class Confirmation:
 
     proposal_id: str
     member_id: str
+    digest: str  # Proposal.digest() of what the PIN approved
     at: datetime
 
 
@@ -153,6 +157,22 @@ class FamilyState:
         return next((b for b in self.balances if b.currency == currency), Money(0, currency))
 
 
+def _canonical(value: object) -> object:
+    """JSON-ready form of a Proposal field. A type it doesn't know raises, so no field is skipped silently."""
+    match value:
+        case None | str() | int():
+            return value
+        case Money():
+            return [value.minor, value.currency]
+        case Payee():
+            return [value.name, _canonical(value.details)]
+        case Quote():
+            return [value.id, value.family_id, _canonical(value.source), _canonical(value.target), iso(value.expires_at)]
+        case tuple():
+            return [_canonical(item) for item in value]
+    raise TypeError(f"can't put {type(value).__name__} in a proposal digest")
+
+
 @dataclass(frozen=True)
 class Proposal:
     """Something the agent wants to happen. Built by code from validated tool input."""
@@ -166,11 +186,18 @@ class Proposal:
     quote: Quote | None = None
     share_id: str | None = None
     standing_order_id: str | None = None
+    fee_id: str | None = None  # the fee this pays or splits
     split: tuple[tuple[str, Money], ...] = field(default=())  # (member id, amount) for SPLIT
 
     def __post_init__(self) -> None:
         if self.amount is not None and self.amount.minor <= 0:
             raise ValueError("amount must be positive")
+
+    def digest(self) -> str:
+        """Fingerprint of every field. The PIN approves this value, so any later edit voids the approval."""
+        content = {f.name: _canonical(getattr(self, f.name)) for f in fields(self)}
+        text = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
