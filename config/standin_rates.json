@@ -1,0 +1,9 @@
+{
+  "note": "Stand-in example rates for offline demo and tests, not real market data",
+  "rates": {
+    "KES->GBP": "0.00578",
+    "UGX->GBP": "0.000183",
+    "KES->UGX": "31.6",
+    "GBP->KES": "173"
+  }
+}
