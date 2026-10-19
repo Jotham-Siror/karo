@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}Karo{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <header class="top">
+    <a class="brand" href="/">Karo</a>
+    {% if member %}
+    <span class="who">{{ member.name }}, {{ member.role.value|replace("_", " ") }}</span>
+    {% endif %}
+    {% if demo_nav %}
+    <nav aria-label="Demo">
+      <a href="/chat">Chat</a>
+      <a href="/log">Log</a>
+      <a href="/demo">Demo controls</a>
+      <a href="/logout">Log out</a>
+    </nav>
+    {% endif %}
+  </header>
+  {% if demo_time %}
+  <div class="banner" role="status">Demo time: {{ demo_time }}</div>
+  {% endif %}
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

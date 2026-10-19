@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Confirm with your PIN · Karo{% endblock %}
+{% block content %}
+<h1>Confirm with your PIN</h1>
+<p class="summary">{{ summary }}</p>
+
+{% if payee %}
+<section class="card">
+  <h2>Who is being paid</h2>
+  <dl class="details">
+    <dt>Name</dt><dd>{{ payee.name }}</dd>
+    {% for label, value in payee.details %}
+    <dt>{{ label }}</dt><dd>{{ value }}</dd>
+    {% endfor %}
+  </dl>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>What Karo's rules say</h2>
+  {% set passed = checks|selectattr("outcome", "equalto", "pass")|list %}
+  {% set others = checks|rejectattr("outcome", "equalto", "pass")|list %}
+  {% if others %}
+  <ul class="checks">
+    {% for c in others %}
+    <li class="{{ c.outcome }}"><strong>{{ c.label }}:</strong> {{ c.words }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <details>
+    <summary>{{ passed|length }} {{ "check" if passed|length == 1 else "checks" }} passed</summary>
+    <ul class="checks">
+      {% for c in passed %}
+      <li class="pass"><strong>{{ c.label }}:</strong> {{ c.words }}</li>
+      {% endfor %}
+    </ul>
+  </details>
+</section>
+
+{% if locked_until %}
+<p class="error" role="alert">Too many wrong PINs. Try again after {{ locked_until }}.</p>
+{% else %}
+<form method="post" class="card">
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <label for="pin">Your PIN</label>
+  <input id="pin" name="pin" type="password" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,6}" minlength="4" maxlength="6" required>
+  <button type="submit">Confirm</button>
+  <p class="hint">Nothing moves until you confirm. Karo never asks for your PIN in chat.</p>
+</form>
+{% endif %}
+{% endblock %}

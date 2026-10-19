@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Demo controls · Karo{% endblock %}
+{% block content %}
+<h1>Demo controls</h1>
+<p class="hint">These are for the demo only. They are not part of Karo.</p>
+{% if flash %}<p class="notice ok" role="status">{{ flash }}</p>{% endif %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+<form method="post" action="/demo/advance" class="card">
+  <h2>Move the clock forward</h2>
+  <p>Use this to show a waiting period or an expired quote without waiting for real.</p>
+  <label for="hours">Hours</label>
+  <input id="hours" name="hours" type="number" inputmode="numeric" min="1" max="{{ max_hours }}" step="1" value="24" required>
+  <button type="submit">Move forward</button>
+</form>
+
+<form method="post" action="/demo/reset" class="card" onsubmit="return confirm('Start the demo again from the beginning?');">
+  <h2>Start again</h2>
+  <p>Deletes everything and sets up the Otieno and Mwangi families again, with the same demo PIN. You stay logged in.</p>
+  <button type="submit" class="danger">Reset the demo</button>
+</form>
+{% endblock %}

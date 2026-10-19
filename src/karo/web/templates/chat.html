@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Chat · Karo{% endblock %}
+{% block body_class %}chat-page{% endblock %}
+{% block content %}
+<deep-chat
+  id="chat"
+  connect='{"url": "/api/chat", "method": "POST", "credentials": "same-origin"}'
+  images='{"files": {"acceptedFormats": ".png,.jpg,.jpeg,.webp,.gif", "maxNumberOfFiles": 3}}'
+  mixedFiles='{"files": {"acceptedFormats": ".pdf", "maxNumberOfFiles": 3}}'
+  textInput='{"placeholder": {"text": "Message Karo"}}'
+  errorMessages='{"displayServiceErrorMessages": true}'
+  browserStorage='{{ {"key": storage_key, "maxMessages": 200}|tojson }}'
+  introMessage='{{ {"text": "Hi " ~ member.name ~ ". I'm Karo. Ask me about the fees, or send a photo or PDF of an invoice. Never type your PIN here: Karo will send you a link to the PIN page."}|tojson }}'
+  style="border-radius: 8px; width: calc(100% - 1rem); height: calc(100% - 1rem);"></deep-chat>
+
+<script type="module" src="https://cdn.jsdelivr.net/npm/deep-chat@2.5.1/dist/deepChat.bundle.js"
+        integrity="sha384-djz34nrOoloJkHQBH1qoINnqdsX56zqoFpMpT0m3ghPF0o0otOUvWZEFwUViT9iF" crossorigin="anonymous"></script>
+<script>
+  (function () {
+    var chat = document.getElementById("chat");
+
+    // A new id on every message, so the server can tell a retry of a message from a new message that reads the same.
+    function newId() {
+      return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
+    }
+
+    // Deep Chat shows a bare URL as plain text. A markdown link makes the PIN page one tap on a phone.
+    function withLinks(text) {
+      return text.replace(/https?:\/\/[^\s)]+/g, function (url) { return "[Open the link](" + url + ")"; });
+    }
+
+    function startInbox() {
+      function poll() {
+        fetch("/api/inbox", { credentials: "same-origin" })
+          .then(function (response) {
+            if (response.status === 401) { window.location.href = "/"; return []; }
+            return response.ok ? response.json() : [];
+          })
+          .then(function (messages) {
+            // The second argument makes Deep Chat treat it as a new message, which is what saves it to the browser.
+            messages.forEach(function (m) { chat.addMessage({ text: withLinks(m.text), role: "ai" }, true); });
+          })
+          // A missed poll is harmless: the messages stay waiting on the server and the next poll fetches them.
+          .catch(function () {});
+      }
+      poll();
+      setInterval(poll, 3000);
+    }
+
+    customElements.whenDefined("deep-chat").then(function () {
+      chat.requestInterceptor = function (details) {
+        if (details.body instanceof FormData) {
+          details.body.append("message_id", newId());
+        } else {
+          details.body.message_id = newId();
+        }
+        return details;
+      };
+      chat.onComponentRender = startInbox;
+    });
+  })();
+</script>
+{% endblock %}

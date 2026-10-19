@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ heading or "Karo" }} · Karo{% endblock %}
+{% block content %}
+{% if heading %}<h1>{{ heading }}</h1>{% endif %}
+<p class="notice {{ tone }}">{{ message }}</p>
+<p><a class="button" href="/chat">Back to the chat</a></p>
+{% endblock %}
