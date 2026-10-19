@@ -17,7 +17,10 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from babel.dates import format_date
 
 from karo import audit, clock, collections, db, executor, outbox, proposals, quotes, store
 from karo.domain import Kind, StandingOrder
@@ -104,14 +107,51 @@ def _execute(run: _Run, proposal_id: str) -> None:
 
 def _renew_waiting(run: _Run) -> None:
     rows = run.conn.execute(
-        "SELECT id, decision_json FROM proposals WHERE family_id = ? AND status = 'waiting' ORDER BY created_at, rowid",
+        "SELECT id, kind, created_at, decision_json FROM proposals "
+        "WHERE family_id = ? AND status = 'waiting' ORDER BY created_at, rowid",
         (run.family_id,),
     ).fetchall()
     for row in rows:
         ends = _wait_ends(row["decision_json"])
         if ends is not None and run.now >= ends:
             with _isolated(run, "waiting", row["id"]):
-                _renew(run, row["id"])
+                _renew_or_lapse(run, row)
+
+
+def _month_of(moment: datetime, tz: ZoneInfo) -> tuple[int, int]:
+    local = moment.astimezone(tz)
+    return local.year, local.month
+
+
+def _month_name(month: tuple[int, int]) -> str:
+    # In English whatever the server's locale is: the message is for the main payer's chat.
+    return format_date(date(*month, 1), "MMMM", locale="en")
+
+
+def _renew_or_lapse(run: _Run, row: sqlite3.Row) -> None:
+    tz = store.family_config(run.conn, run.family_id).timezone
+    made_in = _month_of(clock.parse(row["created_at"]), tz)
+    if row["kind"] == Kind.ALLOWANCE_RUN and made_in < _month_of(run.now, tz):
+        _lapse(run, row["id"], made_in, tz)
+    else:
+        _renew(run, row["id"])
+
+
+def _lapse(run: _Run, old_id: str, month: tuple[int, int], tz: ZoneInfo) -> None:
+    """Skips an allowance run that waited past its own month. Paying it now would fill this month's slot, or sit
+    beside this month's own run, so a month's allowance would be missed or paid twice."""
+    with db.transaction(run.conn):
+        store.update_proposal(run.conn, run.family_id, old_id, status="failed", now=run.now)
+        audit.record(
+            run.conn,
+            at=run.now,
+            family_id=run.family_id,
+            actor="system",
+            event="allowance.lapsed",
+            data={"month": f"{month[0]}-{month[1]:02d}", "proposal_id": old_id},
+        )
+        missed, current = _month_name(month), _month_name(_month_of(run.now, tz))
+        _say(run, f"{missed}'s allowance didn't run in time, so it was skipped. {current}'s runs as usual.")
 
 
 def _wait_ends(decision_json: str) -> datetime | None:
@@ -185,13 +225,8 @@ def _say(run: _Run, text: str) -> None:
 
 def _explain_stop(run: _Run, outcome: ProposalOutcome) -> None:
     """Tells the main payer why a request made by the scheduler is not running, in the executor's own words."""
-    what = _what(run, outcome)
-    if outcome.status == "blocked":
-        _say(run, f"Stopped: {what}. {proposals.block_reasons(outcome.decision)}")
-        return
-    reasons = " ".join(r.reason for r in outcome.decision.results if r.outcome is Outcome.WAIT)
-    when = proposals.when_text(outcome.decision.until, store.family_config(run.conn, run.family_id).timezone)
-    _say(run, f"Not yet: {what}. {reasons} It can run after {when}.")
+    tz = store.family_config(run.conn, run.family_id).timezone
+    _say(run, proposals.stop_notice(_what(run, outcome), outcome.decision, tz))
 
 
 # --- the monthly allowance --------------------------------------------------------------------

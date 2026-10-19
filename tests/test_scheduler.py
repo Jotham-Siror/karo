@@ -379,6 +379,52 @@ def test_a_run_for_a_new_payee_waits_and_then_goes_without_a_pin(conn, provider)
     assert count(conn, "confirmations") == 0
 
 
+def lapsed_notices(conn) -> list[str]:
+    return [t for t in texts(conn, "m_amina") if "didn't run in time" in t]
+
+
+def test_an_allowance_that_waited_into_the_next_month_is_skipped_not_paid_in_its_place(conn, provider):
+    # Catches: October's late run being paid on 1 November, which fills November's slot so November is never paid.
+    fund(conn)
+    add_trusted_payee(conn, "tp_hall", since=NOW - timedelta(hours=1))
+    add_standing_order(conn, payee_id="tp_hall")
+    tick(conn, provider)
+    (october,) = [r[0] for r in conn.execute("SELECT id FROM proposals WHERE kind = 'allowance_run'")]
+    assert proposal_statuses(conn, "allowance_run") == ["waiting"]
+
+    jump = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)  # 09:00 on 1 November in Nairobi, as the demo button lands
+    tick(conn, provider, jump)
+    tick(conn, provider, jump + timedelta(minutes=1))
+
+    assert proposal_statuses(conn, "allowance_run") == ["failed", "executed"]
+    assert events(conn, "proposal.superseded") == []
+    (lapsed,) = events(conn, "allowance.lapsed")
+    assert lapsed["data"] == {"month": "2026-10", "proposal_id": october}
+    (paid,) = allowance_payouts(conn)
+    assert paid["created_at"].startswith("2026-11-01")
+    assert lapsed_notices(conn) == [
+        "October's allowance didn't run in time, so it was skipped. November's runs as usual."
+    ]
+
+
+def test_a_late_run_from_last_month_does_not_add_a_second_payout_to_this_month(conn, provider):
+    # Catches: a run waiting across midnight on 31 October being renewed beside November's own run, two in one month.
+    fund(conn)
+    add_trusted_payee(conn, "tp_hall", since=datetime(2026, 10, 31, 11, 0, tzinfo=UTC))  # 14:00 in Nairobi
+    add_standing_order(conn, payee_id="tp_hall")
+    tick(conn, provider, datetime(2026, 10, 31, 12, 0, tzinfo=UTC))  # 15:00 on 31 October: October's run waits a day
+    tick(conn, provider, datetime(2026, 11, 1, 6, 0, tzinfo=UTC))  # 09:00 on 1 November: November's run waits too
+    assert proposal_statuses(conn, "allowance_run") == ["waiting", "waiting"]
+
+    tick(conn, provider, datetime(2026, 11, 1, 11, 30, tzinfo=UTC))  # 14:30: both waits are over
+
+    assert proposal_statuses(conn, "allowance_run") == ["failed", "failed", "executed"]
+    assert [e["data"]["month"] for e in events(conn, "allowance.lapsed")] == ["2026-10"]
+    assert len(events(conn, "proposal.superseded")) == 1  # November's own run, renewed
+    assert len(allowance_payouts(conn)) == 1
+    assert len(lapsed_notices(conn)) == 1
+
+
 # --- waiting proposals --------------------------------------------------------------------------
 
 
@@ -516,7 +562,7 @@ def test_a_payout_left_pending_is_reconciled_once_it_is_old_enough(conn, provide
 
 
 def test_a_provider_error_is_audited_without_its_message_and_the_rest_of_the_tick_goes_on(conn, provider):
-    # Catches: one dropped connection stopping the reminders, or the error text (which may carry secrets) logged.
+    # Catches: one dropped connection stopping the reminders, or the error text (which may carry secrets) audited.
     fund(conn)
     add_standing_order(conn)
     owing_share(conn, provider, "m_baraka", asked_at=NOW - timedelta(hours=30))

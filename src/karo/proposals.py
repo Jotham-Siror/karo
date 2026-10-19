@@ -37,6 +37,18 @@ def block_reasons(decision: Decision) -> str:
     return " ".join(r.reason for r in decision.results if r.outcome is Outcome.BLOCK)
 
 
+def wait_text(decision: Decision, tz: ZoneInfo) -> str:
+    reasons = " ".join(r.reason for r in decision.results if r.outcome is Outcome.WAIT)
+    return f"{reasons} It can run after {when_text(decision.until, tz)}."
+
+
+def stop_notice(what: str, decision: Decision, tz: ZoneInfo) -> str:
+    """What the main payer is told when a request that was already allowed in principle is blocked or has to wait."""
+    if decision.verdict is Outcome.BLOCK:
+        return f"Stopped: {what}. {block_reasons(decision)}"
+    return f"Not yet: {what}. {wait_text(decision, tz)}"
+
+
 def audit_decision(
     conn: sqlite3.Connection, *, p: Proposal, stage: Stage, decision: Decision, actor: str, now: datetime
 ) -> None:

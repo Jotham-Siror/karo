@@ -12,7 +12,7 @@ from karo import audit, clock, db, ledger, proposals, quotes, seed, store
 from karo.domain import Kind, Payee, Proposal
 from karo.money import Money
 from karo.providers.standin import StandInProvider
-from karo.rules import Outcome
+from karo.rules import Decision, Outcome, RuleResult
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
 FAM = "fam_otieno"
@@ -451,6 +451,19 @@ def test_an_allowance_run_that_must_wait_is_not_marked_confirmed(conn, provider)
     )
     assert outcome.status == "waiting"
     assert outcome.decision.verdict is Outcome.WAIT
+
+
+def test_a_stop_notice_says_what_was_stopped_and_why_and_for_a_wait_when_to_try_again(conn):
+    # Catches: the scheduler and the executor wording a stopped payment differently, or a wait with no time to retry.
+    tz = store.family_config(conn, FAM).timezone
+    blocked = Decision((RuleResult("daily_cap", Outcome.BLOCK, "Over the daily limit."),))
+    what = "Pay GBP 1.00 to X"
+    assert proposals.stop_notice(what, blocked, tz) == "Stopped: Pay GBP 1.00 to X. Over the daily limit."
+    until = datetime(2026, 10, 20, 8, 0, tzinfo=UTC)
+    waits = Decision((RuleResult("new_payee_wait", Outcome.WAIT, "X is a new payee.", until=until),))
+    assert proposals.stop_notice(what, waits, tz) == (
+        "Not yet: Pay GBP 1.00 to X. X is a new payee. It can run after Tue 20 Oct, 11:00 EAT."
+    )
 
 
 # --- summary ----------------------------------------------------------------------------------

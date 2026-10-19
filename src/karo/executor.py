@@ -212,14 +212,11 @@ def _stopped(
     # Not left `confirmed`: a payment stopped here, say by a freeze, needs a fresh PIN to run once it is lifted.
     status = "blocked" if decision.verdict is Outcome.BLOCK else "waiting"
     store.update_proposal(conn, p.family_id, p.id, status=status, decision=decision, now=now)
+    tz = store.family_config(conn, p.family_id).timezone
+    outbox.notify(conn, main.id, proposals.stop_notice(what, decision, tz), now)
     if decision.verdict is Outcome.BLOCK:
-        reasons = proposals.block_reasons(decision)
-        outbox.notify(conn, main.id, f"Stopped: {what}. {reasons}", now)
-        return ExecutionOutcome("blocked", f"That was stopped. {reasons}")
-    reasons = " ".join(r.reason for r in decision.results if r.outcome is Outcome.WAIT)
-    when = proposals.when_text(decision.until, store.family_config(conn, p.family_id).timezone)
-    outbox.notify(conn, main.id, f"Not yet: {what}. {reasons} It can run after {when}.", now)
-    return ExecutionOutcome("waiting", f"Not yet. {reasons} It can run after {when}.")
+        return ExecutionOutcome("blocked", f"That was stopped. {proposals.block_reasons(decision)}")
+    return ExecutionOutcome("waiting", f"Not yet. {proposals.wait_text(decision, tz)}")
 
 
 def _carry_out(
