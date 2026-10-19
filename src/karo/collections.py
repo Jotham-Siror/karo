@@ -164,6 +164,12 @@ def request_all(
     return asked
 
 
+def _shares_to_remind(
+    conn: sqlite3.Connection, family_id: str, fee_id: str, share_id: str | None
+) -> list[sqlite3.Row]:
+    return [s for s in store.shares_for_fee(conn, family_id, fee_id) if share_id is None or s["id"] == share_id]
+
+
 def send_reminders(
     conn: sqlite3.Connection,
     provider: Provider,
@@ -173,8 +179,10 @@ def send_reminders(
     now: datetime,
     base_url: str,
     actor: str = "system",
+    share_id: str | None = None,
 ) -> int:
-    """Reminds each member who still owes on the fee. Returns how many people were messaged.
+    """Reminds each member who still owes on the fee. Returns how many people were messaged. With `share_id`, only
+    that share's owner is reminded.
 
     A share with no live link is given a new one first (its own message is the notice, so it gets no second one).
     That is a provider call, so this must not run inside a transaction."""
@@ -185,13 +193,13 @@ def send_reminders(
         return 0
     fresh = {
         share["id"]
-        for share in store.shares_for_fee(conn, family_id, fee_id)
+        for share in _shares_to_remind(conn, family_id, fee_id, share_id)
         if request_share(conn, provider, family_id=family_id, share_id=share["id"], now=now, base_url=base_url)
         is not None
     }
     sent = 0
     with db.transaction(conn):
-        for share in store.shares_for_fee(conn, family_id, fee_id):
+        for share in _shares_to_remind(conn, family_id, fee_id, share_id):
             remaining = _remaining(share)
             pending = store.latest_pending_collection(conn, family_id, share["id"])
             if remaining.minor <= 0 or pending is None:

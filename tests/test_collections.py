@@ -459,6 +459,18 @@ def test_reminders_go_only_to_members_who_still_owe(conn, provider):
     assert len(texts(conn, "m_amina")) == before["m_amina"] + 1
 
 
+def test_a_reminder_can_be_limited_to_one_share(conn, provider):
+    # Catches: a per-share reminder that messages everyone who owes on the fee, so the scheduler pings them all.
+    fee_id = run_split(conn, provider)
+    nakato = collection_of(conn, "m_nakato")["share_id"]
+    before = {m: len(texts(conn, m)) for m in ("m_baraka", "m_nakato", "m_amina")}
+    assert remind(conn, provider, fee_id, share_id=nakato) == 1
+    assert len(texts(conn, "m_nakato")) == before["m_nakato"] + 1
+    assert len(texts(conn, "m_baraka")) == before["m_baraka"]
+    assert len(texts(conn, "m_amina")) == before["m_amina"]
+    assert [e["data"]["share_id"] for e in events(conn, "reminder.sent")] == [nakato]
+
+
 def test_a_reminder_says_what_is_left_and_carries_the_shares_link(conn, provider):
     # Catches: a reminder for the full share after part-payment, or one without the link to pay with.
     fee_id = new_fee(conn)
