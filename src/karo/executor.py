@@ -6,6 +6,8 @@ A payout is two commits with the provider call between them, never inside either
   3. the provider's answer is written.
 A provider error is not caught: the row stays pending and the retry reconciles it. Marking it failed here
 would hand back a debit for money that may already have gone.
+
+A split commits its shares first, then asks each relative for their payment link with no transaction open.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
-from karo import approvals, audit, db, ledger, outbox, proposals, rules, store
+from karo import approvals, audit, collections, db, ledger, outbox, proposals, rules, store
 from karo import clock
 from karo.clock import iso
 from karo.domain import CheckContext, Confirmation, FamilyState, Kind, Member, Payee, Proposal, Stage, TrustedPayee
@@ -64,13 +66,31 @@ class _PayoutJob:
     frozen: bool = False
 
 
+@dataclass(frozen=True)
+class _SplitDone:
+    """The shares are committed. The payment links are asked for next, outside the transaction."""
+
+    outcome: ExecutionOutcome
+    fee_id: str
+
+
 def execute(
-    conn: sqlite3.Connection, provider: Provider, *, family_id: str, proposal_id: str, now: datetime
+    conn: sqlite3.Connection,
+    provider: Provider,
+    *,
+    family_id: str,
+    proposal_id: str,
+    now: datetime,
+    base_url: str,
 ) -> ExecutionOutcome:
     if conn.in_transaction:
         # Joined to an outer transaction, the payouts row would not be committed before the provider is called.
         raise RuntimeError("execute must not run inside a transaction.")
     step = _prepare(conn, provider.name, family_id=family_id, proposal_id=proposal_id, now=now)
+    if isinstance(step, _SplitDone):
+        # Not inside _prepare's transaction: a link is a provider call, and the shares must be saved before it.
+        collections.request_all(conn, provider, family_id=family_id, fee_id=step.fee_id, now=now, base_url=base_url)
+        return step.outcome
     if isinstance(step, ExecutionOutcome):
         return step
     if step.is_new:
@@ -117,7 +137,7 @@ def _hold_back(job: _PayoutJob, now: datetime) -> ExecutionOutcome | None:
 
 def _prepare(
     conn: sqlite3.Connection, provider_name: str, *, family_id: str, proposal_id: str, now: datetime
-) -> ExecutionOutcome | _PayoutJob:
+) -> ExecutionOutcome | _PayoutJob | _SplitDone:
     # One transaction from the first read to the debit, so two executes can't both pass the funds check.
     with db.transaction(conn):
         found = store.get_proposal(conn, family_id, proposal_id)
@@ -176,7 +196,7 @@ def _stopped(
 
 def _carry_out(
     conn: sqlite3.Connection, provider_name: str, p: Proposal, state: FamilyState, by: str, now: datetime
-) -> ExecutionOutcome | _PayoutJob:
+) -> ExecutionOutcome | _PayoutJob | _SplitDone:
     match p.kind:
         case Kind.PAY_FEE | Kind.ALLOWANCE_RUN:
             return _start_payout(conn, provider_name, p, state, by, now)
@@ -367,7 +387,9 @@ def _executed(conn: sqlite3.Connection, p: Proposal, now: datetime, message: str
     return ExecutionOutcome("executed", message)
 
 
-def _split(conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime) -> ExecutionOutcome:
+def _split(
+    conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime
+) -> ExecutionOutcome | _SplitDone:
     fee = None if p.fee_id is None else store.get_fee(conn, p.family_id, p.fee_id)
     what = "the fees" if fee is None else f"the {fee['payee_name']} fees"
     asker = state.main_payer
@@ -400,7 +422,8 @@ def _split(conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, n
             "shares": [{"member_id": member_id, "amount": str(amount)} for member_id, amount in p.split],
         },
     )
-    return _executed(conn, p, now, f"Asked {', '.join(names)} for their shares of {p.amount}.")
+    outcome = _executed(conn, p, now, f"Asked {', '.join(names)} for their shares of {p.amount}.")
+    return outcome if p.fee_id is None else _SplitDone(outcome, p.fee_id)
 
 
 def _allowance_set(

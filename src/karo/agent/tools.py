@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from karo import audit, db, outbox, proposals, quotes, rules, store
+from karo import audit, collections, db, outbox, proposals, quotes, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -378,6 +378,16 @@ def _request_unfreeze(ctx: ToolContext, _args: dict) -> dict:
     return _proposed(ctx, Kind.UNFREEZE)
 
 
+def _send_reminders(ctx: ToolContext, args: dict) -> dict:
+    fee = _fee(ctx, args["fee_id"])
+    sent = collections.send_reminders(
+        ctx.conn, family_id=ctx.family_id, fee_id=fee["id"], now=ctx.now, actor=ctx.member.id
+    )
+    if sent == 0:
+        return {"reminders_sent": 0, "message": "Nobody needed a reminder: everyone has paid, or has no link yet."}
+    return {"reminders_sent": sent, "message": f"Sent {sent} {'reminder' if sent == 1 else 'reminders'}."}
+
+
 # --- the tool list ---------------------------------------------------------------------------
 
 
@@ -495,6 +505,15 @@ _TOOLS: tuple[_Tool, ...] = (
         _object(),
         _request_unfreeze,
         _MAIN_PAYER,
+    ),
+    _Tool(
+        "send_reminders",
+        "Remind the relatives who have not yet paid their share of a fee. Each gets a message with their own payment "
+        "link; Karo sends it and you never see the links. Call it only when the main payer asks for a reminder.",
+        _object(fee_id=_text("The id of the fee, from record_invoice or get_status.")),
+        _send_reminders,
+        _MAIN_PAYER,
+        gated=True,
     ),
 )
 

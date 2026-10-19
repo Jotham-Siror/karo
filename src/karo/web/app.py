@@ -24,12 +24,13 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.middleware.sessions import SessionMiddleware
 
-from karo import approvals, audit, clock, db, executor, outbox, proposals, seed, store
+from karo import approvals, audit, clock, db, executor, notices, outbox, proposals, seed, store
 from karo.agent.claude import Claude, ClaudeClient
 from karo.config import Settings, load_settings
 from karo.doors import base
 from karo.doors.base import InboundMessage
 from karo.domain import Member
+from karo.money import Money
 from karo.providers.base import Provider
 from karo.providers.standin import StandInProvider
 
@@ -367,7 +368,12 @@ def _run_confirmed(request: Request, conn: sqlite3.Connection, link: approvals.L
     state = request.app.state
     try:
         outcome = executor.execute(
-            conn, state.provider, family_id=link.family_id, proposal_id=link.proposal_id, now=now
+            conn,
+            state.provider,
+            family_id=link.family_id,
+            proposal_id=link.proposal_id,
+            now=now,
+            base_url=state.settings.public_base_url,
         )
     except Exception as error:
         # The payout row stays pending and a retry reconciles it: say it is under way, not that it failed.
@@ -383,6 +389,72 @@ def _run_confirmed(request: Request, conn: sqlite3.Connection, link: approvals.L
         return _notice(request, conn, PROCESSING, heading="On its way", tone="info")
     heading, tone = _RESULT_HEADINGS.get(outcome.status, ("Not done", "bad"))
     return _notice(request, conn, outcome.message, heading=heading, tone=tone)
+
+
+# --- money in: the stand-in checkout and the provider's notices ----------------------------------
+
+# Answers that tell the provider "received, don't send it again". A 401 is for a notice that isn't to be believed.
+_ACCEPTED = frozenset({"credited", "duplicate", "unknown"})
+CHECKOUT_GONE = "This checkout isn't available. Ask for a new payment link."
+
+
+def _standin(request: Request) -> StandInProvider | None:
+    provider = request.app.state.provider
+    return provider if isinstance(provider, StandInProvider) else None
+
+
+def _checkout_missing(request: Request, conn: sqlite3.Connection) -> Response:
+    return _notice(request, conn, CHECKOUT_GONE, status_code=404)
+
+
+@router.get("/standin/pay/{tx_ref}")
+def standin_checkout(tx_ref: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    collection = store.collection_by_tx_ref(conn, tx_ref) if _standin(request) else None
+    if collection is None:
+        return _checkout_missing(request, conn)
+    amount = Money(collection["amount_minor"], collection["currency"])
+    return _page(
+        request,
+        conn,
+        "standin_pay.html",
+        headers=_PIN_PAGE_HEADERS,
+        amount=str(amount),
+        paid=collection["status"] != "pending",
+    )
+
+
+@router.post("/standin/pay/{tx_ref}")
+def standin_pay(tx_ref: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    provider = _standin(request)
+    if provider is None or store.collection_by_tx_ref(conn, tx_ref) is None:
+        return _checkout_missing(request, conn)
+    try:
+        headers, body = provider.mark_paid(tx_ref)
+    except KeyError:
+        # The stand-in keeps its payments in memory, so a restart makes it forget the links it gave out.
+        return _checkout_missing(request, conn)
+    _take_notice(conn, provider, headers, body)
+    return RedirectResponse("/paid", status_code=303)
+
+
+@router.get("/paid")
+def paid_page(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    return _page(request, conn, "paid.html")
+
+
+def _take_notice(conn: sqlite3.Connection, provider: Provider, headers, body: bytes) -> str:
+    return notices.handle_notice(conn, provider, headers=headers, body=body, now=clock.now(conn))
+
+
+@router.post("/webhooks/{provider_name}")
+async def webhook(provider_name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    provider = request.app.state.provider
+    if provider_name != provider.name:
+        return JSONResponse({"error": "Unknown provider."}, status_code=404)
+    # The raw bytes: the signature covers exactly what was sent, so the body must not be parsed first.
+    body = await request.body()
+    result = await run_in_threadpool(_take_notice, conn, provider, request.headers, body)
+    return JSONResponse({"result": result}, status_code=200 if result in _ACCEPTED else 401)
 
 
 # --- the log and the demo controls ---------------------------------------------------------------

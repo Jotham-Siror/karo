@@ -14,7 +14,8 @@ _CAN = {
     Role.MAIN_PAYER: (
         "You can record an invoice (record_invoice), ask relatives to share a fee (propose_split), price and propose "
         "paying a fee (get_quote, then propose_fee_payment), set the student's monthly allowance (propose_allowance), "
-        "check where things stand (get_status), freeze Karo (freeze) and ask to unfreeze it (request_unfreeze). "
+        "check where things stand (get_status), remind relatives who haven't paid their share (send_reminders), "
+        "freeze Karo (freeze) and ask to unfreeze it (request_unfreeze). "
         "When an invoice arrives as text, a PDF or a photo, read it and call record_invoice with exactly what it says. "
         "Never correct or complete bank details yourself."
     ),

@@ -95,6 +95,13 @@ def member(conn: sqlite3.Connection, family_id: str, member_id: str) -> Member |
     return None if row is None else _member_from(row)
 
 
+def member_contact(conn: sqlite3.Connection, family_id: str, member_id: str) -> sqlite3.Row | None:
+    """Name, country, phone and email: what a provider needs to ask this person for money. Member has none of it."""
+    return conn.execute(
+        "SELECT id, name, country, phone, email FROM members WHERE family_id = ? AND id = ?", (family_id, member_id)
+    ).fetchone()
+
+
 def main_payer(conn: sqlite3.Connection, family_id: str) -> Member:
     row = conn.execute(
         "SELECT id, family_id, role, name FROM members "
@@ -462,3 +469,24 @@ def shares_for_fee(conn: sqlite3.Connection, family_id: str, fee_id: str) -> lis
     return conn.execute(
         "SELECT * FROM shares WHERE family_id = ? AND fee_id = ? ORDER BY rowid", (family_id, fee_id)
     ).fetchall()
+
+
+def get_share(conn: sqlite3.Connection, family_id: str, share_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM shares WHERE id = ? AND family_id = ?", (share_id, family_id)).fetchone()
+
+
+# --- collections -----------------------------------------------------------------------------
+
+
+def collection_by_tx_ref(conn: sqlite3.Connection, tx_ref: str) -> sqlite3.Row | None:
+    """Not family-scoped, on purpose: a provider's notice names only the tx_ref, which is unique across families,
+    and the family it belongs to is read from this row."""
+    return conn.execute("SELECT * FROM collections WHERE tx_ref = ?", (tx_ref,)).fetchone()
+
+
+def latest_pending_collection(conn: sqlite3.Connection, family_id: str, share_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM collections WHERE family_id = ? AND share_id = ? AND status = 'pending' "
+        "ORDER BY rowid DESC LIMIT 1",
+        (family_id, share_id),
+    ).fetchone()

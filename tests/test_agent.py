@@ -12,7 +12,7 @@ import httpx2
 import pytest
 from anthropic.types.beta import BetaFallbackBlock, BetaTextBlock, BetaToolUseBlock
 
-from karo import audit, clock, db, ledger, seed, store
+from karo import audit, clock, collections, db, ledger, seed, store
 from karo.agent.claude import (
     ClaudeClient,
     FakeClaude,
@@ -142,6 +142,7 @@ def test_the_main_payer_is_offered_every_tool(conn):
         "propose_allowance",
         "freeze",
         "request_unfreeze",
+        "send_reminders",
     ]
 
 
@@ -675,6 +676,76 @@ def test_a_relative_cannot_ask_to_unfreeze(conn, provider):
     run_tool("freeze", {}, ctx_for(conn, provider, "m_baraka"))
     result = run_tool("request_unfreeze", {}, ctx_for(conn, provider, "m_baraka"))
     assert result["status"] == "blocked"
+
+
+# --- reminders ----------------------------------------------------------------------------------
+
+
+def collecting_fee(conn, provider) -> str:
+    """A recorded fee with a share each for Baraka and Amina, both already asked for through a payment link."""
+    fee_id = recorded_fee(conn, provider)
+    for share_id, member_id, minor in (("sh_b", "m_baraka", 350000), ("sh_a", "m_amina", 250000)):
+        conn.execute(
+            "INSERT INTO shares (id, family_id, fee_id, member_id, amount_minor, currency, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'GBP', ?)",
+            (share_id, FAM, fee_id, member_id, minor, clock.iso(NOW)),
+        )
+    collections.request_all(conn, provider, family_id=FAM, fee_id=fee_id, now=NOW, base_url=BASE_URL)
+    return fee_id
+
+
+def reminders(conn, member_id: str) -> list[str]:
+    return [t for t in texts(conn, member_id) if t.startswith("Reminder")]
+
+
+def test_the_main_payer_can_remind_the_relatives_who_still_owe(conn, provider):
+    # Bug caught: a reminder tool that messages people who have paid, or skips the ones who haven't.
+    fee_id = collecting_fee(conn, provider)
+    conn.execute("UPDATE shares SET paid_minor = amount_minor WHERE id = 'sh_a'")
+    result = run_tool("send_reminders", {"fee_id": fee_id}, ctx_for(conn, provider))
+    assert result["reminders_sent"] == 1
+    (reminder,) = reminders(conn, "m_baraka")
+    assert reminder.startswith("Reminder: your share GBP 3,500.00 for University of Westbridge is still due.")
+    assert reminders(conn, "m_amina") == []
+    (logged,) = events(conn, "reminder.sent")
+    assert logged["actor"] == "m_amina" and logged["data"]["member_id"] == "m_baraka"
+
+
+def test_a_reminder_result_does_not_carry_the_payment_link(conn, provider):
+    # Bug caught: the AI being shown a payment link, which it could then repeat to the wrong person.
+    fee_id = collecting_fee(conn, provider)
+    result = run_tool("send_reminders", {"fee_id": fee_id}, ctx_for(conn, provider))
+    assert result["reminders_sent"] == 2
+    assert "http" not in json.dumps(result) and "/standin/" not in json.dumps(result)
+
+
+def test_a_relative_cannot_send_reminders(conn, provider):
+    # Bug caught: a relative nagging the rest of the family through the AI, because this tool skips the rule checker.
+    fee_id = collecting_fee(conn, provider)
+    result = run_tool("send_reminders", {"fee_id": fee_id}, ctx_for(conn, provider, "m_baraka"))
+    assert result == {"error": "Only the main payer can do that."}
+    assert reminders(conn, "m_amina") == [] and events(conn, "reminder.sent") == []
+
+
+def test_reminders_for_a_fee_of_another_family_are_refused(conn, provider):
+    # Bug caught: a fee id from another family used to message that family's relatives.
+    collecting_fee(conn, provider)
+    conn.execute(
+        "INSERT INTO fees (id, family_id, payee_name, payee_details_json, amount_minor, currency, created_at) "
+        "VALUES ('fee_theirs', ?, 'Northvale College', '{}', 123400, 'GBP', ?)",
+        (OTHER, clock.iso(NOW)),
+    )
+    result = run_tool("send_reminders", {"fee_id": "fee_theirs"}, ctx_for(conn, provider))
+    assert set(result) == {"error"} and "wasn't found" in result["error"]
+    assert events(conn, "reminder.sent") == []
+
+
+def test_reminders_say_so_when_everyone_has_paid(conn, provider):
+    # Bug caught: "Reminded 0 people." sounding like a success when there was nobody to remind.
+    fee_id = collecting_fee(conn, provider)
+    conn.execute("UPDATE shares SET paid_minor = amount_minor")
+    result = run_tool("send_reminders", {"fee_id": fee_id}, ctx_for(conn, provider))
+    assert result["reminders_sent"] == 0 and "Nobody" in result["message"]
 
 
 # --- get_status ---------------------------------------------------------------------------------

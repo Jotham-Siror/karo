@@ -20,7 +20,11 @@ OTHER = "fam_mwangi"
 PIN = "4821"
 PEPPER = "test-pepper"
 BASE_URL = "https://karo.example"
-RATES = {("KES", "GBP"): Decimal("0.00578"), ("GBP", "KES"): Decimal("173")}
+RATES = {
+    ("KES", "GBP"): Decimal("0.00578"),
+    ("UGX", "GBP"): Decimal("0.000183"),  # a split now asks Nakato in Uganda for her share
+    ("GBP", "KES"): Decimal("173"),
+}
 FUNDS = Money.parse("5000000", "KES")
 FEE_COST = Money.parse("1038062.29", "KES")  # GBP 6,000.00 at the stand-in rate, rounded up
 
@@ -226,7 +230,7 @@ def confirm(conn, now: datetime = NOW) -> str:
 
 
 def run(conn, provider, proposal_id: str, *, now: datetime = NOW, family_id: str = FAM):
-    return executor.execute(conn, provider, family_id=family_id, proposal_id=proposal_id, now=now)
+    return executor.execute(conn, provider, family_id=family_id, proposal_id=proposal_id, now=now, base_url=BASE_URL)
 
 
 def confirmed_fee_payment(conn, provider, **kw) -> str:
@@ -853,10 +857,11 @@ def test_each_relative_is_told_their_own_share(conn, provider):
         split=(("m_baraka", gbp("3500.00")), ("m_nakato", gbp("2500.00"))),
     )
     run(conn, provider, confirm(conn))
-    (to_baraka,) = texts(conn, "m_baraka")
-    (to_nakato,) = texts(conn, "m_nakato")
-    assert "GBP 3,500.00" in to_baraka and "GBP 2,500.00" not in to_baraka
-    assert "GBP 2,500.00" in to_nakato and "GBP 3,500.00" not in to_nakato
+    # Two messages each now: the ask, then the payment link that the ask promises.
+    to_baraka, to_nakato = texts(conn, "m_baraka"), texts(conn, "m_nakato")
+    assert len(to_baraka) == 2 and len(to_nakato) == 2
+    assert "GBP 3,500.00" in to_baraka[0] and "GBP 2,500.00" not in " ".join(to_baraka)
+    assert "GBP 2,500.00" in to_nakato[0] and "GBP 3,500.00" not in " ".join(to_nakato)
     assert texts(conn, "m_jabali") == []
     assert outcome.status == "awaiting_pin"
 

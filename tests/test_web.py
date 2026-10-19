@@ -1,5 +1,7 @@
 """The web door: login, chat, the PIN page, the log and the demo controls. Every test names the bug it would catch."""
 
+import hashlib
+import hmac
 import html
 import importlib
 import json
@@ -17,12 +19,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from karo import approvals, audit, clock, db, ledger, outbox, proposals, quotes, seed, store
+from karo import approvals, audit, clock, collections, db, ledger, outbox, proposals, quotes, seed, store
 from karo.agent.claude import FakeClaude, text_response
 from karo.config import Settings
 from karo.domain import Kind, Payee
 from karo.money import Money
-from karo.providers.standin import StandInProvider
+from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
 from karo.web.app import HideConfirmTokens, create_app
 
 FAM = "fam_otieno"
@@ -724,3 +726,208 @@ def test_reset_starts_the_demo_again_from_a_fresh_database(site):
         assert not [e for e in audit.events(conn, None) if e["event"] == "family.frozen"]
         assert approvals.verify_pin(conn, FAM, "m_amina", PIN, PEPPER, clock.now(conn)).ok
     assert site.client.get("/chat").status_code == 200  # the browser stays logged in
+
+
+# --- money in: the stand-in checkout and the provider's notices -----------------------------------
+
+
+class NotTheStandIn:
+    """A provider that is not the stand-in: its name is enough for the routes to decide against it."""
+
+    name = "flutterwave"
+
+
+def ask_for_a_share(site, member_id: str = "m_baraka", amount: str = "3000.00") -> dict:
+    """A fee with one share, asked for through the provider. Returns the collection row and the share's id."""
+    with site.connect() as conn:
+        now = clock.now(conn)
+        payee = store.load_state(conn, FAM, now).trusted_payees[0].payee
+        fee_id = store.insert_fee(
+            conn,
+            family_id=FAM,
+            payee=payee,
+            amount=Money.parse("6000.00", "GBP"),
+            due_date=None,
+            invoice_ref=None,
+            now=now,
+        )
+        share_id = db.new_id("sh")
+        conn.execute(
+            "INSERT INTO shares (id, family_id, fee_id, member_id, amount_minor, currency, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'GBP', ?)",
+            (share_id, FAM, fee_id, member_id, Money.parse(amount, "GBP").minor, clock.iso(now)),
+        )
+        collection_id = collections.request_share(
+            conn, site.provider, family_id=FAM, share_id=share_id, now=now, base_url=BASE_URL
+        )
+        row = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        return {"collection": dict(row), "share_id": share_id}
+
+
+def checkout_path(asked: dict) -> str:
+    return f"/standin/pay/{asked['collection']['tx_ref']}"
+
+
+def share_paid(site, asked: dict) -> int:
+    return site.query("SELECT paid_minor FROM shares WHERE id = ?", asked["share_id"])[0]["paid_minor"]
+
+
+def signed(body: bytes, secret: str = SECRET) -> dict[str, str]:
+    return {SIGNATURE_HEADER: hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()}
+
+
+def test_the_checkout_page_says_it_is_simulated_and_shows_the_amount_with_a_pay_button(site):
+    # Catches: a practice checkout that looks real, or that doesn't say how much is being paid.
+    asked = ask_for_a_share(site)
+    page = site.client.get(checkout_path(asked))
+    amount = str(Money(asked["collection"]["amount_minor"], "KES"))
+    assert page.status_code == 200
+    assert "Stand-in checkout (simulated, no real money)" in page.text
+    assert amount in page.text and "<button" in page.text and 'method="post"' in page.text
+
+
+def test_paying_at_the_checkout_credits_the_share_and_shows_the_thank_you_page(site):
+    # Catches: a Pay button that does nothing, or one that credits the share but strands the payer.
+    asked = ask_for_a_share(site)
+    response = site.client.post(checkout_path(asked))
+    assert response.status_code == 303 and response.headers["location"] == "/paid"
+    assert share_paid(site, asked) == Money.parse("3000.00", "GBP").minor
+    assert site.query("SELECT status FROM collections")[0]["status"] == "succeeded"
+    assert "Payment received. You can close this page." in site.client.get("/paid").text
+
+
+def test_pressing_pay_twice_credits_once(site):
+    # Catches: a double click on Pay crediting the same share twice.
+    asked = ask_for_a_share(site)
+    assert site.client.post(checkout_path(asked)).status_code == 303
+    assert site.client.post(checkout_path(asked)).status_code == 303
+    assert share_paid(site, asked) == Money.parse("3000.00", "GBP").minor
+    assert len(site.query("SELECT seq FROM ledger")) == 1
+
+
+def test_a_paid_checkout_no_longer_offers_the_pay_button(site):
+    # Catches: a finished payment still showing a Pay button, which invites a second try.
+    asked = ask_for_a_share(site)
+    site.client.post(checkout_path(asked))
+    page = site.client.get(checkout_path(asked))
+    assert page.status_code == 200 and "<button" not in page.text and "already been made" in page.text
+
+
+def test_a_checkout_for_a_payment_nobody_asked_for_is_not_found(site):
+    # Catches: the checkout answering for any reference, or crashing on one it doesn't know.
+    assert site.client.get("/standin/pay/karo-col_nobody").status_code == 404
+    assert site.client.post("/standin/pay/karo-col_nobody").status_code == 404
+
+
+def test_a_checkout_the_stand_in_has_forgotten_is_not_found_rather_than_a_crash(make_site, site):
+    # Catches: a restart (the stand-in keeps payments in memory) turning an old link into a 500 error page.
+    asked = ask_for_a_share(site)
+    restarted = make_site()
+    response = restarted.client.post(checkout_path(asked))
+    assert response.status_code == 404
+    assert share_paid(restarted, asked) == 0
+
+
+def test_the_checkout_does_not_exist_unless_the_provider_is_the_stand_in(settings, site):
+    # Catches: the pretend "pay" button staying live when a real provider is configured, so anyone can mark shares paid.
+    asked = ask_for_a_share(site)
+    real = Site(settings, provider=NotTheStandIn())
+    assert real.client.get(checkout_path(asked)).status_code == 404
+    assert real.client.post(checkout_path(asked)).status_code == 404
+    assert share_paid(real, asked) == 0
+
+
+def test_a_signed_webhook_credits_the_share_with_no_login(site):
+    # Catches: the provider's notice needing a login it can never have, so no payment is ever recorded.
+    asked = ask_for_a_share(site)
+    headers, body = site.provider.mark_paid(asked["collection"]["tx_ref"])
+    response = site.client.post("/webhooks/standin", content=body, headers=headers)
+    assert response.status_code == 200 and response.json() == {"result": "credited"}
+    assert share_paid(site, asked) == Money.parse("3000.00", "GBP").minor
+
+
+def test_the_webhook_checks_the_signature_against_the_exact_bytes_sent(site):
+    # Catches: parsing and re-encoding the body before checking it, which breaks every signature but a test's.
+    asked = ask_for_a_share(site)
+    tx_ref = asked["collection"]["tx_ref"]
+    site.provider.mark_paid(tx_ref)
+    body = json.dumps({"tx_ref": tx_ref, "event_id": "SI-EVT-spaced"}, indent=4).encode()
+    response = site.client.post("/webhooks/standin", content=body, headers=signed(body))
+    assert response.status_code == 200 and response.json() == {"result": "credited"}
+
+
+def test_a_forged_webhook_is_refused_and_credits_nothing(site):
+    # Catches: a made-up notice from anyone on the internet paying a share.
+    asked = ask_for_a_share(site)
+    body = json.dumps({"event_id": "x", "tx_ref": asked["collection"]["tx_ref"]}).encode()
+    response = site.client.post("/webhooks/standin", content=body, headers=signed(body, "not-the-secret"))
+    assert response.status_code == 401 and response.json() == {"result": "rejected"}
+    assert share_paid(site, asked) == 0
+
+
+def test_a_signed_webhook_the_provider_does_not_confirm_is_refused(site):
+    # Catches: believing a notice for a payment the provider says never happened.
+    asked = ask_for_a_share(site)
+    body = json.dumps({"event_id": "SI-EVT-early", "tx_ref": asked["collection"]["tx_ref"]}).encode()
+    response = site.client.post("/webhooks/standin", content=body, headers=signed(body))
+    assert response.status_code == 401 and response.json() == {"result": "unverified"}
+    assert share_paid(site, asked) == 0
+
+
+def test_a_repeated_webhook_and_an_unknown_one_are_both_acknowledged(site):
+    # Catches: answering a retry or an unrelated notice with an error, which makes the provider retry for days.
+    asked = ask_for_a_share(site)
+    headers, body = site.provider.mark_paid(asked["collection"]["tx_ref"])
+    site.client.post("/webhooks/standin", content=body, headers=headers)
+    again = site.client.post("/webhooks/standin", content=body, headers=headers)
+    assert again.status_code == 200 and again.json() == {"result": "duplicate"}
+    stranger = json.dumps({"event_id": "SI-EVT-other", "tx_ref": "karo-col_nobody"}).encode()
+    unknown = site.client.post("/webhooks/standin", content=stranger, headers=signed(stranger))
+    assert unknown.status_code == 200 and unknown.json() == {"result": "unknown"}
+    assert share_paid(site, asked) == Money.parse("3000.00", "GBP").minor
+
+
+def test_a_webhook_for_a_provider_this_app_does_not_use_is_not_found(site):
+    # Catches: a notice for one provider being judged by another's rules.
+    asked = ask_for_a_share(site)
+    headers, body = site.provider.mark_paid(asked["collection"]["tx_ref"])
+    response = site.client.post("/webhooks/flutterwave", content=body, headers=headers)
+    assert response.status_code == 404
+    assert share_paid(site, asked) == 0
+
+
+def test_confirming_a_split_on_the_pin_page_sends_the_payment_links(site):
+    # Catches: the PIN page running the split without the app's own address, so payers come back to the wrong page.
+    # The page hides an error from the executor, so a missing link is how a failure would show.
+    return_pages = []
+    create = site.provider.create_collection
+    site.provider.create_collection = lambda **kw: return_pages.append(kw["redirect_url"]) or create(**kw)
+    with site.connect() as conn:
+        now = clock.now(conn)
+        payee = store.load_state(conn, FAM, now).trusted_payees[0].payee
+        total = Money.parse("6000.00", "GBP")
+        fee_id = store.insert_fee(
+            conn, family_id=FAM, payee=payee, amount=total, due_date=None, invoice_ref="INV-77", now=now
+        )
+        split = (("m_baraka", Money.parse("3500.00", "GBP")), ("m_nakato", Money.parse("2500.00", "GBP")))
+        proposals.propose(
+            conn,
+            family_id=FAM,
+            actor=store.member(conn, FAM, "m_amina"),
+            kind=Kind.SPLIT,
+            now=now,
+            base_url=BASE_URL,
+            amount=total,
+            fee_id=fee_id,
+            split=split,
+        )
+        row = conn.execute(
+            "SELECT text FROM outbox WHERE member_id = 'm_amina' AND text LIKE '%/confirm/%' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    token = re.search(r"/confirm/(\S+)", row["text"]).group(1)
+    page = enter(site, token)
+    assert page.status_code == 200 and "Asked Baraka, Nakato" in words(page) and PROCESSING not in words(page)
+    for member_id in ("m_baraka", "m_nakato"):
+        links = site.query("SELECT text FROM outbox WHERE member_id = ? AND text LIKE '%/standin/pay/%'", member_id)
+        assert len(links) == 1
+    assert return_pages == [f"{BASE_URL}/paid"] * 2

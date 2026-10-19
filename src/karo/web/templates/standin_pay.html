@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Stand-in checkout (simulated, no real money) · Karo{% endblock %}
+{% block content %}
+<h1>Stand-in checkout (simulated, no real money)</h1>
+{% if paid %}
+<p class="notice info">This payment has already been made.</p>
+{% else %}
+<p class="summary">Amount to pay: {{ amount }}</p>
+<form method="post" class="card">
+  <button type="submit">Pay {{ amount }}</button>
+  <p class="hint">This is a practice checkout. No real money moves.</p>
+</form>
+{% endif %}
+{% endblock %}
