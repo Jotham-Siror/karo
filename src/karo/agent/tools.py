@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from karo import audit, collections, db, outbox, proposals, quotes, rules, store
+from karo import audit, collections, comparison, db, outbox, proposals, quotes, rates, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -318,6 +318,33 @@ def _get_quote(ctx: ToolContext, args: dict) -> dict:
     }
 
 
+def _compare_routes(ctx: ToolContext, args: dict) -> dict:
+    fee = _fee(ctx, args["fee_id"])
+    try:
+        found = comparison.compare(
+            ctx.conn, ctx.provider, family_id=ctx.family_id, target=_fee_amount(fee), now=ctx.now
+        )
+    except ValueError as exc:  # the provider has no price for this pair of currencies
+        raise _BadInput(str(exc)) from exc
+    result = {
+        "quote_id": found.quote_id,
+        "line": found.line,
+        "options": [
+            {
+                "name": o.name,
+                "you_pay": str(o.you_pay),
+                "they_receive": str(o.they_receive),
+                "speed": o.speed,
+                "is_example": o.is_example,
+            }
+            for o in found.options
+        ],
+    }
+    if found.markup_pct is not None:
+        result["rate_source"] = rates.ATTRIBUTION
+    return result
+
+
 def _propose_fee_payment(ctx: ToolContext, args: dict) -> dict:
     fee = _fee(ctx, args["fee_id"])
     payee = Payee.of(fee["payee_name"], **json.loads(fee["payee_details_json"]))
@@ -467,20 +494,31 @@ _TOOLS: tuple[_Tool, ...] = (
     ),
     _Tool(
         "get_quote",
-        "Get a price for paying a recorded fee in full: what the family pays in its home currency and what the payee "
-        "receives. Call it before propose_fee_payment. A quote only lasts a short time (see expires_at).",
+        "Get a plain price for paying a recorded fee in full: what the family pays in its home currency and what the "
+        "payee receives. To pay a fee, call compare_routes instead. A quote only lasts a short time (see expires_at).",
         _object(fee_id=_text("The id of the fee, from record_invoice or get_status.")),
         _get_quote,
         _MAIN_PAYER,
         gated=True,
     ),
     _Tool(
+        "compare_routes",
+        "Price paying a recorded fee in full and compare it with other ways to send. Call it before "
+        "propose_fee_payment. Karo can only send through its own provider, so that is always the pick: the other "
+        "options are illustrative examples (is_example), not live quotes. Tell the main payer the line word for "
+        "word, then propose with the quote_id. A quote only lasts a short time.",
+        _object(fee_id=_text("The id of the fee, from record_invoice or get_status.")),
+        _compare_routes,
+        _MAIN_PAYER,
+        gated=True,
+    ),
+    _Tool(
         "propose_fee_payment",
-        "Propose paying a recorded fee in full, using a quote from get_quote. Nothing moves until the main payer "
-        "confirms with a PIN.",
+        "Propose paying a recorded fee in full, using the quote_id from compare_routes. Nothing moves until the main "
+        "payer confirms with a PIN.",
         _object(
             fee_id=_text("The id of the fee, from record_invoice or get_status."),
-            quote_id=_text("The quote_id returned by get_quote for this fee."),
+            quote_id=_text("The quote_id returned by compare_routes for this fee."),
         ),
         _propose_fee_payment,
         _MAIN_PAYER,

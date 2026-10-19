@@ -1,0 +1,3 @@
+{"note": "Illustrative examples, not live quotes", "routes": [
+  {"name": "Bank wire (example)", "fixed_fee": {"minor": 350000, "currency": "KES"}, "markup_pct": "4.0", "speed": "3-5 days"},
+  {"name": "Money transfer shop (example)", "fixed_fee": {"minor": 150000, "currency": "KES"}, "markup_pct": "3.0", "speed": "1-2 days"}]}

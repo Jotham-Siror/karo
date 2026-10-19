@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import respx
 
 from karo.domain import (
     CheckContext,
@@ -39,6 +40,20 @@ UNIVERSITY = Payee.of(
     "University of Westbridge", country="GB", currency="GBP", sort_code="20-40-60", account_number="41234567"
 )
 SON_ACCOUNT = Payee.of("Jabali Otieno", country="GB", currency="GBP", sort_code="30-90-11", account_number="70012345")
+
+
+EXCHANGE_URL = "https://open.er-api.com/v6/latest/{source}"
+
+
+def rates_payload(**rates: float) -> dict:
+    return {"result": "success", "rates": rates}
+
+
+@pytest.fixture
+def exchange_api():
+    """The exchange-rate API, mocked. A test that reaches karo.rates must use this: the suite never uses the network."""
+    with respx.mock(assert_all_called=False) as router:
+        yield router
 
 
 def kes(amount: str) -> Money:

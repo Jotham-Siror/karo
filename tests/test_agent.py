@@ -8,10 +8,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import anthropic
+import httpx
 import httpx2
 import pytest
 from anthropic.types.beta import BetaFallbackBlock, BetaTextBlock, BetaToolUseBlock
 
+from conftest import EXCHANGE_URL, rates_payload
 from karo import audit, clock, collections, db, ledger, seed, store
 from karo.agent.claude import (
     ClaudeClient,
@@ -138,6 +140,7 @@ def test_the_main_payer_is_offered_every_tool(conn):
         "record_invoice",
         "propose_split",
         "get_quote",
+        "compare_routes",
         "propose_fee_payment",
         "propose_allowance",
         "freeze",
@@ -548,6 +551,92 @@ def test_only_the_main_payer_can_ask_for_a_quote(conn, provider):
     assert count(conn, "quotes") == 0
 
 
+# --- compare_routes ----------------------------------------------------------------------------
+
+KES_RATES = EXCHANGE_URL.format(source="KES")
+
+
+def compare_routes(conn, provider, fee_id: str, member_id: str = "m_amina") -> dict:
+    return run_tool("compare_routes", {"fee_id": fee_id}, ctx_for(conn, provider, member_id))
+
+
+def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can_use(conn, provider, exchange_api):
+    # Bug caught: a quote_id that propose_fee_payment can't use, or examples not marked as examples to the AI.
+    exchange_api.get(KES_RATES).respond(json=rates_payload(GBP=0.0058))
+    fee_id = recorded_fee(conn, provider)
+    result = compare_routes(conn, provider, fee_id)
+    assert result["line"] == (
+        "Stand-in provider (simulated): you pay KES 1,038,062.29 and GBP 6,000.00 arrives in about a day, "
+        "KES 41,299.78 less than a typical bank wire (example figures); "
+        "its rate is 0.35% above the market rate (Rates by Exchange Rate API)."
+    )
+    assert result["rate_source"] == "Rates by Exchange Rate API"
+    assert [(o["name"], o["is_example"]) for o in result["options"]] == [
+        ("Stand-in provider (simulated)", False),
+        ("Bank wire (example)", True),
+        ("Money transfer shop (example)", True),
+    ]
+    assert result["options"][1] == {
+        "name": "Bank wire (example)",
+        "you_pay": "KES 1,079,362.07",
+        "they_receive": "GBP 6,000.00",
+        "speed": "3-5 days",
+        "is_example": True,
+    }
+    proposed = run_tool(
+        "propose_fee_payment", {"fee_id": fee_id, "quote_id": result["quote_id"]}, ctx_for(conn, provider)
+    )
+    assert proposed["status"] == "awaiting_pin"
+    assert "http" not in json.dumps(result)
+
+
+def test_with_no_market_rate_the_result_has_no_markup_and_no_attribution(conn, provider, exchange_api):
+    # Bug caught: telling the AI to cite a market rate that was never available.
+    exchange_api.get(KES_RATES).mock(side_effect=[httpx.ConnectError("offline")])
+    result = compare_routes(conn, provider, recorded_fee(conn, provider))
+    assert "rate_source" not in result
+    assert "market rate" not in result["line"] and "Exchange Rate API" not in result["line"]
+    assert result["quote_id"].startswith("q_")
+
+
+def test_only_the_main_payer_can_compare_routes(conn, provider, exchange_api):
+    # Bug caught: a relative making the provider and the rate service price payments for the family.
+    route = exchange_api.get(KES_RATES).respond(json=rates_payload(GBP=0.0058))
+    fee_id = recorded_fee(conn, provider)
+    result = compare_routes(conn, provider, fee_id, "m_baraka")
+    assert result == {"error": "Only the main payer can do that."}
+    assert count(conn, "quotes") == 0 and not route.called
+
+
+def test_comparing_routes_for_a_fee_from_another_family_is_an_error(conn, provider, exchange_api):
+    # Bug caught: pricing, and so revealing the existence of, another family's invoice.
+    route = exchange_api.get(KES_RATES).respond(json=rates_payload(GBP=0.0058))
+    conn.execute(
+        "INSERT INTO fees (id, family_id, payee_name, payee_details_json, amount_minor, currency, created_at) "
+        "VALUES ('fee_theirs', ?, 'University of Westbridge', '{}', 600000, 'GBP', ?)",
+        (OTHER, clock.iso(NOW)),
+    )
+    result = compare_routes(conn, provider, "fee_theirs")
+    assert "wasn't found" in result["error"]
+    assert count(conn, "quotes") == 0 and not route.called
+
+
+def test_comparing_routes_the_provider_cannot_price_is_an_error(conn, provider, exchange_api):
+    # Bug caught: a provider with no rate for the currency raising out of the tool, or leaving a quote behind.
+    fee_id = store.insert_fee(
+        conn,
+        family_id=FAM,
+        payee=Payee.of("University of Westbridge", **WESTBRIDGE),
+        amount=Money.parse("100", "JPY"),
+        due_date=None,
+        invoice_ref=None,
+        now=NOW,
+    )
+    result = compare_routes(conn, provider, fee_id)
+    assert "No stand-in rate for KES to JPY" in result["error"]
+    assert count(conn, "quotes") == 0
+
+
 def test_a_fee_payment_is_held_for_the_pin_without_leaking_the_link(conn, provider):
     # Bug caught: the payment proposed with the fee's own payee and amount, but the link coming back to the AI.
     fee_id = recorded_fee(conn, provider)
@@ -853,6 +942,13 @@ def test_the_prompt_says_who_is_talking_and_what_their_role_can_do(conn):
     main, student = prompt_for(conn, "m_amina"), prompt_for(conn, "m_jabali")
     assert "Amina" in main and "Otieno family" in main and "record_invoice" in main
     assert "Jabali" in student and "can't move money" in student and "record_invoice" not in student
+
+
+def test_the_prompt_sends_a_fee_payment_through_compare_routes_and_the_line_word_for_word(conn):
+    # Bug caught: the AI paraphrasing the comparison, or proposing without the quote it was shown.
+    main = prompt_for(conn, "m_amina")
+    assert "call compare_routes" in main and "word for word" in main and "quote_id" in main
+    assert "compare_routes" not in prompt_for(conn, "m_baraka") and "compare_routes" not in prompt_for(conn, "m_jabali")
 
 
 def test_the_prompt_forbids_asking_for_a_pin_in_chat(conn):
