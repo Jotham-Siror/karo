@@ -1,0 +1,24 @@
+# Secrets: keys live only in .env, never in the repo
+.env
+.env.*
+!.env.example
+
+# Internal planning notes: not for the public repo
+Karo — *.md
+plans/
+.superpowers/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
