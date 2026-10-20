@@ -57,7 +57,7 @@ OPENING_BALANCE = Money(20000000, "KES")
 _STUDENT_ACCOUNT = {"country": "GB", "currency": "GBP", "sort_code": "30-90-11", "account_number": "70012345"}
 
 
-def _whatsapp_identities(whatsapp: dict[str, str]) -> list[tuple[str, str]]:
+def whatsapp_identities(whatsapp: dict[str, str]) -> list[tuple[str, str]]:
     by_name = {p.name.lower(): p for p in _PEOPLE}
     unknown = sorted(set(whatsapp) - set(by_name))
     if unknown:
@@ -87,7 +87,7 @@ def seed_demo(
     conn: sqlite3.Connection, *, pin: str, pepper: str, now: datetime, whatsapp: dict[str, str] | None = None
 ) -> str:
     """Builds both demo families and returns the Otieno family's id. Reset means a new database file."""
-    whatsapp_identities = _whatsapp_identities(whatsapp or {})
+    identities = whatsapp_identities(whatsapp or {})
     with db.transaction(conn):
         if conn.execute("SELECT 1 FROM families WHERE id = ?", (FAMILY_ID,)).fetchone() is not None:
             raise ValueError("The demo family already exists. To start again, use a new database file.")
@@ -105,7 +105,7 @@ def seed_demo(
                 (person.id, person.family_id, person.role, person.name, person.country, person.phone, person.email),
             )
             _add_identity(conn, "web", person.name.lower(), person.id)
-        for address, member_id in whatsapp_identities:
+        for address, member_id in identities:
             _add_identity(conn, "whatsapp", address, member_id)
 
         institution = next(i for i in countries.institutions() if i["name"] == "University of Westbridge")

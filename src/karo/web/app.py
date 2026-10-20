@@ -20,7 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import APIRouter, Depends, FastAPI, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -31,7 +31,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from karo import approvals, audit, clock, db, executor, notices, outbox, proposals, scheduler, seed, store
 from karo.agent.claude import Claude, ClaudeClient
 from karo.config import Settings, load_settings
-from karo.doors import base
+from karo.doors import base, whatsapp
 from karo.doors.base import InboundMessage
 from karo.domain import Member
 from karo.money import Money
@@ -76,6 +76,9 @@ _RESULT_HEADINGS = {
 _CONFIRM_PATH = re.compile(r"(/confirm/)[^\s/?#\"]+")
 
 router = APIRouter()
+# Its own router, added to the app only when Twilio is set up, and before `router`: the provider route there would
+# otherwise answer /webhooks/twilio first.
+whatsapp_router = APIRouter()
 
 
 class HideConfirmTokens(logging.Filter):
@@ -339,7 +342,11 @@ def confirm_page(token: str, request: Request, conn: sqlite3.Connection = Depend
 
 @router.post("/confirm/{token}")
 def confirm_submit(
-    token: str, request: Request, pin: str = Form(""), conn: sqlite3.Connection = Depends(get_conn)
+    token: str,
+    request: Request,
+    background: BackgroundTasks,
+    pin: str = Form(""),
+    conn: sqlite3.Connection = Depends(get_conn),
 ):
     state = request.app.state
     now = clock.now(conn)
@@ -354,7 +361,7 @@ def confirm_submit(
     result = approvals.confirm(conn, token=token, pin=pin, pepper=state.settings.pin_pepper, now=now)
     match result.status:
         case "confirmed":
-            return _run_confirmed(request, conn, link, now)
+            return _run_confirmed(request, background, conn, link, now)
         case "not_awaiting":
             return _notice(request, conn, NOT_WAITING, status_code=409)
         case "invalid_link":
@@ -369,8 +376,23 @@ def confirm_submit(
             return _confirm_page(request, conn, link, now, error=error, status_code=403)
 
 
-def _run_confirmed(request: Request, conn: sqlite3.Connection, link: approvals.LinkInfo, now: datetime) -> Response:
+def _deliver_later(request: Request, background: BackgroundTasks, family_id: str | None = None) -> None:
+    """Queues sending the waiting WhatsApp messages (a family's, or everyone's) for after the response is out."""
     state = request.app.state
+    if state.whatsapp_sender is None:
+        return
+    if family_id is None:
+        background.add_task(whatsapp.deliver_everywhere, state.settings, state.whatsapp_sender)
+    else:
+        background.add_task(whatsapp.deliver_for_family, state.settings, state.whatsapp_sender, family_id)
+
+
+def _run_confirmed(
+    request: Request, background: BackgroundTasks, conn: sqlite3.Connection, link: approvals.LinkInfo, now: datetime
+) -> Response:
+    state = request.app.state
+    # Before the try: even a payout that errors will have queued messages (the payment links, the failure notice).
+    _deliver_later(request, background, link.family_id)
     try:
         outcome = executor.execute(
             conn,
@@ -429,7 +451,9 @@ def standin_checkout(tx_ref: str, request: Request, conn: sqlite3.Connection = D
 
 
 @router.post("/standin/pay/{tx_ref}")
-def standin_pay(tx_ref: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def standin_pay(
+    tx_ref: str, request: Request, background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_conn)
+):
     provider = _standin(request)
     collection = None if provider is None else store.collection_by_tx_ref(conn, tx_ref)
     if collection is None or collection["status"] == "failed":
@@ -440,6 +464,7 @@ def standin_pay(tx_ref: str, request: Request, conn: sqlite3.Connection = Depend
         # The stand-in keeps its payments in memory, so a restart makes it forget the links it gave out.
         return _checkout_missing(request, conn)
     _take_notice(conn, provider, headers, body)
+    _deliver_later(request, background, collection["family_id"])
     return RedirectResponse("/paid", status_code=303)
 
 
@@ -453,14 +478,42 @@ def _take_notice(conn: sqlite3.Connection, provider: Provider, headers, body: by
 
 
 @router.post("/webhooks/{provider_name}")
-async def webhook(provider_name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+async def webhook(
+    provider_name: str, request: Request, background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_conn)
+):
     provider = request.app.state.provider
     if provider_name != provider.name:
         return JSONResponse({"error": "Unknown provider."}, status_code=404)
     # The raw bytes: the signature covers exactly what was sent, so the body must not be parsed first.
     body = await request.body()
     result = await run_in_threadpool(_take_notice, conn, provider, request.headers, body)
+    _deliver_later(request, background)
     return JSONResponse({"result": result}, status_code=200 if result in _ACCEPTED else 401)
+
+
+# --- WhatsApp: the signed Twilio webhook ---------------------------------------------------------
+
+
+@whatsapp_router.post(whatsapp.WEBHOOK_PATH)
+async def twilio_webhook(request: Request, background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_conn)):
+    state = request.app.state
+    fields = whatsapp.text_fields(await request.form())
+    signature = request.headers.get("X-Twilio-Signature")
+    if fields is None or not whatsapp.signature_is_valid(state.settings, fields, signature):
+        await run_in_threadpool(whatsapp.record_rejection, conn)
+        return Response(status_code=403)
+    if not (fields.get("MessageSid") and fields.get("From")):
+        return Response(status_code=400)
+    # The answer goes back to Twilio now; the agent can take far longer than Twilio will wait for it.
+    background.add_task(
+        whatsapp.process_inbound,
+        state.settings,
+        client=state.client,
+        provider=state.provider,
+        sender=state.whatsapp_sender,
+        fields=fields,
+    )
+    return Response(whatsapp.EMPTY_TWIML, media_type="text/xml")
 
 
 # --- the log and the demo controls ---------------------------------------------------------------
@@ -511,7 +564,7 @@ def first_of_next_month_at_nine(now: datetime, tz: ZoneInfo) -> datetime:
 
 
 @router.post("/demo/next-month", dependencies=[Depends(require_demo)])
-def demo_next_month(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def demo_next_month(request: Request, background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_conn)):
     state = request.app.state
     tz = store.family_config(conn, seed.FAMILY_ID).timezone
     now = clock.now(conn)
@@ -529,6 +582,7 @@ def demo_next_month(request: Request, conn: sqlite3.Connection = Depends(get_con
             data={"seconds": seconds, "to": clock.iso(target)},
         )
     scheduler.tick(conn, state.provider, now=clock.now(conn), base_url=state.settings.public_base_url)
+    _deliver_later(request, background)
     request.session["flash"] = f"The demo clock moved to {proposals.when_text(target, tz)}. Karo ran its checks."
     return RedirectResponse("/demo", status_code=303)
 
@@ -549,18 +603,26 @@ def demo_reset(request: Request):
 
 
 def ensure_database(settings: Settings) -> None:
-    """Creates the schema and, if there are no families yet, seeds the demo family with the demo PIN."""
+    """Creates the schema and, if there are no families yet, seeds the demo family with the demo PIN and phones."""
     with closing(db.connect(settings.db_path)) as conn:
         db.init(conn)
         if conn.execute("SELECT 1 FROM families").fetchone() is None:
             settings.require("demo_pin", "pin_pepper")
-            seed.seed_demo(conn, pin=settings.demo_pin, pepper=settings.pin_pepper, now=clock.now(conn))
+            seed.seed_demo(
+                conn,
+                pin=settings.demo_pin,
+                pepper=settings.pin_pepper,
+                now=clock.now(conn),
+                whatsapp=settings.demo_whatsapp,
+            )
 
 
-def run_scheduled_tick(settings: Settings, provider: Provider) -> None:
+def run_scheduled_tick(settings: Settings, provider: Provider, sender: whatsapp.Sender | None = None) -> None:
     # Its own connection, opened and closed here: the scheduler's thread must never share one with a request.
     with closing(db.connect(settings.db_path)) as conn:
         scheduler.tick(conn, provider, now=clock.now(conn), base_url=settings.public_base_url)
+        if sender is not None:
+            whatsapp.deliver_all(conn, sender)
 
 
 def build_provider(settings: Settings) -> Provider:
@@ -575,6 +637,7 @@ def create_app(
     *,
     client: Claude | None = None,
     provider: Provider | None = None,
+    whatsapp_sender: whatsapp.Sender | None = None,
     start_scheduler: bool = False,
 ) -> FastAPI:
     if client is None:
@@ -583,6 +646,11 @@ def create_app(
     if provider is None:
         provider = build_provider(settings)
     ensure_database(settings)
+    sender = None
+    if settings.whatsapp_enabled:
+        sender = whatsapp_sender or whatsapp.twilio_sender(
+            settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_whatsapp_from
+        )
     # On the logger, not in a uvicorn flag, so a plain `uvicorn karo.web.app:app` is covered too.
     logging.getLogger("uvicorn.access").addFilter(_HIDE_TOKENS)
 
@@ -598,6 +666,7 @@ def create_app(
             "interval",
             seconds=TICK_SECONDS,
             args=[settings, provider],
+            kwargs={"sender": sender},
             max_instances=1,
             coalesce=True,
         )
@@ -613,6 +682,7 @@ def create_app(
     app.state.settings = settings
     app.state.client = client
     app.state.provider = provider
+    app.state.whatsapp_sender = sender
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.session_secret,
@@ -623,6 +693,8 @@ def create_app(
     )
     app.add_exception_handler(LoginRequired, _login_required)
     app.mount("/static", StaticFiles(directory=_HERE / "static"), name="static")
+    if sender is not None:
+        app.include_router(whatsapp_router)
     app.include_router(router)
     return app
 

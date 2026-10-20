@@ -16,6 +16,12 @@ ALL_NAMES = (
     "KARO_PROVIDER",
     "KARO_STANDIN_SECRET",
     "DEMO_PIN",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_WHATSAPP_FROM",
+    "DEMO_WHATSAPP_AMINA",
+    "DEMO_WHATSAPP_BARAKA",
+    "DEMO_WHATSAPP_NAKATO",
 )
 REQUIRED = {
     "KARO_PIN_PEPPER": "pepper-value-xyz",
@@ -122,3 +128,59 @@ def test_a_settings_object_does_not_print_its_secrets():
     for secret in ("key-value-xyz", "pepper-value-xyz", "session-value-xyz", "password-value-xyz", "standin-value-xyz"):
         assert secret not in shown
     assert "4821" not in shown
+
+
+# --- WhatsApp -----------------------------------------------------------------------------------
+
+
+def test_the_twilio_settings_are_read_and_the_door_is_off_without_all_three(env):
+    # Catches: a half-set Twilio setup switching the WhatsApp door on, with a webhook that can never check a signature.
+    set_required(env)
+    assert load_settings(NO_ENV_FILE).whatsapp_enabled is False
+
+    env.setenv("TWILIO_ACCOUNT_SID", "ACsid-value-xyz")
+    env.setenv("TWILIO_AUTH_TOKEN", "token-value-xyz")
+    assert load_settings(NO_ENV_FILE).whatsapp_enabled is False
+
+    env.setenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155550100")
+    settings = load_settings(NO_ENV_FILE)
+    assert settings.whatsapp_enabled is True
+    assert (settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_whatsapp_from) == (
+        "ACsid-value-xyz",
+        "token-value-xyz",
+        "whatsapp:+14155550100",
+    )
+
+
+def test_demo_phones_are_kept_and_empty_ones_are_skipped(env):
+    # Catches: an empty `DEMO_WHATSAPP_BARAKA=` line seeding a phone for Baraka, or the set ones being dropped.
+    set_required(env)
+    env.setenv("DEMO_WHATSAPP_AMINA", "+254700000101")
+    env.setenv("DEMO_WHATSAPP_BARAKA", "")
+    env.setenv("DEMO_WHATSAPP_NAKATO", "0770 000 103")
+    assert load_settings(NO_ENV_FILE).demo_whatsapp == {"amina": "+254700000101", "nakato": "0770 000 103"}
+
+
+@pytest.mark.parametrize("name", ["DEMO_WHATSAPP_AMINA", "DEMO_WHATSAPP_BARAKA", "DEMO_WHATSAPP_NAKATO"])
+def test_a_bad_demo_phone_is_a_start_up_error_that_names_the_variable_and_not_the_number(env, name):
+    # Catches: a typo in a phone number found only when a message never arrives, or the number printed into a log.
+    set_required(env)
+    env.setenv(name, "12-not-a-phone-345")
+    with pytest.raises(RuntimeError) as caught:
+        load_settings(NO_ENV_FILE)
+    assert name in str(caught.value)
+    assert "12-not-a-phone-345" not in str(caught.value) and "12-not-a-phone-345" not in repr(caught.value.__cause__)
+    assert caught.value.__suppress_context__ is True  # so the traceback does not print the number from the cause
+
+
+def test_the_twilio_secrets_and_demo_phones_are_not_in_the_settings_repr():
+    # Catches: a log line or failed assertion showing the settings object and leaking the Twilio token or a phone.
+    settings = Settings(
+        twilio_account_sid="ACsid-value-xyz",
+        twilio_auth_token="token-value-xyz",
+        twilio_whatsapp_from="whatsapp:+14155550100",
+        demo_whatsapp={"amina": "+254700000101"},
+    )
+    shown = repr(settings)
+    for secret in ("ACsid-value-xyz", "token-value-xyz", "+14155550100", "+254700000101"):
+        assert secret not in shown
