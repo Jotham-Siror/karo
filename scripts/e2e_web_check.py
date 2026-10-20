@@ -202,11 +202,13 @@ def send_abroad(ok) -> None:
     start = mark()
     reply = chat("amina", SEND_FRIEND)
     show("send to a friend ->", reply, 600)
-    ok(HOLD_24H.search(reply) is not None, "the reply mentions the 24 hour hold on larger sends to a new recipient")
     path = link(inbox("amina"), "confirm")
     if path is None:  # the AI sometimes waits for a nudge before adding the recipient
-        show("no PIN link yet, so ->", chat("amina", "Yes, add him."), 300)
+        nudged = chat("amina", "Yes, add him.")
+        show("no PIN link yet, so ->", nudged, 300)
+        reply += " " + nudged
         path = link(inbox("amina"), "confirm")
+    ok(HOLD_24H.search(reply) is not None, "the reply mentions the 24 hour hold on larger sends to a new recipient")
     ok(path is not None, "a PIN link to add the recipient is in Amina's inbox")
     if path is None:
         return

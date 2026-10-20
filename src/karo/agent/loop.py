@@ -7,6 +7,7 @@ never edited or dropped; a long conversation is replaced by a new one instead.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -24,6 +25,9 @@ REFUSAL_REPLY = "Sorry, I can't help with that one."
 TOO_MANY_STEPS_REPLY = "Sorry, that took too many steps. Please try again."
 NO_ANSWER_REPLY = "Sorry, I couldn't put an answer together. Please try again."
 STATUS_NOTE = "From Karo's records as this message arrives, replacing any status earlier in this chat:"
+
+# "<" before a status tag, in either direction and with stray spaces.
+_STATUS_TAG_START = re.compile(r"<(?=\s*/?\s*karo_status)", re.IGNORECASE)
 
 _TURN_LOCKS: dict[str, threading.Lock] = {}
 
@@ -58,6 +62,7 @@ def _run_turn(
     base_url: str,
 ) -> str:
     conversation_id, messages = _open_conversation(conn, member, channel, now)
+    content = _without_status_tags(content)
     ctx = ToolContext(conn, provider, member.family_id, member, now, base_url)
     system = system_prompt(member, store.family_row(conn, member.family_id)["name"], member.role)
     tools = tools_for(member.role)
@@ -106,6 +111,17 @@ def _status_note(ctx: ToolContext) -> list[dict]:
     survives, and cannot spell a closing tag."""
     status = json.dumps(run_tool("get_status", {}, ctx)).replace("<", "\\u003c")
     return [{"type": "text", "text": f"{STATUS_NOTE}\n<karo_status>{status}</karo_status>"}]
+
+
+def _without_status_tags(content: list[dict]) -> list[dict]:
+    """The person's own text with any status tag defused, so nobody can type a block that reads as Karo's data.
+    The words stay readable; only the opening "<" is escaped, the way the real note escapes it."""
+    return [
+        {**block, "text": _STATUS_TAG_START.sub(lambda _: "\\u003c", block["text"])}
+        if block.get("type") == "text"
+        else block
+        for block in content
+    ]
 
 
 def _text_of(blocks: list[dict]) -> str:

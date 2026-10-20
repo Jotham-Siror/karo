@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from karo import audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
+from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -24,7 +24,7 @@ from karo.rules import Outcome, RuleResult
 _MAX_MINOR = 10**14
 
 # A longer name would push the details off the PIN page.
-_MAX_NAME = 60
+_MAX_NAME = 80
 
 # Invoice payee names are copied into the status note the AI reads on every turn, and an invoice's author chooses them
 # (an invoice is accepted on its bank details alone), so long text there is an injection route, not a name.
@@ -191,14 +191,8 @@ def _get_status(ctx: ToolContext, _args: dict) -> dict:
 
 
 def _record_invoice(ctx: ToolContext, args: dict) -> dict:
-    name = args["payee_name"].strip()
-    if len(name) > _MAX_PAYEE_NAME:
-        raise _BadInput(
-            f"The payee name is longer than {_MAX_PAYEE_NAME} characters, which no real payee's name is. "
-            "Check the invoice and ask the main payer."
-        )
     details = {key: value.strip() for key, value in args["payee_details"].items() if value.strip()}
-    payee = Payee.of(name, **details)
+    payee = Payee.of(args["payee_name"].strip(), **details)
     amount = _money(args["amount"], args["currency"])
     account_currency = details.get("currency", amount.currency).upper()
     if account_currency != amount.currency:
@@ -223,6 +217,12 @@ def _file_invoice(ctx: ToolContext, payee: Payee, amount: Money, due_date: str, 
     verdict = rules.check_payee(payee, state)
     if verdict.outcome is Outcome.BLOCK:
         return _refuse_invoice(ctx, payee, amount, verdict)
+    # After the payee check too, so a tampered invoice with a long name is still blocked, logged and reported.
+    if len(payee.name) > _MAX_PAYEE_NAME:
+        raise _BadInput(
+            f"The payee name is longer than {_MAX_PAYEE_NAME} characters, which no real payee's name is. "
+            "Check the invoice and ask the main payer."
+        )
     # After the payee check, so a fake copy of a real invoice is still caught and reported.
     earlier = _earlier_fees(ctx, state, payee, ref)
     paid = next((f for f in earlier if f["status"] == "paid"), None)
@@ -453,10 +453,23 @@ def _recipient_details(code: str, country: countries.Country, pairs: list[dict])
     return given
 
 
+def _is_plain_name(name: str) -> bool:
+    """Letters in any script, single spaces, and . ' - only. The name heads the PIN message, so it must not be able to
+    carry a number or a line of its own that sits beside the real details."""
+    return any(ch.isalpha() for ch in name) and all(ch.isalpha() or ch in " .'-" for ch in name)
+
+
+def _letters(name: str) -> str:
+    return "".join(ch for ch in name.casefold() if ch.isalpha())
+
+
 def _add_recipient(ctx: ToolContext, args: dict) -> dict:
     name = args["name"].strip()
-    if not name or len(name) > _MAX_NAME:
-        raise _BadInput(f"Give the recipient's name, in {_MAX_NAME} characters or fewer.")
+    if len(name) > _MAX_NAME or not _is_plain_name(name):
+        raise _BadInput(
+            f"A name can only use letters, spaces and . ' - and be at most {_MAX_NAME} characters long. "
+            "Phone numbers and account details go in the details, not the name."
+        )
     code = args["country"].strip().upper()
     country = _sendable().get(code)
     if country is None:
@@ -467,9 +480,9 @@ def _add_recipient(ctx: ToolContext, args: dict) -> dict:
         raise _BadInput(f"{args['method']!r} isn't a way to send to {country.name}. Use one of: {ids}.")
     details = _recipient_details(code, country, args["details"])
     # Every source: a recipient with an institution's name would be mistaken for it, and a repeat name makes "send to
-    # Paul" ambiguous.
+    # Paul" ambiguous. Only the letters count, so "Paul-Mbarga" is the same name as "Paul Mbarga".
     trusted = store.load_state(ctx.conn, ctx.family_id, ctx.now).trusted_payees
-    if any(t.payee.name.casefold() == name.casefold() for t in trusted):
+    if any(_letters(t.payee.name) == _letters(name) for t in trusted):
         raise _BadInput(f"There is already a payee called {name!r}. Use a different name, such as one with a surname.")
     payee = Payee.of(name, country=code, currency=country.currency, method=method_id, **details)
     result = _proposed(ctx, Kind.ADD_PAYEE, payee=payee)
@@ -505,8 +518,25 @@ def _propose_transfer(ctx: ToolContext, args: dict) -> dict:
         raise _BadInput(f"I don't have a currency on file for {payee.name}, so I can't send to them.")
     if account_currency != amount.currency:
         raise _BadInput(f"{payee.name} is paid in {account_currency}, so the amount has to be in {account_currency}.")
+    if _send_awaiting_pin(ctx, amount, payee):
+        raise _BadInput(
+            f"A send of {amount} to {payee.name} is already waiting for the PIN. "
+            "Ask the main payer to confirm that one instead of making another."
+        )
     quote = _new_quote(ctx, amount)
     return _proposed(ctx, Kind.SEND, amount=amount, payee=payee, quote_id=quote.id)
+
+
+def _send_awaiting_pin(ctx: ToolContext, amount: Money, payee: Payee) -> bool:
+    """An identical send whose PIN link can still be used. A send has no invoice to tell two apart, so without this a
+    repeated request pays twice. A link nobody used has expired, and the send may be made again."""
+    return any(
+        p.kind is Kind.SEND
+        and (p.amount, p.payee) == (amount, payee)
+        and row["status"] == "awaiting_pin"
+        and approvals.has_live_link(ctx.conn, ctx.family_id, p.id, ctx.now)
+        for p, row in store.open_proposals(ctx.conn, ctx.family_id)
+    )
 
 
 def _freeze(ctx: ToolContext, _args: dict) -> dict:

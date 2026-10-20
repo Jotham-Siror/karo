@@ -88,6 +88,8 @@ def request_share(
 
     contact = store.member_contact(conn, family_id, payer.id)
     country = countries.get(contact["country"])
+    if not country.collect_methods:
+        raise ValueError(f"Karo can't collect payments in {country.name} yet.")
     method = country.collect_methods[0]
     quote = provider.quote(country.currency, remaining)
     collection_id = db.new_id("col")

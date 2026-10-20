@@ -177,6 +177,16 @@ def open_link(conn: sqlite3.Connection, token: str, now: datetime) -> LinkInfo |
     return LinkInfo(row["proposal_id"], row["member_id"], row["family_id"])
 
 
+def has_live_link(conn: sqlite3.Connection, family_id: str, proposal_id: str, now: datetime) -> bool:
+    """True if a confirm link for this proposal can still be used."""
+    rows = conn.execute(
+        "SELECT l.expires_at FROM confirm_links l JOIN proposals p ON p.id = l.proposal_id "
+        "WHERE l.proposal_id = ? AND p.family_id = ? AND l.used_at IS NULL",
+        (proposal_id, family_id),
+    )
+    return any(now < clock.parse(row["expires_at"]) for row in rows)
+
+
 # --- confirm -----------------------------------------------------------------------------------
 
 

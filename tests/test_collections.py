@@ -223,6 +223,14 @@ def test_each_country_pays_by_its_own_method_in_its_own_currency(conn, provider)
     assert (by_payer["Nakato"]["method"], by_payer["Nakato"]["amount"].currency) == ("mtn_ug", "UGX")
 
 
+def test_a_payer_in_a_country_with_no_collect_method_gets_a_clear_error(conn, provider):
+    # Catches: an IndexError from an empty list when a payer lives where Karo can send to but cannot collect yet.
+    conn.execute("UPDATE members SET country = 'CM' WHERE id = 'm_baraka'")
+    share_id = add_share(conn, new_fee(conn), "m_baraka", "100.00")
+    with pytest.raises(ValueError, match="Cameroon"):
+        request(conn, provider, share_id)
+
+
 def test_the_provider_is_given_the_payers_details_and_the_return_page(conn, provider):
     # Catches: a collection with no payer contact, or one that sends the payer to the wrong page afterwards.
     recording = Recording(provider, conn)

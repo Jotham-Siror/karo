@@ -353,11 +353,36 @@ def test_a_recipient_named_like_an_institution_is_refused(conn, provider):
     assert "already" in result["error"]
 
 
-@pytest.mark.parametrize("name", ["", "   ", "x" * 61])
+@pytest.mark.parametrize("name", ["", "   ", "x" * 81])
 def test_an_empty_or_very_long_name_is_refused(conn, provider, name):
     # Bug caught: a blank recipient, or a name long enough to push the details off the PIN page.
     assert set(add_recipient(conn, provider, name=name)) == {"error"}
     assert count(conn, "proposals") == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Paul Mbarga +237 6 99 99 99 99", "Paul\n+237699999999", "Paul 2", "Paul (friend)", "Paul_Mbarga", "Paul\tMbarga"],
+    ids=["phone_number", "newline", "digit", "brackets", "underscore", "tab"],
+)
+def test_a_name_with_anything_but_letters_spaces_and_dot_apostrophe_hyphen_is_refused(conn, provider, name):
+    # Bug caught: a name that carries a fake phone number or line next to the real one on the PIN message.
+    result = add_recipient(conn, provider, name=name)
+    assert set(result) == {"error"} and "letters" in result["error"]
+    assert (count(conn, "proposals"), texts(conn)) == (0, [])
+
+
+@pytest.mark.parametrize("name", ["N'Goné Ndiaye-Fall", "Dr. Jean-Luc Obiang", "李小龙", "U" * 80])
+def test_real_names_in_any_script_up_to_80_characters_are_accepted(conn, provider, name):
+    # Bug caught: the name rule refusing accents, apostrophes, hyphens or names not written in the Latin alphabet.
+    assert add_recipient(conn, provider, name=name)["status"] == "awaiting_pin"
+
+
+def test_a_name_that_differs_only_in_spaces_or_hyphens_counts_as_the_same_name(conn, provider):
+    # Bug caught: "Paul-Mbarga" added beside "Paul Mbarga", defeating the one-name-one-payee check.
+    save_recipient(conn)
+    result = add_recipient(conn, provider, name="Paul-Mbarga", details=[{"field": "phone", "value": "+237699999999"}])
+    assert "already" in result["error"]
 
 
 # --- propose_transfer ------------------------------------------------------------------------------
@@ -475,6 +500,44 @@ def test_a_send_while_frozen_is_blocked(conn, provider):
     save_recipient(conn)
     conn.execute("UPDATE families SET frozen = 1 WHERE id = ?", (FAM,))
     assert transfer(conn, provider)["status"] == "blocked"
+
+
+# --- one send, one confirmation -------------------------------------------------------------------
+
+
+def test_a_second_identical_send_while_the_first_waits_for_the_pin_is_refused(conn, provider):
+    # Bug caught: "send it" said twice (or a model retry) giving two PIN links, and the family paying twice.
+    save_recipient(conn)
+    assert transfer(conn, provider)["status"] == "awaiting_pin"
+    again = transfer(conn, provider)
+    assert set(again) == {"error"} and "already waiting" in again["error"]
+    assert (count(conn, "proposals"), count(conn, "quotes"), len(texts(conn))) == (1, 1, 1)
+
+
+def test_a_different_amount_or_recipient_may_be_sent_while_another_send_waits(conn, provider):
+    # Bug caught: the guard refusing any second send, so Amina could not pay two people or two amounts at once.
+    save_recipient(conn)
+    save_recipient(conn, name="Grace Ndong", details=PAUL | {"phone": "+237699999999"})
+    transfer(conn, provider)
+    assert transfer(conn, provider, amount="6000")["status"] == "awaiting_pin"
+    assert transfer(conn, provider, recipient="Grace Ndong")["status"] == "awaiting_pin"
+
+
+def test_the_same_send_may_be_made_again_once_the_first_has_run(conn, provider):
+    # Bug caught: a send blocked for ever because an identical one was paid yesterday.
+    save_recipient(conn)
+    transfer(conn, provider)
+    run(conn, provider, confirm(conn))
+    assert transfer(conn, provider)["status"] == "awaiting_pin"
+
+
+def test_the_same_send_may_be_made_again_once_the_first_ones_link_has_expired(conn, provider):
+    # Bug caught: a send stuck for ever because the PIN link was never used and the proposal never leaves awaiting_pin.
+    save_recipient(conn)
+    transfer(conn, provider)
+    later = ctx_for(conn, provider, now=NOW + timedelta(minutes=16))
+    args = {"recipient": "Paul Mbarga", "amount": "5000", "currency": "XAF"}
+    assert run_tool("propose_transfer", args, later)["status"] == "awaiting_pin"
 
 
 # --- the prompt -----------------------------------------------------------------------------------
