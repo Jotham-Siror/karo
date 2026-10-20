@@ -7,6 +7,7 @@ import pytest
 
 from karo import approvals, audit, clock, countries, db, rules, store
 from karo.domain import Payee, Role
+from karo.money import Money
 from karo.seed import seed_demo
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
@@ -186,4 +187,22 @@ def test_seed_is_audited_and_the_chain_holds(conn):
     # The seed is a state change and belongs in the tamper-evident log.
     seed(conn)
     assert [e["event"] for e in audit.events(conn, FAM) if e["event"] == "seed.demo"] == ["seed.demo"]
+    assert audit.verify(conn) == (True, None)
+
+
+def test_the_otieno_family_starts_with_a_simulated_opening_balance_that_is_in_the_log(conn):
+    # Without it the first monthly allowance has nothing to draw on once the fee is paid, and the funds rule stops it.
+    seed(conn)
+    (opening,) = conn.execute("SELECT * FROM ledger WHERE ref = 'opening_balance'").fetchall()
+    assert (opening["family_id"], opening["kind"], opening["currency"], opening["amount_minor"]) == (
+        FAM,
+        "collection",
+        "KES",
+        20000000,
+    )
+    assert opening["at"] == clock.iso(NOW)
+    (logged,) = [e for e in audit.events(conn, FAM) if e["event"] == "balance.opening"]
+    assert logged["data"] == {"amount": "200000.00", "currency": "KES", "simulated": True}
+    assert store.load_state(conn, FAM, NOW).balances == (Money(20000000, "KES"),)
+    assert store.load_state(conn, OTHER, NOW).balances == ()
     assert audit.verify(conn) == (True, None)

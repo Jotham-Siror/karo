@@ -8,8 +8,9 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
-from karo import approvals, audit, countries, db
+from karo import approvals, audit, countries, db, ledger
 from karo.clock import iso
+from karo.money import Money
 
 FAMILY_ID = "fam_otieno"
 OTHER_FAMILY_ID = "fam_mwangi"
@@ -48,6 +49,10 @@ _FAMILIES = (
     (FAMILY_ID, "Otieno family"),
     (OTHER_FAMILY_ID, "Mwangi family"),
 )
+
+# Pretend money to start from. The fee is paid out of the relatives' shares, so without this the family would have
+# nothing left for the first monthly allowance and the funds rule would stop it.
+OPENING_BALANCE = Money(20000000, "KES")
 
 _STUDENT_ACCOUNT = {"country": "GB", "currency": "GBP", "sort_code": "30-90-11", "account_number": "70012345"}
 
@@ -119,5 +124,16 @@ def seed_demo(
             actor="seed",
             event="seed.demo",
             data={"families": [family_id for family_id, _ in _FAMILIES]},
+        )
+        ledger.post(
+            conn, family_id=FAMILY_ID, at=now, amount=OPENING_BALANCE, kind="collection", ref="opening_balance"
+        )
+        audit.record(
+            conn,
+            at=now,
+            family_id=FAMILY_ID,
+            actor="seed",
+            event="balance.opening",
+            data={"amount": str(OPENING_BALANCE.decimal), "currency": OPENING_BALANCE.currency, "simulated": True},
         )
     return FAMILY_ID

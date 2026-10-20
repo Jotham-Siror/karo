@@ -7,7 +7,8 @@ Usage:
 Writes DIR/run-<stamp>/ (default DIR is proof/) holding audit.json, payouts.csv, collections.csv and README.md.
 The chain head is printed. Copy it somewhere outside the database: the chain can show a changed row, but it can't
 show that the newest rows were cut off, so the head written down earlier is what catches that.
-Exit code: 0 if the audit chain is intact, 1 if it is broken, 2 if the export could not be made.
+Exit code: 0 if the audit chain is intact, 1 if it is broken, 2 if the export could not be made (no database,
+or the run folder is already there: nothing is overwritten).
 The database is only read. Audit data holds no PIN, token or key, and the collection links are not exported.
 """
 
@@ -159,9 +160,24 @@ def _tally(provider_and_simulated: list[tuple[str, bool]]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
+def _opening_balances(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT family_id, currency, SUM(amount_minor) AS minor FROM ledger WHERE ref = 'opening_balance' "
+        "GROUP BY family_id, currency ORDER BY family_id"
+    )
+    return [f"{Money(r['minor'], r['currency'])} for {r['family_id']}" for r in rows]
+
+
 def _readme(
-    stamp: str, events: int, head: str, intact: bool, broken_at: int | None, payouts: list[dict], rows: list[dict],
+    stamp: str,
+    events: int,
+    head: str,
+    intact: bool,
+    broken_at: int | None,
+    payouts: list[dict],
+    rows: list[dict],
     clock_offset: int,
+    openings: list[str],
 ) -> str:
     chain = "intact" if intact else f"BROKEN at event {broken_at}"
     paid = _tally([(p["provider"], p["simulated"] == "true") for p in payouts])
@@ -172,6 +188,11 @@ def _readme(
             f"\nThe demo clock was moved forward by {clock_offset} seconds during this run, "
             "so later times in the log are demo times, not real dates.\n"
         )
+    opening = "".join(
+        f"- The opening balance, {text}: money the demo family was given to start from (ledger ref `opening_balance`, "
+        "audit event `balance.opening`). It is pretend, not a deposit anyone made.\n"
+        for text in openings
+    )
     return f"""# Karo proof of a run ({stamp})
 
 Made by `scripts/export_proof.py` from the database after the run.
@@ -206,7 +227,7 @@ followed by the compact, key-sorted JSON of its `at`, `family_id`, `actor`, `eve
 - The stand-in checkout page, where a relative presses "Pay" instead of paying through a bank or mobile money.
 - The automatic conversion of money collected in another currency (for example Ugandan shillings) into the family's
   home currency. It is recorded in the ledger and the audit log as simulated.
-- Universities, families and bank details are made-up test data.
+{opening}- Universities, families and bank details are made-up test data.
 
 ## Files
 
@@ -237,7 +258,8 @@ def export(conn: sqlite3.Connection, out_root: Path) -> Exported:
     (folder / "audit.json").write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
     _write_csv(folder / "payouts.csv", PAYOUT_COLUMNS, payouts)
     _write_csv(folder / "collections.csv", COLLECTION_COLUMNS, collected)
-    readme = _readme(stamp, len(events), head, intact, broken_at, payouts, collected, clock.offset(conn))
+    openings = _opening_balances(conn)
+    readme = _readme(stamp, len(events), head, intact, broken_at, payouts, collected, clock.offset(conn), openings)
     (folder / "README.md").write_text(readme, encoding="utf-8")
     return Exported(folder, head, intact, broken_at)
 
@@ -262,6 +284,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         conn.execute("PRAGMA query_only = ON")
         result = export(conn, Path(args.out) if args.out else ROOT / "proof")
+    except FileExistsError as error:
+        # Two runs in one second share a stamp. The first stays as it is; this one is told, and is not "chain broken".
+        print(f"{error.filename} already exists, so nothing was written. Wait a second and try again.", file=sys.stderr)
+        return 2
     finally:
         conn.close()
 

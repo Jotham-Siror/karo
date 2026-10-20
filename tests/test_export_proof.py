@@ -24,6 +24,7 @@ FAM = "fam_otieno"
 PIN = "4821"
 PEPPER = "test-pepper"
 BASE_URL = "https://karo.example"
+STANDIN_SECRET = "standin-test-secret"
 
 
 def load_script():
@@ -102,7 +103,7 @@ def played_db(tmp_path_factory):
     connection = db.connect(path)
     db.init(connection)
     seed.seed_demo(connection, pin=PIN, pepper=PEPPER, now=NOW)
-    provider = StandInProvider.from_config("standin-test-secret", BASE_URL)
+    provider = StandInProvider.from_config(STANDIN_SECRET, BASE_URL)
     token = play_a_small_run(connection, provider)
     connection.close()
     return path, token
@@ -252,6 +253,36 @@ def test_the_readme_says_what_is_real_and_what_is_simulated_and_gives_the_head(d
     assert "1 payout" in readme and "1 collection" in readme
 
 
+def test_the_readme_lists_the_seeded_opening_balance_as_simulated(db_path, out_root):
+    # Bug caught: pretend starting money in the ledger that the proof pack never owns up to.
+    readme = (run_export(db_path, out_root) / "README.md").read_text(encoding="utf-8")
+    simulated = readme.split("## What is simulated")[1].split("## Files")[0]
+    assert "opening balance" in simulated and "KES 200,000.00" in simulated and FAM in simulated
+
+
+def test_the_readme_has_no_opening_balance_line_when_there_was_none(tmp_path, out_root):
+    # Bug caught: a proof pack claiming an opening balance that the database never had.
+    path = tmp_path / "empty.db"
+    connection = db.connect(path)
+    db.init(connection)
+    connection.close()
+    assert "opening balance" not in (run_export(path, out_root) / "README.md").read_text(encoding="utf-8")
+
+
+def test_an_existing_run_folder_is_a_refusal_and_not_the_chain_broken_exit(db_path, out_root, monkeypatch, capsys):
+    # Bug caught: two exports in the same second ending in a traceback and exit 1, which means "chain broken".
+    monkeypatch.setattr(export_proof.clock, "now", lambda conn: NOW)
+    assert export_proof.main(["--db", str(db_path), "--out", str(out_root)]) == 0
+    (folder,) = out_root.iterdir()
+    before = (folder / "audit.json").read_bytes()
+    capsys.readouterr()
+
+    assert export_proof.main(["--db", str(db_path), "--out", str(out_root)]) == 2
+
+    assert "already exists" in capsys.readouterr().err
+    assert (folder / "audit.json").read_bytes() == before
+
+
 def test_the_readme_says_when_the_demo_clock_was_moved(db_path, out_root):
     # Bug caught: audit times from a fast-forwarded demo clock being read as real dates.
     connection = db.connect(db_path)
@@ -265,13 +296,13 @@ def test_the_readme_says_when_the_demo_clock_was_moved(db_path, out_root):
 
 
 def test_no_confirm_token_pin_or_secret_reaches_the_export(db_path, out_root, confirm_token):
-    # Bug caught: a confirm link (a one-time credential), the PIN or the pepper copied into a file that gets published.
+    # Bug caught: a confirm link, the PIN, the pepper or the webhook secret copied into a file that gets published.
     folder = run_export(db_path, out_root)
     files = {p.name: p.read_text(encoding="utf-8") for p in folder.iterdir()}
     for name, text in files.items():
         assert confirm_token not in text, name
         assert "/confirm/" not in text, name
-        assert PEPPER not in text and "argon2" not in text, name
+        assert PEPPER not in text and STANDIN_SECRET not in text and "argon2" not in text, name
     # Only the event data is searched for the PIN: a 64-character hash can hold any four digits by chance.
     data = json.dumps([e["data"] for e in audit_json(folder)["events"]])
     assert PIN not in data

@@ -928,7 +928,7 @@ def test_pressing_pay_twice_credits_once(site):
     assert site.client.post(checkout_path(asked)).status_code == 303
     assert site.client.post(checkout_path(asked)).status_code == 303
     assert share_paid(site, asked) == Money.parse("3000.00", "GBP").minor
-    assert len(site.query("SELECT seq FROM ledger")) == 1
+    assert len(site.query("SELECT seq FROM ledger WHERE ref != 'opening_balance'")) == 1
 
 
 def test_a_paid_checkout_no_longer_offers_the_pay_button(site):

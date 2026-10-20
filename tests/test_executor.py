@@ -181,7 +181,14 @@ def add_trusted_payee(conn, payee_id: str, name: str, details: dict, since: date
 
 
 def fund(conn, amount: Money = FUNDS) -> None:
-    ledger.post(conn, family_id=FAM, at=NOW, amount=amount, kind="collection", ref="test-funds")
+    """Tops the family up so it holds `amount` in all, counting the opening balance the seed already gave it."""
+    ledger.post(conn, family_id=FAM, at=NOW, amount=amount - seed.OPENING_BALANCE, kind="collection", ref="test-funds")
+
+
+def ledger_kinds(conn) -> list[str]:
+    """Kinds of the ledger rows the code under test wrote, leaving out the seeded and the test's own funding."""
+    rows = conn.execute("SELECT kind FROM ledger WHERE ref NOT IN ('test-funds', 'opening_balance') ORDER BY seq")
+    return [r["kind"] for r in rows]
 
 
 def new_fee(conn, amount: str = "6000.00", payee: Payee | None = None) -> str:
@@ -346,7 +353,7 @@ def test_a_payment_lost_in_a_crash_is_sent_again_after_two_minutes_under_the_sam
     assert provider.payout_status(reference=f"karo-{proposal_id}", provider_id=None).status == "succeeded"
     assert count(conn, "payouts") == 1
     assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
-    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM ledger WHERE ref != 'test-funds' ORDER BY seq")]
+    kinds = ledger_kinds(conn)
     assert kinds == ["payout"]
     assert store.get_fee(conn, FAM, fee_id)["status"] == "paid"
 
@@ -365,7 +372,7 @@ def test_a_second_execute_during_an_in_flight_payout_neither_refunds_nor_pays_tw
     assert first.status == "executed"
     assert provider.payout_calls == 1
     assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
-    assert [r["kind"] for r in conn.execute("SELECT kind FROM ledger WHERE ref != 'test-funds'")] == ["payout"]
+    assert ledger_kinds(conn) == ["payout"]
     assert status_of(conn, proposal_id) == "executed"
     assert store.get_fee(conn, FAM, fee_id)["status"] == "paid"
     assert propose_fee(conn, provider, fee_id=fee_id).status == "blocked"
@@ -657,7 +664,7 @@ def test_a_failed_payout_gives_the_money_back_and_leaves_the_fee_open(conn, prov
 
     assert result.status == "failed"
     assert ledger.balance(conn, FAM, "KES") == FUNDS
-    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM ledger WHERE ref != 'test-funds' ORDER BY seq")]
+    kinds = ledger_kinds(conn)
     assert kinds == ["payout", "payout_reversal"]
     assert store.get_fee(conn, FAM, fee_id)["status"] == "open"
     assert status_of(conn, proposal_id) == "failed"

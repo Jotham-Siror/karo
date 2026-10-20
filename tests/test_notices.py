@@ -180,7 +180,9 @@ def pay(conn, provider, collection: sqlite3.Row) -> str:
 
 def ledger_rows(conn, family_id: str = FAM) -> list[tuple]:
     rows = conn.execute(
-        "SELECT currency, amount_minor, kind, ref FROM ledger WHERE family_id = ? ORDER BY seq", (family_id,)
+        "SELECT currency, amount_minor, kind, ref FROM ledger WHERE family_id = ? AND ref != 'opening_balance' "
+        "ORDER BY seq",
+        (family_id,),
     )
     return [tuple(r) for r in rows]
 
@@ -237,7 +239,7 @@ def test_a_ugx_share_credits_and_converts_to_kes(conn, provider):
         ("UGX", -local.minor, "conversion", collection["id"]),
         ("KES", home.minor, "conversion", collection["id"]),
     ]
-    assert ledger.balances(conn, FAM) == (home,)
+    assert ledger.balances(conn, FAM) == (home + seed.OPENING_BALANCE,)
     (auto,) = events(conn, "conversion.auto")
     assert auto["data"]["simulated"] is True
     assert auto["data"]["from"] == str(local) and auto["data"]["to"] == str(home)

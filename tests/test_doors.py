@@ -124,14 +124,17 @@ def test_a_freeze_word_inside_a_sentence_does_not_freeze(conn, provider, text):
 def test_a_pin_typed_in_chat_is_refused_and_never_kept(conn, provider, typed):
     # Catches: a PIN typed in chat reaching the AI, the conversation history or the log.
     claude = FakeClaude([])
+    seeded = {e["seq"] for e in audit.events(conn, None, limit=1000)}
     reply = send(conn, provider, claude, message(typed))
     assert reply == "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page."
     assert claude.requests == []
     assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
     logged = events(conn, "pin.typed_in_chat")
     assert len(logged) == 1
-    # Only the data is searched: a hash in the log can contain any four digits by chance.
-    assert typed.strip() not in json.dumps([e["data"] for e in audit.events(conn, None)])
+    # Only the data of what this message logged is searched: a hash can contain any four digits by chance, and the
+    # seed's opening balance (200000.00) already holds a run of zeros.
+    after = [e["data"] for e in audit.events(conn, None, limit=1000) if e["seq"] not in seeded]
+    assert after and typed.strip() not in json.dumps(after)
 
 
 @pytest.mark.parametrize("text", ["123", "1234567", "pay 4821", "48 21", "٤٨٢١"])

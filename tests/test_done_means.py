@@ -22,7 +22,7 @@ from conftest import FAM as RULES_FAM
 from conftest import NOW as RULES_NOW
 from fastapi.testclient import TestClient
 
-from karo import audit, clock, collections, countries, db, executor, ledger, proposals, quotes, rules, scheduler
+from karo import audit, clock, collections, countries, db, executor, ledger, rules, scheduler
 from karo import seed, store
 from karo.agent.claude import FakeClaude, text_response, tool_response
 from karo.config import Settings
@@ -196,8 +196,31 @@ class World:
         assert self.confirm().status_code == 200
         return self.conn.execute("SELECT id FROM fees WHERE family_id = ? ORDER BY rowid DESC", (FAM,)).fetchone()["id"]
 
-    def fund(self, amount: str = "5000000") -> None:
-        ledger.post(self.conn, family_id=FAM, at=self.now(), amount=kes(amount), kind="collection", ref="test-funds")
+    def collect_the_fee(self) -> str:
+        """Splits the fee three ways and has all three relatives pay at the stand-in checkout. Returns the fee id."""
+        fee_id = self.split_fee()
+        for member_id in ("m_baraka", "m_nakato", "m_amina"):
+            self.pay_at_checkout(member_id)
+        return fee_id
+
+    def propose_paying(self, fee_id: str) -> str:
+        """Amina asks for the fee to be paid, and her PIN link is sent. Returns the proposal id."""
+
+        def propose_with_the_quote(request):
+            return tool_response(
+                ("propose_fee_payment", {"fee_id": fee_id, "quote_id": result_of(request)["quote_id"]})
+            )
+
+        steps = [
+            tool_response(("get_quote", {"fee_id": fee_id})),
+            propose_with_the_quote,
+            text_response("Confirm with your PIN."),
+        ]
+        self.say("amina", "Please pay the fees", steps)
+        return self.conn.execute("SELECT id FROM proposals WHERE kind = 'pay_fee'").fetchone()["id"]
+
+    def ledger_refs(self) -> list[str]:
+        return [r["ref"] for r in self.conn.execute("SELECT ref FROM ledger ORDER BY seq")]
 
     def count(self, table: str, where: str = "1 = 1") -> int:
         return self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}").fetchone()[0]
@@ -263,21 +286,33 @@ def events(conn, name: str, family_id: str = FAM) -> list[dict]:
     return [e for e in audit.events(conn, family_id, limit=1000) if e["event"] == name]
 
 
-class CountingProvider:
-    """The stand-in, counting each time a payout is actually sent to it (the stand-in itself ignores repeats)."""
+class CountingProvider(StandInProvider):
+    """The stand-in, noting each reference it is asked to pay (the stand-in itself ignores a repeated reference)."""
 
-    name = "standin"
-
-    def __init__(self, inner: StandInProvider) -> None:
-        self.inner = inner
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.payouts_sent: list[str] = []
 
     def payout(self, **kwargs):
         self.payouts_sent.append(kwargs["reference"])
-        return self.inner.payout(**kwargs)
+        return super().payout(**kwargs)
 
-    def __getattr__(self, attr):
-        return getattr(self.inner, attr)
+
+class DroppedPayout(CountingProvider):
+    """The first payout is cut off by a dropped connection. With `reached_the_provider` it got there and only the
+    answer was lost; without, it never arrived."""
+
+    reached_the_provider = False
+
+    def payout(self, **kwargs):
+        first = not self.payouts_sent
+        if first and not self.reached_the_provider:
+            self.payouts_sent.append(kwargs["reference"])
+            raise ConnectionError("connection dropped")
+        result = super().payout(**kwargs)
+        if first:
+            raise ConnectionError("connection dropped")
+        return result
 
 
 # --- A payment notice not really from the provider is rejected ----------------------------------
@@ -300,7 +335,7 @@ def test_done_means_a_payment_notice_not_from_the_provider_is_rejected_standin(w
     assert (response.status_code, response.json()) == (401, {"result": "rejected"})
     assert world.count("shares", "paid_minor > 0") == 0
     assert world.count("collections", "status = 'succeeded'") == 0
-    assert world.count("ledger") == 0 and world.count("provider_events") == 0
+    assert world.ledger_refs() == ["opening_balance"] and world.count("provider_events") == 0
     assert len(events(world.conn, "notice.rejected", None)) == 1
 
 
@@ -335,52 +370,68 @@ def test_done_means_the_same_message_sent_twice_is_handled_once(world):
 
 
 def test_done_means_a_retried_payment_pays_once(make_world):
-    # Bug it catches: a second tap on the PIN link, or a retry after a timeout, sending the university a second payout.
-    sender = CountingProvider(StandInProvider.from_config(SECRET, BASE_URL))
+    # Bug it catches: a second tap on the PIN link, or a retry of a finished payment, paying the university twice.
+    sender = CountingProvider.from_config(SECRET, BASE_URL)
     world = make_world(sender)
-    world.fund()
-    now = world.now()
-    fee_id = store.insert_fee(
-        world.conn,
-        family_id=FAM,
-        payee=Payee.of("University of Westbridge", **WESTBRIDGE),
-        amount=gbp("6000.00"),
-        due_date=None,
-        invoice_ref="INV-77",
-        now=now,
-    )
-    priced = quotes.create_quote(
-        world.conn, sender, family_id=FAM, source_currency="KES", target=gbp("6000.00"), now=now
-    )
-    proposed = proposals.propose(
-        world.conn,
-        family_id=FAM,
-        actor=store.member(world.conn, FAM, "m_amina"),
-        kind=Kind.PAY_FEE,
-        now=now,
-        base_url=BASE_URL,
-        amount=gbp("6000.00"),
-        payee=Payee.of("University of Westbridge", **WESTBRIDGE),
-        quote_id=priced.id,
-        fee_id=fee_id,
-    )
-    assert proposed.status == "awaiting_pin"
+    proposal_id = world.propose_paying(world.collect_the_fee())
     token = world.latest_confirm_token()
     balance_before = ledger.balance(world.conn, FAM, "KES")
 
     assert world.enter_pin(token).status_code == 200
     assert world.enter_pin(token).status_code == 404  # the same link again, as a double tap or a retry would
     executor.execute(
-        world.conn, sender, family_id=FAM, proposal_id=proposed.proposal_id, now=world.now(), base_url=BASE_URL
+        world.conn, sender, family_id=FAM, proposal_id=proposal_id, now=world.now(), base_url=BASE_URL
     )
 
     (payout,) = world.conn.execute("SELECT * FROM payouts").fetchall()
-    assert payout["status"] == "succeeded" and payout["reference"] == f"karo-{proposed.proposal_id}"
+    assert payout["status"] == "succeeded" and payout["reference"] == f"karo-{proposal_id}"
     assert sender.payouts_sent == [payout["reference"]]
-    assert sender.inner.payout_calls == 1
+    assert sender.payout_calls == 1
+    debit = Money(payout["debit_minor"], payout["debit_currency"])
     debits = world.conn.execute("SELECT amount_minor FROM ledger WHERE kind = 'payout'").fetchall()
-    assert [d["amount_minor"] for d in debits] == [-priced.source.minor]
-    assert ledger.balance(world.conn, FAM, "KES") == balance_before - priced.source
+    assert [d["amount_minor"] for d in debits] == [-debit.minor]
+    assert ledger.balance(world.conn, FAM, "KES") == balance_before - debit
+
+
+@pytest.mark.parametrize(
+    ("reached_the_provider", "early_retry"),
+    [(False, "pending"), (True, "executed")],
+    ids=["never_arrived", "arrived_answer_lost"],
+)
+def test_done_means_a_retried_payment_pays_once_after_a_dropped_connection(
+    make_world, reached_the_provider, early_retry
+):
+    # Bug it catches: a retry of a payout the connection cut off, paying twice or refunding money that left.
+    sender = DroppedPayout.from_config(SECRET, BASE_URL)
+    sender.reached_the_provider = reached_the_provider
+    world = make_world(sender)
+    proposal_id = world.propose_paying(world.collect_the_fee())
+    reference = f"karo-{proposal_id}"
+
+    world.confirm()  # the send is cut off, so the page can only say the payment is on its way
+
+    (waiting,) = world.conn.execute("SELECT * FROM payouts").fetchall()
+    assert waiting["status"] == "pending"
+    debits = world.conn.execute("SELECT amount_minor FROM ledger WHERE kind = 'payout'").fetchall()
+    assert [d["amount_minor"] for d in debits] == [-waiting["debit_minor"]]
+
+    # Retried at once: a provider that has the payment says so, and one that doesn't is given time before a re-send.
+    retried = executor.execute(
+        world.conn, sender, family_id=FAM, proposal_id=proposal_id, now=world.now(), base_url=BASE_URL
+    )
+    assert retried.status == early_retry and sender.payouts_sent == [reference]
+
+    clock.advance(world.conn, 3 * 60)
+    scheduler.tick(world.conn, sender, now=world.now(), base_url=BASE_URL)
+
+    (payout,) = world.conn.execute("SELECT * FROM payouts").fetchall()
+    assert (payout["id"], payout["reference"], payout["status"]) == (waiting["id"], reference, "succeeded")
+    assert sender.payouts_sent == [reference] * (1 if reached_the_provider else 2)  # always the same reference
+    assert sender.payout_calls == 1  # so the provider holds one payment
+    debits = world.conn.execute("SELECT kind, amount_minor FROM ledger WHERE kind LIKE 'payout%'").fetchall()
+    assert [(d["kind"], d["amount_minor"]) for d in debits] == [("payout", -payout["debit_minor"])]
+    assert world.count("proposals", "kind = 'pay_fee' AND status = 'executed'") == 1
+    assert world.count("fees", "status = 'paid'") == 1
 
 
 # --- An invoice with hidden instructions can't get money moved -----------------------------------
@@ -409,7 +460,8 @@ def test_done_means_an_invoice_with_hidden_instructions_cannot_get_money_moved(w
     assert [r.get("accepted") for r in tried[:2]] == [False, False]
     assert all("error" in r or r.get("status") == "blocked" for r in tried[2:])
     assert world.count("fees") == 0
-    assert world.count("payouts") == 0 and world.count("ledger") == 0 and world.count("collections") == 0
+    assert world.count("payouts") == 0 and world.count("collections") == 0
+    assert world.ledger_refs() == ["opening_balance"]  # no money row beyond the seeded opening balance
     assert world.provider.payout_calls == 0
     assert [p["status"] for p in world.conn.execute("SELECT status FROM proposals")] == ["blocked"]
     assert world.count("trusted_payees", "details_json LIKE '%00000001%'") == 0
@@ -420,10 +472,23 @@ def test_done_means_an_invoice_with_hidden_instructions_cannot_get_money_moved(w
 
 
 def test_done_means_one_family_cannot_see_anothers_records(world):
-    # Bug it catches: a lookup that forgets to filter by family, so the Mwangis can read or act on the Otienos' fee.
+    # Bug it catches: a lookup that forgets the family filter, so the Mwangis can read or use the Otienos' fee or quote.
     fee_id = world.split_fee()
+    asking_for_a_price = [tool_response(("get_quote", {"fee_id": fee_id})), text_response("Quoted.")]
+    quoted = world.say("amina", "What would the fee cost?", asking_for_a_price)
+    otieno_quote = result_of(quoted.claude.requests[-1])["quote_id"]
     otieno_share = world.conn.execute("SELECT id FROM shares WHERE member_id = 'm_baraka'").fetchone()["id"]
     otieno_proposal = world.conn.execute("SELECT id FROM proposals").fetchone()["id"]
+    # The Mwangis have no invoice to record (they trust no payee yet), so their one fee is written in directly.
+    mwangi_fee = store.insert_fee(
+        world.conn,
+        family_id=OTHER,
+        payee=Payee.of("Hillcrest School", country="GB", currency="GBP", sort_code="11-11-11", account_number="1111"),
+        amount=gbp("100.00"),
+        due_date=None,
+        invoice_ref=None,
+        now=world.now(),
+    )
     split = [{"member_name": "Wanjiru", "amount": "6000.00"}]
     nosy = [
         tool_response(
@@ -431,7 +496,9 @@ def test_done_means_one_family_cannot_see_anothers_records(world):
             ("get_quote", {"fee_id": fee_id}),
             ("propose_split", {"fee_id": fee_id, "shares": split}),
             ("send_reminders", {"fee_id": fee_id}),
-            ("propose_fee_payment", {"fee_id": fee_id, "quote_id": "q_0000000000000000"}),
+            ("propose_fee_payment", {"fee_id": fee_id, "quote_id": otieno_quote}),
+            # Their own fee, but the Otienos' quote: a lookup that ignores the family would hand the quote over.
+            ("propose_fee_payment", {"fee_id": mwangi_fee, "quote_id": otieno_quote}),
         ),
         text_response("Nothing found."),
     ]
@@ -439,23 +506,41 @@ def test_done_means_one_family_cannot_see_anothers_records(world):
     turn = world.say("wanjiru", "Show me the fees", nosy)
 
     status, *lookups = results_seen(turn.claude.requests[-1])
-    nothing = {"fees": [], "shares": [], "frozen": False, "balances": [], "allowance": None, "open_proposals": []}
-    assert status == nothing
-    assert all("error" in r for r in lookups) and len(lookups) == 4
-    # What the model was told: the prompt and the tool results. Not its own calls, which name the id it was fishing for.
+    only_their_own = {
+        "fees": [
+            {"fee_id": mwangi_fee, "payee": "Hillcrest School", "amount": "GBP 100.00", "due": None, "status": "open"}
+        ],
+        "shares": [],
+        "frozen": False,
+        "balances": [],
+        "allowance": None,
+        "open_proposals": [],
+    }
+    assert status == only_their_own
+    assert all("error" in r for r in lookups[:4]) and len(lookups) == 5
+    assert lookups[4]["status"] == "blocked"
+    # What the model was told: the prompt and the tool results, not its own calls, which name the ids it fished for.
     everything_the_model_saw = json.dumps(
         [(request["system"], results_seen(request)) for request in turn.claude.requests]
     )
-    for private in (fee_id, "Westbridge", "Baraka", "Nakato", "Amina", "Jabali", "INV-77"):
+    for private in (fee_id, otieno_quote, "Westbridge", "Baraka", "Nakato", "Amina", "Jabali", "INV-77"):
         assert private not in everything_the_model_saw
     conn = world.conn
-    assert store.fees(conn, OTHER) == [] and store.get_fee(conn, OTHER, fee_id) is None
+    assert store.fees(conn, OTHER) == [store.get_fee(conn, OTHER, mwangi_fee)]
+    assert store.get_fee(conn, OTHER, fee_id) is None
     assert store.shares_for_fee(conn, OTHER, fee_id) == [] and store.get_share(conn, OTHER, otieno_share) is None
     assert store.get_proposal(conn, OTHER, otieno_proposal) is None
-    for table in ("proposals", "quotes", "payouts", "collections", "ledger", "fees", "shares"):
+    assert store.get_quote(conn, FAM, otieno_quote) is not None  # the id is real
+    assert store.get_quote(conn, OTHER, otieno_quote) is None
+    (their_proposal,) = conn.execute("SELECT id FROM proposals WHERE family_id = ?", (OTHER,)).fetchall()
+    attempt, row = store.get_proposal(conn, OTHER, their_proposal["id"])
+    assert attempt.quote is None and row["status"] == "blocked"
+    assert "quote_lookup" in [r["rule"] for r in json.loads(row["decision_json"])]
+    for table in ("quotes", "payouts", "collections", "ledger", "shares"):
         assert world.count(table, f"family_id = '{OTHER}'") == 0, table
     assert world.count("outbox", "member_id = 'm_wanjiru'") == 0
-    assert fee_id not in json.dumps(audit.events(conn, OTHER, limit=1000))
+    logged = json.dumps(audit.events(conn, OTHER, limit=1000))
+    assert fee_id not in logged and otieno_quote not in logged
 
     assert world.web.post("/login", data={"password": PASSWORD, "person": "wanjiru"}).status_code == 303
     assert world.web.get("/api/inbox").json() == []
@@ -486,7 +571,8 @@ def test_done_means_uganda_works_from_settings_alone(world):
     assert share["paid_minor"] == share["amount_minor"] == gbp("2000.00").minor
     assert world.count("collections", "status = 'succeeded' AND currency = 'UGX'") == 1
     assert ledger.balance(world.conn, FAM, "UGX") == Money(0, "UGX")  # taken in, then converted to the home currency
-    assert ledger.balance(world.conn, FAM, "KES") == world.provider.quote("KES", gbp("2000.00")).source
+    converted = world.provider.quote("KES", gbp("2000.00")).source
+    assert ledger.balance(world.conn, FAM, "KES") == seed.OPENING_BALANCE + converted
     (conversion,) = events(world.conn, "conversion.auto")
     assert conversion["data"]["simulated"] is True
 
@@ -589,12 +675,14 @@ def test_done_means_the_whole_story_runs_on_the_stand_in_with_no_internet(world)
         assert fee_payout["simulated"] == 1
         assert world.count("fees", "status = 'paid'") == 1
 
-        # The money for the fee came only from the three shares.
+        # The three shares alone covered the fee, so the seeded opening balance is what is left to draw on.
         credits = world.conn.execute(
             "SELECT SUM(amount_minor) FROM ledger WHERE currency = 'KES' AND amount_minor > 0 "
-            "AND kind IN ('collection', 'conversion')"
+            "AND kind IN ('collection', 'conversion') AND ref != 'opening_balance'"
         ).fetchone()[0]
-        assert ledger.balance(world.conn, FAM, "KES") == Money(credits - fee_payout["debit_minor"], "KES")
+        assert credits >= fee_payout["debit_minor"]
+        left = ledger.balance(world.conn, FAM, "KES")
+        assert left == seed.OPENING_BALANCE + Money(credits - fee_payout["debit_minor"], "KES")
         assert ledger.balance(world.conn, FAM, "UGX") == Money(0, "UGX")
 
         # 3:45  the allowance is set with the PIN
@@ -610,8 +698,7 @@ def test_done_means_the_whole_story_runs_on_the_stand_in_with_no_internet(world)
         assert world.count("standing_orders", "active = 1 AND approved_by = 'm_amina'") == 1
         assert world.count("payouts") == 1
 
-        # A month passes on the demo clock. There is no top-up flow yet, so the home balance is topped up directly.
-        world.fund("500000")
+        # A month passes on the demo clock, and the allowance runs from the balance the family was seeded with.
         clock.advance(world.conn, 32 * 24 * 3600)
         scheduler.tick(world.conn, world.provider, now=world.now(), base_url=BASE_URL)
         scheduler.tick(world.conn, world.provider, now=world.now(), base_url=BASE_URL)
@@ -629,6 +716,8 @@ def test_done_means_the_whole_story_runs_on_the_stand_in_with_no_internet(world)
         ("allowance_run", "succeeded", "standin", 1),
     ]
     assert world.provider.payout_calls == 2
+    allowance_debit = Money(payouts[1]["debit_minor"], payouts[1]["debit_currency"])
+    assert ledger.balance(world.conn, FAM, "KES") == left - allowance_debit
     assert world.count("confirmations") == 3  # the split, the fee and the allowance; the monthly run needs no PIN
     debited = world.conn.execute("SELECT amount_minor FROM ledger WHERE kind = 'payout' ORDER BY seq").fetchall()
     assert [p["debit_minor"] for p in payouts] == [-row["amount_minor"] for row in debited]

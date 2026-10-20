@@ -887,7 +887,7 @@ def test_the_main_payer_sees_everything_about_the_family(conn, provider):
         {"member": "Baraka", "amount": "GBP 3,500.00", "paid": "GBP 1,000.00"},
         {"member": "Nakato", "amount": "GBP 2,500.00", "paid": "GBP 0.00"},
     ]
-    assert status["balances"] == ["KES 5,000,000.00"]
+    assert status["balances"] == ["KES 5,200,000.00"]  # the 5,000,000 posted here plus the 200,000 opening balance
     assert status["frozen"] is False
     assert status["allowance"] == {"payee": "Jabali Otieno", "amount": "GBP 500.00", "day_of_month": 1}
     (open_proposal,) = status["open_proposals"]

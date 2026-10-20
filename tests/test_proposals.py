@@ -573,6 +573,7 @@ def test_freezing_one_family_leaves_the_other_running(conn):
 def test_balances_are_unchanged_by_proposing(conn, provider):
     # Bug caught: proposing moving money. Only the executor may.
     ledger.post(conn, family_id=FAM, at=NOW, amount=kes("5000000"), kind="collection", ref="seed")
+    before = ledger.balance(conn, FAM, "KES")
     propose_fee_payment(conn, provider, fee_id=new_fee(conn))
-    assert ledger.balance(conn, FAM, "KES") == kes("5000000")
+    assert ledger.balance(conn, FAM, "KES") == before
     assert conn.execute("SELECT COUNT(*) FROM payouts").fetchone()[0] == 0

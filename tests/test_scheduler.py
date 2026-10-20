@@ -146,7 +146,10 @@ def hours_later(conn, hours: int) -> None:
 
 
 def fund(conn, amount: str = "5000000") -> None:
-    ledger.post(conn, family_id=FAM, at=NOW, amount=kes(amount), kind="collection", ref="test-funds")
+    """Tops the family up so it holds `amount` in all, counting the opening balance the seed already gave it."""
+    ledger.post(
+        conn, family_id=FAM, at=NOW, amount=kes(amount) - seed.OPENING_BALANCE, kind="collection", ref="test-funds"
+    )
 
 
 def add_trusted_payee(conn, payee_id: str, since: datetime) -> None:
