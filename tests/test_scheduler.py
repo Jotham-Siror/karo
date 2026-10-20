@@ -12,7 +12,21 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from karo import approvals, audit, clock, collections, db, executor, ledger, proposals, quotes, scheduler, seed, store
+from karo import (
+    approvals,
+    audit,
+    clock,
+    collections,
+    db,
+    executor,
+    ledger,
+    notices,
+    proposals,
+    quotes,
+    scheduler,
+    seed,
+    store,
+)
 from karo.domain import Kind, Payee
 from karo.money import Money
 from karo.providers.standin import StandInProvider
@@ -92,6 +106,18 @@ class DeadLinkCheck(Wrapped):
     def verify_collection(self, tx_ref):
         if tx_ref in self.tx_refs:
             raise ConnectionError("connection dropped")
+        return self.inner.verify_collection(tx_ref)
+
+
+class CountedChecks(Wrapped):
+    """Counts each time a payment link is asked about."""
+
+    def __init__(self, inner) -> None:
+        super().__init__(inner)
+        self.checked: list[str] = []
+
+    def verify_collection(self, tx_ref):
+        self.checked.append(tx_ref)
         return self.inner.verify_collection(tx_ref)
 
 
@@ -634,6 +660,57 @@ def test_a_manual_reminder_counts_towards_the_day(conn, provider):
     assert [e["data"]["share_id"] for e in events(conn, "reminder.sent")] == [share_id]
 
 
+# --- shares paid without a notice ---------------------------------------------------------------
+
+
+def test_a_share_paid_without_its_notice_is_credited_by_the_tick_and_the_late_notice_adds_nothing(conn, provider):
+    # Catches: a missed webhook leaving a paid share uncredited for good, or the late webhook crediting it twice.
+    share_id = owing_share(conn, provider, "m_baraka", asked_at=NOW - timedelta(hours=30))
+    link = store.latest_pending_collection(conn, FAM, share_id)
+    headers, body = provider.mark_paid(link["tx_ref"])  # the notice never arrives
+    tick(conn, provider)
+    status = conn.execute("SELECT status FROM collections WHERE id = ?", (link["id"],)).fetchone()[0]
+    assert status == "succeeded"
+    assert store.get_share(conn, FAM, share_id)["paid_minor"] == gbp("2000.00").minor
+    assert [e["data"]["collection_id"] for e in events(conn, "collection.credited")] == [link["id"]]
+    assert texts(conn, "m_amina")[-1] == f"Baraka has paid their share (GBP 2,000.00). {notices.ALL_IN}"
+    assert reminders(conn, "m_baraka") == []
+
+    entries = count(conn, "ledger")
+    late = notices.handle_notice(conn, provider, headers=headers, body=body, now=NOW + timedelta(minutes=1))
+    assert late == "duplicate"
+    assert count(conn, "ledger") == entries
+    assert store.get_share(conn, FAM, share_id)["paid_minor"] == gbp("2000.00").minor
+    assert len(events(conn, "collection.credited")) == 1
+
+
+def test_a_link_still_unpaid_is_asked_about_at_most_once_every_ten_minutes(conn, provider):
+    # Catches: every 30-second tick calling the provider for every open link, or an unpaid link never asked again.
+    share_id = owing_share(conn, provider, "m_baraka", asked_at=NOW - timedelta(hours=1))
+    tx_ref = store.latest_pending_collection(conn, FAM, share_id)["tx_ref"]
+    counted = CountedChecks(provider)
+    tick(conn, counted, NOW)
+    tick(conn, counted, NOW + timedelta(minutes=1))
+    assert counted.checked == [tx_ref]
+    tick(conn, counted, NOW + timedelta(minutes=11))
+    assert counted.checked == [tx_ref, tx_ref]
+    assert store.latest_pending_collection(conn, FAM, share_id)["tx_ref"] == tx_ref
+    assert events(conn, "collection.credited") == []
+
+
+def test_a_link_the_provider_no_longer_knows_stays_pending(conn, provider):
+    # Catches: the tick marking a link failed because a restarted stand-in forgot it, when unknown means wait.
+    share_id = owing_share(conn, provider, "m_baraka", asked_at=NOW - timedelta(hours=1))
+    link = store.latest_pending_collection(conn, FAM, share_id)
+    restarted = StandInProvider.from_config("standin-test-secret", BASE_URL)
+    assert restarted.verify_collection(link["tx_ref"]).status == "failed"
+    tick(conn, restarted)
+    status = conn.execute("SELECT status FROM collections WHERE id = ?", (link["id"],)).fetchone()[0]
+    assert status == "pending"
+    assert events(conn, "collection.failed") == []
+    assert store.get_share(conn, FAM, share_id)["paid_minor"] == 0
+
+
 # --- stuck payouts ------------------------------------------------------------------------------
 
 
@@ -756,12 +833,13 @@ def test_a_provider_error_on_one_share_does_not_stop_the_others(conn, provider):
     fee_id = new_fee(conn)
     first = owing_share(conn, provider, "m_baraka", asked_at=NOW - timedelta(hours=30), fee_id=fee_id)
     owing_share(conn, provider, "m_nakato", asked_at=NOW - timedelta(hours=30), fee_id=fee_id)
-    tx_ref = store.latest_pending_collection(conn, FAM, first)["tx_ref"]
-    tick(conn, DeadLinkCheck(provider, [tx_ref]))
+    dead = store.latest_pending_collection(conn, FAM, first)
+    tick(conn, DeadLinkCheck(provider, [dead["tx_ref"]]))
     assert reminders(conn, "m_baraka") == []
     assert len(reminders(conn, "m_nakato")) == 1
-    (failed,) = events(conn, "scheduler.error")
-    assert (failed["data"]["step"], failed["data"]["subject_id"]) == ("reminder", first)
+    # The link is asked about twice in a tick: once to see if it was paid, once before the reminder.
+    failed = [(e["data"]["step"], e["data"]["subject_id"]) for e in events(conn, "scheduler.error")]
+    assert sorted(failed) == [("collection", dead["id"]), ("reminder", first)]
 
 
 # --- how a tick runs ----------------------------------------------------------------------------

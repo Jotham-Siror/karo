@@ -1,8 +1,8 @@
 """The background tick: what has to happen because time has passed.
 
 For each family, in this order: payouts left pending are asked about again, PIN-confirmed requests that never got as
-far as a payout are run, waiting requests whose wait is over are made again, the monthly allowance is paid, and late
-shares are reminded. Money still moves only through the executor,
+far as a payout are run, waiting requests whose wait is over are made again, the monthly allowance is paid, payment
+links still pending are asked about (in case their notice was lost), and late shares are reminded. Money still moves only through the executor,
 and the allowance only because the main payer's PIN already approved the standing order behind it.
 
 An error from the provider or the network on one item is audited (by type only) and the item is left for the next
@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from babel.dates import format_date
 
-from karo import audit, clock, collections, db, executor, outbox, proposals, quotes, store
+from karo import audit, clock, collections, db, executor, notices, outbox, proposals, quotes, store
 from karo.domain import Kind, StandingOrder
 from karo.proposals import ProposalOutcome
 from karo.providers.base import Provider
@@ -58,6 +58,8 @@ def tick(conn: sqlite3.Connection, provider: Provider, *, now: datetime, base_ur
             _run_confirmed(run)
             _renew_waiting(run)
             _pay_allowance(run)
+            # Before the reminders, so nobody is reminded about a share they already paid.
+            _settle_paid_shares(run)
             _remind_late_shares(run)
 
 
@@ -374,6 +376,22 @@ def _propose_run(
             data={"standing_order_id": order.id, "proposal_id": outcome.proposal_id},
         )
     return outcome
+
+
+# --- shares paid without a notice ---------------------------------------------------------------
+
+
+def _settle_paid_shares(run: _Run) -> None:
+    # `settle` moves updated_at on every check, so one link costs at most one provider call per VERIFY_EVERY.
+    checked_before = clock.iso(run.now - notices.VERIFY_EVERY)
+    rows = run.conn.execute(
+        "SELECT * FROM collections WHERE family_id = ? AND provider = ? AND status = 'pending' AND updated_at < ? "
+        "ORDER BY rowid",
+        (run.family_id, run.provider.name, checked_before),
+    ).fetchall()
+    for row in rows:
+        with _isolated(run, "collection", row["id"]):
+            notices.settle(run.conn, run.provider, row, now=run.now)
 
 
 # --- reminders --------------------------------------------------------------------------------

@@ -31,6 +31,9 @@ from karo.throttle import RejectionThrottle
 
 ALL_IN = "All shares are in. Ask me to pay the fees when you're ready."
 
+# How often the scheduler asks about a payment link still pending, in case its notice was lost.
+VERIFY_EVERY = timedelta(minutes=10)
+
 # A flood of forged posts writes one audit row a minute, carrying how many there were.
 REJECTION_WINDOW = timedelta(seconds=60)
 # One window per database file and provider, so two apps (or two tests) in one process never share a window.
@@ -102,6 +105,36 @@ def _confirm_and_credit(conn: sqlite3.Connection, provider: Provider, notice: No
         )
         return "unverified"
 
+    return _credit_confirmed(conn, provider, notice, collection, reported, now)
+
+
+def settle(conn: sqlite3.Connection, provider: Provider, collection: sqlite3.Row, *, now: datetime) -> str:
+    """Asks the provider about a pending payment link and credits it if it was paid. For a notice that never came.
+    One of "credited", "duplicate" or "pending". Must not run inside a transaction: it calls the provider."""
+    reported = provider.verify_collection(collection["tx_ref"])
+    local = Money(collection["amount_minor"], collection["currency"])
+    if _confirms(reported, local):
+        # One event id per payment link, so this credit and a late notice for it go through the same duplicate checks.
+        notice = Notice(provider.name, f"verify:{collection['tx_ref']}", collection["tx_ref"], None)
+        return _credit_confirmed(conn, provider, notice, collection, reported, now)
+    # Never marked failed here: a provider that doesn't know the link (the stand-in after a restart) may still be paid.
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE collections SET updated_at = ? WHERE id = ? AND family_id = ? AND status = 'pending'",
+            (iso(now), collection["id"], collection["family_id"]),
+        )
+    return "pending"
+
+
+def _credit_confirmed(
+    conn: sqlite3.Connection,
+    provider: Provider,
+    notice: Notice,
+    collection: sqlite3.Row,
+    reported: CollectionStatus,
+    now: datetime,
+) -> str:
+    local = Money(collection["amount_minor"], collection["currency"])
     credit = Money(collection["credit_minor"], collection["credit_currency"])
     home = store.family_config(conn, collection["family_id"]).policy.home_currency
     converted = None if local.currency == home else provider.quote(home, credit).source
