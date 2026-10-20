@@ -534,3 +534,53 @@ def test_the_rule_checker_accepts_the_confirmation_it_is_given(conn):
     state = store.load_state(conn, FAM, NOW)
     context = CheckContext(NOW, Stage.EXECUTE, state.main_payer, approvals.confirmation_for(conn, FAM, "prop_1"))
     assert rules.confirmation(proposal, state, context).outcome is rules.Outcome.PASS
+
+
+def notices(conn, member="m_amina") -> list[str]:
+    rows = conn.execute("SELECT text FROM outbox WHERE member_id = ? ORDER BY id", (member,)).fetchall()
+    return [r["text"] for r in rows]
+
+
+def test_the_lockout_tells_the_main_payer_once_and_only_at_the_lock(conn):
+    # Catches: a lock nobody hears about (a guesser could lock her out unseen), or a notice for each wrong try.
+    verify(conn, "1357")
+    verify(conn, "2468")
+    assert notices(conn) == []
+    verify(conn, "9753")
+    assert len(notices(conn)) == 1
+    assert notices(conn, "m_baraka") == []
+
+
+def test_the_lockout_notice_gives_the_unlock_time_in_the_family_timezone_and_the_freeze_word(conn):
+    # Catches: telling her UTC (09:15) instead of Nairobi time (12:15), or leaving out how to stop it.
+    lock(conn)
+    (notice,) = notices(conn)
+    assert "12:15 EAT" in notice
+    assert "09:15" not in notice
+    assert notice.endswith("If this wasn't you, reply FREEZE.")
+
+
+def test_the_lockout_notice_holds_no_digits_of_any_pin(conn):
+    # Catches: the notice repeating a guessed PIN, or the real one, into the outbox that WhatsApp delivers.
+    for guess in ("1357", "2468", "9753"):
+        verify(conn, guess)
+    (notice,) = notices(conn)
+    assert not any(pin in notice for pin in ("1357", "2468", "9753", PIN))
+
+
+def test_attempts_while_locked_send_no_further_notice(conn):
+    # Catches: one notice per refused attempt, which would flood the main payer while someone keeps guessing.
+    lock(conn)
+    for minutes in range(1, 6):
+        verify(conn, "0000", now=NOW + timedelta(minutes=minutes))
+    verify(conn, PIN, now=NOW + timedelta(minutes=6))
+    assert len(notices(conn)) == 1
+
+
+def test_a_second_lock_sends_a_second_notice(conn):
+    # Catches: telling her about the first lock only, so a later lock goes unannounced.
+    lock(conn)
+    later = NOW + LOCKOUT
+    for _ in range(3):
+        verify(conn, "0000", now=later)
+    assert len(notices(conn)) == 2

@@ -18,7 +18,7 @@ from typing import Literal
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
-from karo import audit, clock, db, store
+from karo import audit, clock, db, outbox, store
 from karo.domain import Confirmation
 
 _HASHER = PasswordHasher()
@@ -114,6 +114,15 @@ def verify_pin(
             _log_pin(
                 conn, now, family_id, member_id, "pin.locked", failures=failures, locked_until=clock.iso(locked_until)
             )
+            # Same format as proposals.when_text, which can't be imported here: proposals imports approvals.
+            unlock = locked_until.astimezone(config.timezone).strftime("%a %d %b, %H:%M %Z")
+            outbox.notify(
+                conn,
+                member_id,
+                f"Someone entered the wrong PIN too many times, so approving payments is locked until {unlock}. "
+                "If this wasn't you, reply FREEZE.",
+                now,
+            )
             return PinResult(False, locked_until, 0)
 
         attempts_left = config.pin_max_attempts - failures
@@ -139,7 +148,11 @@ def create_link(
     base_url: str,
     ttl: timedelta,
 ) -> str:
-    """The returned URL holds the only copy of the token; the database keeps just its hash."""
+    """Makes a one-time link and returns its URL, which carries the token.
+
+    confirm_links keeps only the token's hash. The full URL is also in the main payer's outbox message, because
+    that is how it reaches her; it must not go anywhere else (audit, logs, anything the AI sees).
+    """
     token = secrets.token_urlsafe(32)
     with db.transaction(conn):
         if store.get_proposal(conn, family_id, proposal_id) is None:
