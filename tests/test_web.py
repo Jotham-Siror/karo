@@ -642,7 +642,7 @@ def test_the_page_after_the_right_pin_says_done_and_what_was_done(site):
     # Catches: a success page that does not look like success, so the person submits the PIN again.
     page = words(enter(site, add_jonathan(site)))
     assert "<h1>Done ✓</h1>" in page
-    assert "Jonathan Siror is now a saved recipient." in page
+    assert "Jonathan Siror is saved. You can send them money now." in page
 
 
 def test_a_browser_with_a_session_is_sent_back_to_the_chat_after_four_seconds(site):
@@ -684,7 +684,7 @@ def test_a_used_link_says_when_it_was_confirmed_and_what_was_done(site, method):
     enter(site, token)
     again = site.client.get(f"/confirm/{token}") if method == "get" else enter(site, token)
     assert again.status_code == 200
-    expected = f"This was already confirmed at {used_at_local(site)}. Jonathan Siror is now a saved recipient."
+    expected = f"This was already confirmed at {used_at_local(site)}. Jonathan Siror is saved."
     assert expected in words(again)
 
 
@@ -694,7 +694,7 @@ def test_a_used_link_does_not_add_the_payee_or_tell_the_chat_again(site):
     for _ in range(5):
         enter(site, token)
     assert len(site.query("SELECT id FROM trusted_payees WHERE name = 'Jonathan Siror'")) == 1
-    done = site.query("SELECT id FROM outbox WHERE member_id = 'm_amina' AND channel = 'web' AND text LIKE 'Done:%'")
+    done = site.query("SELECT id FROM outbox WHERE member_id = 'm_amina' AND channel = 'web' AND text LIKE 'Done ✓%'")
     assert len(done) == 1
 
 
@@ -714,7 +714,7 @@ def test_a_used_link_says_plainly_how_its_proposal_ended(site, status, words_for
     site.query("UPDATE proposals SET status = ?", status)
     page = words(site.client.get(f"/confirm/{token}"))
     assert words_for_it in page
-    assert "is now a saved recipient" not in page
+    assert "is saved" not in page
 
 
 def test_an_expired_link_that_was_never_used_stays_a_plain_not_found(site):
@@ -735,6 +735,22 @@ def test_a_used_link_whose_member_is_in_another_family_stays_a_plain_not_found(s
     response = site.client.get(f"/confirm/{token}")
     assert response.status_code == 404
     assert EXPIRED in response.text and "Jonathan" not in response.text
+
+
+def test_the_outcome_note_goes_out_on_whatsapp_right_after_the_pin(settings):
+    # Catches: the result reaching only the PIN page and the web chat, so a person who confirmed from WhatsApp hears nothing.
+    sent: list[tuple[str, str]] = []
+    site = Site(settings)
+    configured = replace(settings, twilio_account_sid="AC-test", twilio_auth_token="auth-test", twilio_whatsapp_from=WHATSAPP_FROM)
+    sender = lambda to, body: sent.append((to, body))  # noqa: E731
+    site.client = TestClient(
+        create_app(configured, client=site.claude, provider=site.provider, whatsapp_sender=sender), follow_redirects=False
+    )
+    site.query("INSERT INTO identities (channel, address, member_id) VALUES ('whatsapp', 'whatsapp:+254700000001', 'm_amina')")
+    enter(site, add_jonathan(site))
+    assert ("whatsapp:+254700000001", "Done ✓ Jonathan Siror is saved. You can send them money now.") in sent
+    waiting = site.query("SELECT id FROM outbox WHERE channel = 'whatsapp' AND delivered_at IS NULL AND text LIKE 'Done ✓%'")
+    assert waiting == []
 
 
 def test_a_provider_error_after_the_pin_says_the_payment_is_being_processed(make_site):

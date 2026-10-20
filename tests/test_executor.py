@@ -1046,7 +1046,7 @@ def test_a_kind_with_no_receipt_tells_the_main_payer_once_on_each_channel(conn, 
     assert run(conn, provider, proposal_id).status == "executed"
     sent = sent_since(conn, last)
     assert [channel for channel, _ in sent] == ["web", "whatsapp"]
-    assert all(text.startswith("Done: ") for _, text in sent)
+    assert all(text.startswith("Done ✓ ") for _, text in sent)
 
 
 @pytest.mark.parametrize("kind", NO_RECEIPT_KINDS)
@@ -1065,7 +1065,7 @@ def test_the_note_for_a_new_payee_names_them_in_plain_words(conn, provider):
     last = newest_outbox_id(conn)
     run(conn, provider, proposal_id)
     assert sent_since(conn, last) == [
-        ("web", "Done: Jonathan Siror is now a saved recipient. You can ask me to send money to them now.")
+        ("web", "Done ✓ Jonathan Siror is saved. You can send them money now.")
     ]
 
 
@@ -1088,3 +1088,21 @@ def test_running_a_kind_again_does_not_tell_the_main_payer_again(conn, provider)
     last = newest_outbox_id(conn)
     assert run(conn, provider, proposal_id).status == "not_confirmed"
     assert sent_since(conn, last) == []
+
+
+def test_the_note_for_a_new_allowance_is_one_line_with_the_amount_and_the_day(conn, provider):
+    # Bug caught: a note that names no amount or day, so the main payer has to ask what was set.
+    proposal_id = confirmed_without_receipt(conn, provider, Kind.ALLOWANCE_SET)
+    last = newest_outbox_id(conn)
+    run(conn, provider, proposal_id)
+    assert sent_since(conn, last) == [("web", "Done ✓ Allowance set: GBP 500.00 on the 1st of each month.")]
+
+
+@pytest.mark.parametrize("kind", NO_RECEIPT_KINDS)
+def test_every_outcome_note_is_a_single_line(conn, provider, kind):
+    # Bug caught: a multi-line note that WhatsApp shows as a wall of text instead of a quick "done".
+    proposal_id = confirmed_without_receipt(conn, provider, kind)
+    last = newest_outbox_id(conn)
+    run(conn, provider, proposal_id)
+    (_, text), *_ = sent_since(conn, last)
+    assert text.splitlines() == [text] and len(text) <= 100

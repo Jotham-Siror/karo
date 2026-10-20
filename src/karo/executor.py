@@ -421,24 +421,29 @@ def _executed(conn: sqlite3.Connection, p: Proposal, now: datetime, message: str
     return ExecutionOutcome("executed", message)
 
 
+def _ordinal(day: int) -> str:
+    suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
 def done_text(p: Proposal, state: FamilyState) -> str:
-    """What a proposal that ran has done, in plain words. The reply to the PIN page, the note in the chat and the page
-    for a link used twice all say it the same way."""
+    """What a proposal that ran has done, as one short line. The PIN page, the note in the chat and WhatsApp, and the
+    page for a link used twice all say it the same way."""
     payee = p.payee.name if p.payee is not None else "the payee"
     match p.kind:
         case Kind.PAY_FEE | Kind.SEND | Kind.ALLOWANCE_RUN:
             return f"Paid {p.amount} to {payee}."
         case Kind.ALLOWANCE_SET:
-            return f"The monthly allowance is now {p.amount} to {payee}, paid on day {ALLOWANCE_DAY}."
+            return f"Allowance set: {p.amount} on the {_ordinal(ALLOWANCE_DAY)} of each month."
         case Kind.SPLIT:
             names = ", ".join(state.member(member_id).name for member_id, _ in p.split)
             return f"Asked {names} for their shares of {p.amount}."
         case Kind.ADD_PAYEE:
-            return f"{payee} is now a saved recipient. You can ask me to send money to them now."
+            return f"{payee} is saved. You can send them money now."
         case Kind.UNFREEZE:
             return "Karo is unfrozen. Money can move again."
         case Kind.CONVERT:
-            return f"Converted {p.quote.source} into {p.quote.target} (simulated: no real money moved)."
+            return f"Converted {p.quote.source} into {p.quote.target} (simulated)."
     return "That has been done."
 
 
@@ -446,7 +451,7 @@ def _done(conn: sqlite3.Connection, p: Proposal, state: FamilyState, now: dateti
     """For a kind with no receipt or payment link of its own: the main payer is told in the chat and on WhatsApp too,
     because the PIN page is the only other place the result shows and she may have left it."""
     message = done_text(p, state)
-    outbox.notify(conn, state.main_payer.id, f"Done: {message}", now)
+    outbox.notify(conn, state.main_payer.id, f"Done ✓ {message}", now)
     return _executed(conn, p, now, message)
 
 
