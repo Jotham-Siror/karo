@@ -208,12 +208,21 @@ class Result(enum.Enum):
 
 def _is_refusal(error: Exception) -> bool:
     # A 4xx is Twilio saying no to this message (outside the 24-hour window, a number that never joined the sandbox).
-    # A rate limit or a timeout is a 4xx too, but it passes.
-    return isinstance(error, TwilioRestException) and 400 <= error.status < 500 and error.status not in (408, 429)
+    # Not a rate limit or a timeout, which pass, nor a 401 or 403, which mean our own login is wrong or was changed.
+    return (
+        isinstance(error, TwilioRestException)
+        and 400 <= error.status < 500
+        and error.status not in (401, 403, 408, 429)
+    )
 
 
-def send_text(conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, family_id: str | None) -> Result:
-    """Sends `text` in as many messages as it needs. If Twilio won't take one, it is audited and sending stops."""
+def send_text(
+    conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, family_id: str | None, reply: bool = False
+) -> Result:
+    """Sends `text` in as many messages as it needs. If Twilio won't take one, it is audited and sending stops.
+
+    A reply is never sent again; an outbox row is, after a failure that may pass.
+    """
     for piece in chunks(text):
         try:
             sender(to, piece)
@@ -227,7 +236,11 @@ def send_text(conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, f
                 family_id=family_id,
                 actor=CHANNEL,
                 event="whatsapp.send_failed",
-                data={"error": type(error).__name__, "code": getattr(error, "code", None), "will_retry": not refused},
+                data={
+                    "error": type(error).__name__,
+                    "code": getattr(error, "code", None),
+                    "will_retry": not (refused or reply),
+                },
             )
             return Result.REFUSED if refused else Result.FAILED
     return Result.SENT
@@ -298,6 +311,6 @@ def process_inbound(settings: Settings, *, client, provider: Provider, sender: S
         family_id = None if member is None else member.family_id
         if reply is not None:
             note = f"\n\n{_skipped_note(skipped)}" if skipped else ""
-            send_text(conn, sender, message.address, reply + note, family_id=family_id)
+            send_text(conn, sender, message.address, reply + note, family_id=family_id, reply=True)
         if family_id is not None:
             deliver_pending(conn, sender, family_id)

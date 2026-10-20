@@ -582,6 +582,32 @@ def test_a_temporary_failure_backs_the_member_off_for_five_minutes_then_tries_ag
     assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 0
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_wrong_twilio_credentials_keep_every_waiting_message_instead_of_marking_it_delivered(settings, status):
+    # Catches: a rotated or wrong auth token being read as "Twilio refuses this message", dropping the whole outbox.
+    door = Door(settings)
+    add_outbox(settings, "First note.", "Second note.")
+    door.sender.fail = refusal(status, code=20003)
+
+    whatsapp.deliver_for_family(settings, door.sender, FAM)
+
+    assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 2
+    assert len(door.sender.attempts) == 1  # backed off, not tried again on every row
+    (failure,) = door.events("whatsapp.send_failed")
+    assert failure["data"]["will_retry"] is True
+
+
+def test_a_reply_that_fails_to_send_is_not_audited_as_going_to_be_retried(settings):
+    # Catches: the log promising a retry for a reply, which Karo never sends again.
+    door = Door(settings, [text_response("Hello.")])
+    door.sender.fail = refusal(503)
+
+    door.receive(inbound())
+
+    (failure,) = door.events("whatsapp.send_failed")
+    assert failure["data"]["will_retry"] is False
+
+
 def test_one_members_temporary_failure_does_not_hold_back_another_member(settings):
     # Catches: Amina's phone being unreachable stopping Baraka's messages from going out.
     door = Door(settings)
