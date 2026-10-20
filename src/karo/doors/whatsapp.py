@@ -27,6 +27,7 @@ from karo.config import Settings
 from karo.doors import base
 from karo.doors.base import InboundMessage
 from karo.providers.base import Provider
+from karo.throttle import RejectionThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +62,7 @@ class _DoorState:
         # second does not wait: it would hold a worker thread behind a slow Twilio call. The next tick catches up.
         self.delivery = threading.Lock()
         self.backed_off_until: dict[str, datetime] = {}
-        self.rejections = threading.Lock()
-        self.last_rejection_row: datetime | None = None
-        self.unrecorded_rejections = 0
+        self.rejections = RejectionThrottle(REJECTION_WINDOW)
 
 
 # Kept with the sender it belongs to, so two apps (or two tests) never share a back-off. Dropped with the sender.
@@ -102,22 +101,17 @@ def record_rejection(conn: sqlite3.Connection, sender: Sender) -> None:
     The posts held back since the last row are counted in the next one. No content in it: not the body, the number
     or the id. A forged message is untrusted text, and the log is shown on a page.
     """
-    state = _state(sender)
     now = clock.now(conn)
-    with state.rejections:
-        state.unrecorded_rejections += 1
-        if state.last_rejection_row is not None and now - state.last_rejection_row < REJECTION_WINDOW:
-            return
+    count = _state(sender).rejections.take(now)
+    if count is not None:
         audit.record(
             conn,
             at=now,
             family_id=None,
             actor="twilio",
             event="inbound.rejected",
-            data={"channel": CHANNEL, "count": state.unrecorded_rejections},
+            data={"channel": CHANNEL, "count": count},
         )
-        state.last_rejection_row = now
-        state.unrecorded_rejections = 0
 
 
 # --- files sent with a message -------------------------------------------------------------------

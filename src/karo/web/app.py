@@ -674,6 +674,7 @@ def demo_reset(request: Request):
     ensure_database(settings)
     # The chat rate limit lives in memory, so deleting the file did not reset it.
     base.RECENT_TURNS.clear()
+    notices.forget_rejections()
     request.session["flash"] = "The demo is back at its starting point."
     return RedirectResponse("/demo", status_code=303)
 

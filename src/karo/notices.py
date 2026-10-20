@@ -19,15 +19,35 @@ and the provider's retry would be turned away as a duplicate with the payment ne
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from karo import audit, db, ledger, outbox, store
 from karo.clock import iso
 from karo.money import Money
 from karo.providers.base import CollectionStatus, Notice, Provider
+from karo.throttle import RejectionThrottle
 
 ALL_IN = "All shares are in. Ask me to pay the fees when you're ready."
+
+# A flood of forged posts writes one audit row a minute, carrying how many there were.
+REJECTION_WINDOW = timedelta(seconds=60)
+# One window per database file and provider, so two apps (or two tests) in one process never share a window.
+_REJECTIONS: dict[tuple[str, str], RejectionThrottle] = {}
+_REJECTIONS_LOCK = threading.Lock()
+
+
+def forget_rejections() -> None:
+    """Closes every window. A demo reset deletes the database, so the old windows no longer describe it."""
+    with _REJECTIONS_LOCK:
+        _REJECTIONS.clear()
+
+
+def _throttle(conn: sqlite3.Connection, provider_name: str) -> RejectionThrottle:
+    database = conn.execute("PRAGMA database_list").fetchone()[2]
+    with _REJECTIONS_LOCK:
+        return _REJECTIONS.setdefault((database, provider_name), RejectionThrottle(REJECTION_WINDOW))
 
 
 def handle_notice(
@@ -36,10 +56,18 @@ def handle_notice(
     """One of "credited", "rejected", "duplicate", "unknown" or "unverified"."""
     notice = provider.parse_notice(headers, body)
     if notice is None:
-        # The body is left out: it came from someone who couldn't prove who they are.
-        audit.record(
-            conn, at=now, family_id=None, actor="system", event="notice.rejected", data={"provider": provider.name}
-        )
+        count = _throttle(conn, provider.name).take(now)
+        if count is not None:
+            # The body is left out: it came from someone who couldn't prove who they are.
+            audit.record(
+                conn,
+                at=now,
+                family_id=None,
+                actor="system",
+                event="notice.rejected",
+                # No count for a single post, which keeps the row as it always was.
+                data={"provider": provider.name} | ({"count": count} if count > 1 else {}),
+            )
         return "rejected"
 
     known = conn.execute(

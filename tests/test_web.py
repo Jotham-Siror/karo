@@ -980,6 +980,18 @@ def test_reset_clears_the_chat_rate_limit(make_site):
     assert site.chat("hi", message_id="client-id-9998").json() == {"text": "ok"}
 
 
+def test_reset_clears_the_forged_notice_window(site):
+    # Catches: a reset that leaves the one-row-a-minute window open, so the first forged post after it is never logged.
+    site.login()
+    site.client.post("/webhooks/standin", content=b"{}")
+    site.client.post("/demo/reset")
+    site.client.post("/webhooks/standin", content=b"{}")
+    with site.connect() as conn:
+        assert [e["data"] for e in audit.events(conn, None) if e["event"] == "notice.rejected"] == [
+            {"provider": "standin"}
+        ]
+
+
 NAIROBI = ZoneInfo("Africa/Nairobi")
 
 

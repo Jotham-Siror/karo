@@ -322,6 +322,30 @@ def test_a_forged_notice_is_rejected_and_nothing_is_credited(conn, provider, how
     assert collection["tx_ref"] not in json.dumps(rejected)
 
 
+def test_a_flood_of_forged_notices_writes_one_audit_row_a_minute_and_counts_the_rest(conn, provider):
+    # Catches: anyone on the internet filling the audit log with notice.rejected rows, pushing real events out of /log.
+    body = body_for("karo-col_x")
+    for _ in range(50):
+        assert handle(conn, provider, {}, body) == "rejected"
+    assert [e["data"] for e in events(conn, "notice.rejected", None)] == [{"provider": "standin"}]
+
+    later = NOW + notices.REJECTION_WINDOW
+    handle(conn, provider, {}, body, now=later)
+    rows = events(conn, "notice.rejected", None)
+    assert [e["data"].get("count") for e in reversed(rows)] == [None, 50]
+    assert body.decode() not in json.dumps(rows)
+
+
+def test_a_forged_notice_under_one_provider_does_not_hold_back_the_row_for_another(conn, provider):
+    # Catches: one provider's flood hiding the first forged post to a different provider behind its window.
+    other = Wrapped(provider)
+    other.name = "otherpay"
+    other.parse_notice = lambda headers, body: None
+    handle(conn, provider, {}, b"{}")
+    handle(conn, other, {}, b"{}")
+    assert sorted(e["data"]["provider"] for e in events(conn, "notice.rejected", None)) == ["otherpay", "standin"]
+
+
 def test_the_same_notice_twice_credits_once(conn, provider):
     # Catches: a provider retry (or a replayed notice) paying the same share twice.
     share_id = add_share(conn, new_fee(conn), "m_baraka", "3000.00")
