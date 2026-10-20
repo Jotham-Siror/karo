@@ -7,6 +7,9 @@ How a reply is read, because it decides whether money is refunded or credited:
 - Flutterwave reports some of its own failures as an HTTP 400 too (see proof/smoke/), so a 400 on a payout is not a
   verdict by itself. Only a message on `_PAYOUT_REFUSALS`, a refusal made before any transfer exists, makes a payout
   `failed`. Any other error answer raises `ConnectionError`, which leaves the payout pending for reconcile.
+- A payout with no transfer id (its first answer was lost) is looked up with `GET /transfers?reference=<reference as
+  sent>`, whose `data` is a list of transfers. One match settles it, none stays pending, and two or an unreadable
+  reply raise `ConnectionError`.
 - A request Flutterwave refuses before anything happens (no rate, a bad payment option) raises `ValueError`, the
   error the stand-in raises when it has no price.
 """
@@ -169,7 +172,7 @@ class FlutterwaveProvider:
         # Not "failed" for anything Flutterwave cannot find: a transfer still being created isn't visible yet.
         not_found = PayoutResult(reference, None, "pending", True, "not found")
         if provider_id is None:
-            return not_found
+            return self._transfer_by_reference(reference, not_found)
         code, body = self._send("GET", f"/transfers/{provider_id}")
         data = _data(code, body)
         if data is not None:
@@ -177,6 +180,22 @@ class FlutterwaveProvider:
         if code == 404 or _not_found(body):
             return not_found
         raise ConnectionError(f"Flutterwave gave no usable status for transfer {provider_id} (HTTP {code}).")
+
+    def _transfer_by_reference(self, reference: str, not_found: PayoutResult) -> PayoutResult:
+        """A payout whose first answer was lost has no transfer id: ask under the reference it was sent as."""
+        sent_as = reference + TEST_MODE_SUCCESS
+        code, body = self._send("GET", "/transfers", params={"reference": sent_as})
+        found = body.get("data")
+        if code < 400 and body.get("status") == "success" and isinstance(found, list):
+            # The filter is Flutterwave's, but the id taken from this answer settles money, so match it again here.
+            ours = [item for item in found if isinstance(item, dict) and item.get("reference") == sent_as]
+            if len(ours) == 1:
+                return _transfer_result(reference, ours[0])
+            if not ours:
+                return not_found
+        elif code == 404 or _not_found(body):
+            return not_found
+        raise ConnectionError(f"Flutterwave gave no usable transfer list for {reference} (HTTP {code}).")
 
     def parse_notice(self, headers: Mapping[str, str], body: bytes) -> Notice | None:
         sent = {name.lower(): value for name, value in headers.items()}.get(WEBHOOK_HEADER)

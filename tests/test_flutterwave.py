@@ -459,6 +459,15 @@ def test_a_duplicate_reference_is_pending_never_failed(provider, flw):
     assert (result.status, result.provider_id) == ("pending", None)
 
 
+def test_a_duplicate_reference_is_closed_by_the_next_status_check(provider, flw):
+    # Bug caught: the lost-answer re-send never learns its transfer id, so reconcile re-posts the payout every tick.
+    flw.post("/transfers").respond(400, json=refusal("Transfer with this reference already exists"))
+    flw.get("/transfers").respond(200, json=reply("Transfers fetched", [transfer("SUCCESSFUL")["data"]]))
+    first = pay_out(provider)
+    later = provider.payout_status(reference="karo-prop_1", provider_id=first.provider_id)
+    assert (later.status, later.provider_id) == ("succeeded", "190626")
+
+
 @pytest.mark.parametrize("code", [401, 403, 429, 500, 503])
 def test_a_payout_reply_that_is_not_a_verdict_raises_so_the_row_stays_pending(provider, flw, code):
     # Bug caught: an outage or a bad key read as "failed", which refunds a payment that may be on its way.
@@ -522,11 +531,50 @@ def test_payout_status_raises_on_a_network_failure_reported_as_a_400(provider, f
         provider.payout_status(reference="karo-prop_1", provider_id="190626")
 
 
-def test_payout_status_with_no_transfer_id_is_pending_without_a_request(provider, flw):
-    # Bug caught: asking Flutterwave for transfers/None, or reading "we never got an id" as a failure.
+def test_payout_status_with_no_transfer_id_asks_for_the_transfer_by_the_reference_it_was_sent_under(provider, flw):
+    # Bug caught: a duplicate-reference reply left the payout with no id for ever, so the executor re-posted every tick.
+    route = flw.get("/transfers").respond(200, json=reply("Transfers fetched", [transfer("SUCCESSFUL")["data"]]))
+    result = provider.payout_status(reference="karo-prop_1", provider_id=None)
+    assert dict(sent(route).url.params) == {"reference": "karo-prop_1_PMCK"}
+    assert (result.reference, result.status, result.provider_id) == ("karo-prop_1", "succeeded", "190626")
+
+
+def test_a_transfer_list_with_nothing_for_the_reference_is_pending_never_failed(provider, flw):
+    # Bug caught: "Flutterwave has no such transfer yet" read as failed, refunding a payout that is still being created.
+    flw.get("/transfers").respond(200, json=reply("Transfers fetched", []))
     result = provider.payout_status(reference="karo-prop_1", provider_id=None)
     assert (result.status, result.provider_id, result.message) == ("pending", None, "not found")
-    assert not flw.calls
+
+
+def test_a_transfer_list_for_other_references_is_not_taken_as_ours(provider, flw):
+    # Bug caught: a lookup that ignored the reference filter settled this payout with someone else's transfer.
+    other = transfer("SUCCESSFUL", id=7, reference="karo-prop_9_PMCK")["data"]
+    flw.get("/transfers").respond(200, json=reply("Transfers fetched", [other]))
+    result = provider.payout_status(reference="karo-prop_1", provider_id=None)
+    assert (result.status, result.provider_id) == ("pending", None)
+
+
+def test_a_transfer_lookup_by_reference_that_is_not_a_list_raises(provider, flw):
+    # Bug caught: an unreadable lookup reply read as "no transfer", so the executor re-posts the payout.
+    flw.get("/transfers").respond(200, json=reply("Transfers fetched", {"id": 1}))
+    with pytest.raises(ConnectionError):
+        provider.payout_status(reference="karo-prop_1", provider_id=None)
+
+
+def test_two_transfers_for_one_reference_raise_rather_than_guess(provider, flw):
+    # Bug caught: picking one of two transfers under a reference, which could settle the payout on the wrong one.
+    both = [transfer("FAILED")["data"], transfer("NEW")["data"]]
+    flw.get("/transfers").respond(200, json=reply("Transfers fetched", both))
+    with pytest.raises(ConnectionError):
+        provider.payout_status(reference="karo-prop_1", provider_id=None)
+
+
+@pytest.mark.parametrize("code", [401, 429, 500])
+def test_a_transfer_lookup_that_is_not_a_verdict_raises(provider, flw, code):
+    # Bug caught: an outage during the lookup read as "not found", so the executor re-posts the payout.
+    flw.get("/transfers").respond(code, json=refusal("Something went wrong"))
+    with pytest.raises(ConnectionError):
+        provider.payout_status(reference="karo-prop_1", provider_id=None)
 
 
 def test_payout_status_raises_when_flutterwave_cannot_be_reached(provider, flw):
