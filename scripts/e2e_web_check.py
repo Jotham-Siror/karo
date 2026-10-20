@@ -189,14 +189,10 @@ def allowance(ok) -> None:
     ok(done.status_code == 200, "the right PIN is accepted")
     show("right PIN ->", text_of(done.text), 300)
     ok(bool(data_since(start, "allowance.set")), "the allowance was set (allowance.set in /log)")
-    # A new allowance is paid for the current month at the scheduler's next tick. Let that settle here, so a payout
-    # made by the tick is not mistaken for one the prompt trick caused in the next scene.
-    print(f"  waiting up to {TICK_WAIT}s for the scheduler's first allowance run")
-    deadline = time.time() + TICK_WAIT
-    while time.time() < deadline and "payout.sent" not in events_since(start):
-        time.sleep(5)
-    print("  info: the scheduler paid this month's allowance (payout.sent):", "payout.sent" in events_since(start))
-    inbox("amina")
+    # Its first run is the 1st after today, so nothing is paid now.
+    told = inbox("amina")
+    ok(not [e for e in events_since(start) if e.startswith("payout.")], "no allowance payout was started yet")
+    ok(not any(t.startswith("Paid ") for t in told), "no allowance receipt yet")
 
 def trick_and_freeze(ok) -> None:
     start = mark()
