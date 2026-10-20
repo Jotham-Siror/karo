@@ -100,8 +100,12 @@ def _status_note(ctx: ToolContext) -> list[dict]:
     """Where things stand, fresh, for every message after the first.
 
     It changes outside the chat (the PIN page, payments coming in), and the prompt telling the model to call
-    get_status first was not enough: it repeated an old "awaiting_pin" result. A first message has no old result."""
-    return [{"type": "text", "text": f"{STATUS_NOTE} {json.dumps(run_tool('get_status', {}, ctx))}"}]
+    get_status first was not enough: it repeated an old "awaiting_pin" result. A first message has no old result.
+
+    The tags mark it as data. Names in it are copied from invoices, so "<" is escaped inside the JSON: the text
+    survives, and cannot spell a closing tag."""
+    status = json.dumps(run_tool("get_status", {}, ctx)).replace("<", "\\u003c")
+    return [{"type": "text", "text": f"{STATUS_NOTE}\n<karo_status>{status}</karo_status>"}]
 
 
 def _text_of(blocks: list[dict]) -> str:

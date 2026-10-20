@@ -26,6 +26,10 @@ _MAX_MINOR = 10**14
 # A longer name would push the details off the PIN page.
 _MAX_NAME = 60
 
+# Invoice payee names are copied into the status note the AI reads on every turn, and an invoice's author chooses them
+# (an invoice is accepted on its bank details alone), so long text there is an injection route, not a name.
+_MAX_PAYEE_NAME = 80
+
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -187,8 +191,14 @@ def _get_status(ctx: ToolContext, _args: dict) -> dict:
 
 
 def _record_invoice(ctx: ToolContext, args: dict) -> dict:
+    name = args["payee_name"].strip()
+    if len(name) > _MAX_PAYEE_NAME:
+        raise _BadInput(
+            f"The payee name is longer than {_MAX_PAYEE_NAME} characters, which no real payee's name is. "
+            "Check the invoice and ask the main payer."
+        )
     details = {key: value.strip() for key, value in args["payee_details"].items() if value.strip()}
-    payee = Payee.of(args["payee_name"].strip(), **details)
+    payee = Payee.of(name, **details)
     amount = _money(args["amount"], args["currency"])
     account_currency = details.get("currency", amount.currency).upper()
     if account_currency != amount.currency:
