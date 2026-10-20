@@ -214,6 +214,16 @@ def has_live_link(conn: sqlite3.Connection, family_id: str, proposal_id: str, no
     return any(now < clock.parse(row["expires_at"]) for row in rows)
 
 
+def any_link_live(conn: sqlite3.Connection, family_id: str, now: datetime) -> bool:
+    """True if any confirm link for one of this family's proposals can still be used."""
+    rows = conn.execute(
+        "SELECT l.expires_at FROM confirm_links l JOIN proposals p ON p.id = l.proposal_id "
+        "WHERE p.family_id = ? AND l.used_at IS NULL",
+        (family_id,),
+    )
+    return any(now < clock.parse(row["expires_at"]) for row in rows)
+
+
 # --- confirm -----------------------------------------------------------------------------------
 
 

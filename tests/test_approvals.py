@@ -355,6 +355,18 @@ def test_link_expires_after_its_ttl(conn):
     assert approvals.open_link(conn, token, NOW + timedelta(minutes=30)) is None
 
 
+def test_any_link_live_sees_only_this_familys_unused_unexpired_links(conn):
+    # Catches: counting a used, expired or other family's link, so bare digits are refused for no reason.
+    assert not approvals.any_link_live(conn, FAM, NOW)
+    add_proposal(conn)
+    token = new_token(conn, ttl=timedelta(minutes=30))
+    assert approvals.any_link_live(conn, FAM, NOW)
+    assert not approvals.any_link_live(conn, OTHER, NOW)
+    assert not approvals.any_link_live(conn, FAM, NOW + timedelta(minutes=30))
+    assert confirm(conn, token).status == "confirmed"
+    assert not approvals.any_link_live(conn, FAM, NOW)
+
+
 def test_link_is_single_use(conn):
     # A link that survives a successful confirm could be replayed.
     add_proposal(conn)

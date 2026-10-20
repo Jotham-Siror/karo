@@ -11,10 +11,12 @@ import anthropic
 import httpx
 import pytest
 
-from karo import audit, db, seed
+from karo import approvals, audit, db, rules, seed, store
 from karo.agent.claude import FakeClaude, text_response
 from karo.doors import base
 from karo.doors.base import InboundMessage, handle
+from karo.domain import Kind, Payee, Proposal
+from karo.money import Money
 from karo.providers.standin import StandInProvider
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
@@ -58,6 +60,28 @@ def send(conn, provider, claude, msg, *, now=NOW):
 
 def events(conn, name):
     return [e for e in audit.events(conn, FAM) if e["event"] == name]
+
+
+def open_a_confirm_link(conn):
+    """Leaves an unused confirm link for Amina live, as it is while she has a payment waiting for her PIN."""
+    proposal = Proposal(
+        id="prop_waiting",
+        family_id=FAM,
+        kind=Kind.PAY_FEE,
+        requested_by="m_amina",
+        amount=Money.parse("6000", "GBP"),
+        payee=Payee.of("Westbridge University", account="12345678"),
+    )
+    store.insert_proposal(conn, proposal, status="awaiting_pin", decision=rules.Decision(()), now=NOW)
+    approvals.create_link(
+        conn,
+        family_id=FAM,
+        proposal_id="prop_waiting",
+        member_id="m_amina",
+        now=NOW,
+        base_url=BASE_URL,
+        ttl=timedelta(minutes=30),
+    )
 
 
 def frozen(conn) -> bool:
@@ -125,10 +149,11 @@ def test_a_freeze_word_inside_a_sentence_does_not_freeze(conn, provider, text):
 @pytest.mark.parametrize("typed", ["4821", " 123456 ", "0000"])
 def test_a_pin_typed_in_chat_is_refused_and_never_kept(conn, provider, typed):
     # Catches: a PIN typed in chat reaching the AI, the conversation history or the log.
+    open_a_confirm_link(conn)
     claude = FakeClaude([])
     seeded = {e["seq"] for e in audit.events(conn, None, limit=1000)}
     reply = send(conn, provider, claude, message(typed))
-    assert reply == "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page."
+    assert reply == base.PIN_IN_CHAT + base.PIN_IN_CHAT_DIGITS_ONLY
     assert claude.requests == []
     assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
     logged = events(conn, "pin.typed_in_chat")
@@ -137,6 +162,31 @@ def test_a_pin_typed_in_chat_is_refused_and_never_kept(conn, provider, typed):
     # seed's opening balance (200000.00) already holds a run of zeros.
     after = [e["data"] for e in audit.events(conn, None, limit=1000) if e["seq"] not in seeded]
     assert after and typed.strip() not in json.dumps(after)
+
+
+@pytest.mark.parametrize("amount", ["50000", "2026"])
+def test_a_bare_number_reaches_the_agent_when_no_confirm_link_is_live(conn, provider, amount):
+    # Catches: the answer to "how much?" being refused as a PIN, so the model never gets the amount.
+    claude = FakeClaude([text_response("Okay.")])
+    assert send(conn, provider, claude, message(amount)) == "Okay."
+    assert events(conn, "pin.typed_in_chat") == []
+
+
+def test_a_bare_number_reaches_the_agent_once_the_confirm_link_has_expired(conn, provider):
+    # Catches: an expired link keeping the guard on forever, so the first amount typed after it is refused too.
+    open_a_confirm_link(conn)
+    claude = FakeClaude([text_response("Okay.")])
+    later = NOW + timedelta(minutes=31)
+    assert send(conn, provider, claude, message("50000"), now=later) == "Okay."
+
+
+def test_a_pin_inside_a_sentence_is_refused_even_with_no_confirm_link(conn, provider):
+    # Catches: relaxing the bare-digits guard also letting "my PIN is 4821" through to the AI and the history.
+    claude = FakeClaude([])
+    reply = send(conn, provider, claude, message("my PIN is 4821"))
+    assert reply == base.PIN_IN_CHAT
+    assert claude.requests == []
+    assert len(events(conn, "pin.typed_in_chat")) == 1
 
 
 @pytest.mark.parametrize("text", ["123", "1234567", "pay 4821", "48 21", "٤٨٢١"])

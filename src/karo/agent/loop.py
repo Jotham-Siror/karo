@@ -76,9 +76,11 @@ def _run_turn(
         # Checked before the content is read: a refusal can cut a tool call off halfway, and that must never run.
         if response.stop_reason == "refusal":
             reply = {"role": "assistant", "content": [{"type": "text", "text": REFUSAL_REPLY}]}
-            _append(conn, conversation_id, messages, reply)
             # The refused message would be re-sent, and refused again, on every later turn. The record of it stays.
-            conn.execute("UPDATE conversations SET active = 0 WHERE id = ?", (conversation_id,))
+            # One transaction, so the reply is never saved to a conversation that stays open.
+            with db.transaction(conn):
+                _append(conn, conversation_id, messages, reply)
+                conn.execute("UPDATE conversations SET active = 0 WHERE id = ?", (conversation_id,))
             return REFUSAL_REPLY
         # by_alias, because a fallback block's `from` field is `from_` in Python; exclude_none, because the API
         # rejects the null fields the SDK adds.

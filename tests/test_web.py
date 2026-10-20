@@ -181,6 +181,15 @@ def test_without_an_injected_client_the_api_key_is_required(settings):
         create_app(settings, provider=StandInProvider.from_config(SECRET, BASE_URL))
 
 
+@pytest.mark.parametrize("missing", ["session_secret", "demo_password"])
+def test_the_app_will_not_start_without_the_session_secret_or_the_demo_password(settings, missing):
+    # Catches: a hand-built Settings signing sessions with the text "None", so anyone can forge a login cookie.
+    with pytest.raises(RuntimeError, match="KARO_SESSION_SECRET|KARO_DEMO_PASSWORD"):
+        create_app(replace(settings, **{missing: ""}), client=FakeClaude([]))
+    with pytest.raises(RuntimeError, match="KARO_SESSION_SECRET|KARO_DEMO_PASSWORD"):
+        create_app(replace(settings, **{missing: None}), client=FakeClaude([]))
+
+
 def test_an_unknown_provider_is_refused_at_start(settings):
     # Catches: a misspelt KARO_PROVIDER quietly running on the stand-in, which pays nothing.
     with pytest.raises(RuntimeError, match="flutterwav"):

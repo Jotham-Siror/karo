@@ -731,6 +731,8 @@ def create_app(
     whatsapp_sender: whatsapp.Sender | None = None,
     start_scheduler: bool = False,
 ) -> FastAPI:
+    # load_settings checks these too, but a hand-built Settings would otherwise sign sessions with the text "None".
+    settings.require("session_secret", "demo_password")
     if client is None:
         settings.require("anthropic_api_key")
         client = ClaudeClient(settings.anthropic_api_key)

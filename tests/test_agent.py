@@ -3,6 +3,7 @@
 import json
 import re
 import shutil
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1541,6 +1542,17 @@ def test_after_a_refusal_the_next_turn_starts_fresh_without_the_refused_message(
     ended = conn.execute("SELECT active, messages_json FROM conversations ORDER BY rowid").fetchall()
     assert [r["active"] for r in ended] == [0, 1]
     assert "a refused request" in ended[0]["messages_json"]  # the record of the refused turn is kept
+
+
+def test_a_refusal_close_that_fails_leaves_no_half_closed_conversation(conn, provider):
+    # Bug caught: the refusal reply saved but the conversation left open, so the refused message is re-sent every turn.
+    conn.execute(
+        "CREATE TRIGGER no_close BEFORE UPDATE OF active ON conversations BEGIN SELECT RAISE(ABORT, 'disk full'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="disk full"):
+        say(conn, provider, FakeClaude([refusal_response()]), "something odd")
+    (row,) = conn.execute("SELECT active, messages_json FROM conversations").fetchall()
+    assert [m["role"] for m in json.loads(row["messages_json"])] == ["user"]
 
 
 def test_a_refused_turn_never_runs_the_tool_it_started_to_call(conn, provider):

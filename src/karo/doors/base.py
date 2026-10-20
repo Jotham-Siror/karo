@@ -9,12 +9,13 @@ import base64
 import logging
 import re
 import sqlite3
+import string
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from karo import audit, proposals, store
+from karo import approvals, audit, proposals, store
 from karo.agent import loop
 from karo.agent.claude import Claude
 from karo.clock import iso
@@ -23,9 +24,12 @@ from karo.providers.base import Provider
 logger = logging.getLogger(__name__)
 
 FREEZE_WORDS = {"stop", "freeze", "simamisha"}
+# "STOP!" and "freeze." freeze, but "freeze?" is a question and goes to the agent.
+_FREEZE_TRIM = string.punctuation.replace("?", "") + string.whitespace
 
 UNKNOWN_SENDER = "Sorry, this number isn't linked to a Karo family."
 PIN_IN_CHAT = "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page."
+PIN_IN_CHAT_DIGITS_ONLY = " If you meant an amount, type it with the currency, like KES 50,000."
 AGENT_ERROR = "Sorry, something went wrong on my side. Please try again in a minute."
 NOTHING_TO_READ = "Please type a message or send a photo or PDF."
 CANNOT_READ_FILE = "Sorry, I can only read photos (JPEG, PNG, GIF or WebP) and PDFs."
@@ -86,7 +90,11 @@ def handle(
         return UNKNOWN_SENDER
 
     text = msg.text.strip()
-    if _looks_like_a_typed_pin(text):
+    digits_only = PIN_SHAPE.fullmatch(text) is not None
+    # Bare digits are an amount as often as a PIN ("how much?" "50000"), so they are refused only while a confirm
+    # link is live, which is the one time a PIN is being asked for.
+    if _PIN_IN_TEXT.search(text) or (digits_only and approvals.any_link_live(conn, member.family_id, now)):
+        # The digits are never compared with the real PIN: that would let anyone guess it in chat, around the lockout.
         # Not stored, not shown to the agent, and left out of the log: the audit row records only that it happened.
         audit.record(
             conn,
@@ -96,8 +104,8 @@ def handle(
             event="pin.typed_in_chat",
             data={"channel": msg.channel},
         )
-        return PIN_IN_CHAT
-    if text.lower() in FREEZE_WORDS:
+        return PIN_IN_CHAT + PIN_IN_CHAT_DIGITS_ONLY if digits_only else PIN_IN_CHAT
+    if text.strip(_FREEZE_TRIM).lower() in FREEZE_WORDS:
         return proposals.freeze(conn, family_id=member.family_id, actor=member, now=now)
 
     problem = _attachment_problem(msg.attachments)
@@ -124,11 +132,6 @@ def handle(
             data={"error": type(error).__name__},
         )
         return AGENT_ERROR
-
-
-def _looks_like_a_typed_pin(text: str) -> bool:
-    # The digits are never compared with the real PIN: that would let anyone guess it in chat, around the lockout.
-    return bool(PIN_SHAPE.fullmatch(text) or _PIN_IN_TEXT.search(text))
 
 
 def _take_a_turn(member_id: str, now: datetime) -> bool:
