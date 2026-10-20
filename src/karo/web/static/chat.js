@@ -7,8 +7,14 @@
   }
 
   // Deep Chat shows a bare URL as plain text. A markdown link makes the PIN page one tap on a phone.
+  // Only Karo's own PIN and pay pages get one: any other URL may come from an invoice's text, so it stays plain.
+  // The links are built from PUBLIC_BASE_URL, and this page is served from that same address.
   function withLinks(text) {
-    return text.replace(/https?:\/\/[^\s)]+/g, function (url) { return "[Open the link](" + url + ")"; });
+    var own = window.location.origin;
+    return text.replace(/https?:\/\/[^\s)]+/g, function (url) {
+      var ours = url.indexOf(own + "/confirm/") === 0 || url.indexOf(own + "/standin/pay/") === 0;
+      return ours ? "[Open the link](" + url + ")" : url;
+    });
   }
 
   function startInbox() {

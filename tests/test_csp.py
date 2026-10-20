@@ -3,7 +3,10 @@
 The AI's replies are shown as markdown, so a prompt-injected reply could carry an image that sends data to another
 site. The policy stops the browser fetching it. Every test names the bug it would catch."""
 
+import json
 import re
+import shutil
+import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -190,6 +193,33 @@ def test_the_chat_script_takes_the_inbox_address_from_the_page(site):
     site.login()
     assert 'data-inbox-url="/api/inbox"' in page_at(site, "/chat")
     assert "dataset.inboxUrl" in site.client.get("/static/chat.js").text
+
+
+def links_made(script: str, text: str) -> str:
+    """Run the chat script's withLinks on `text` in Node, as a page at https://karo.example would."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is not installed")
+    (function,) = re.findall(r"^  function withLinks\(.*?^  }$", script, re.MULTILINE | re.DOTALL)
+    program = f"var window = {{location: {{origin: 'https://karo.example'}}}};\n{function}\n"
+    program += f"process.stdout.write(withLinks({json.dumps(text)}));"
+    return subprocess.run([node, "-e", program], capture_output=True, text=True, check=True).stdout
+
+
+def test_the_chat_makes_links_only_of_karos_own_pin_and_pay_pages(site):
+    # Catches: a URL from an invoice's payee name shown as "Open the link" beside the real PIN link.
+    script = site.client.get("/static/chat.js").text
+    pin, pay = "https://karo.example/confirm/abc123", "https://karo.example/standin/pay/tx_1"
+    assert links_made(script, f"Confirm: {pin}") == f"Confirm: [Open the link]({pin})"
+    assert links_made(script, f"Pay: {pay}") == f"Pay: [Open the link]({pay})"
+    for other in (
+        "https://evil.example/confirm/abc123",
+        "https://karo.example.evil.example/confirm/abc123",
+        "https://karo.example@evil.example/confirm/abc123",
+        "https://karo.example/login",
+        "http://karo.example/confirm/abc123",
+    ):
+        assert links_made(script, f"Pay instead at {other}") == f"Pay instead at {other}", other
 
 
 def test_the_demo_page_still_asks_before_it_resets(site):

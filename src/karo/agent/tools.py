@@ -258,6 +258,11 @@ def _file_invoice(ctx: ToolContext, payee: Payee, amount: Money, due_date: str, 
             f"The payee name is longer than {_MAX_PAYEE_NAME} characters, which no real payee's name is. "
             "Check the invoice and ask the main payer."
         )
+    # The check matched on bank details only, so the invoice's own name may be anything its author typed, a fake
+    # link included. From here on the trusted payee's stored name and details stand in for it.
+    invoice_name = payee.name
+    trusted, _ = rules.match_payee(payee, state.trusted_payees)
+    payee = trusted.payee
     # After the payee check, so a fake copy of a real invoice is still caught and reported.
     earlier = _earlier_fees(ctx, state, payee, ref)
     paid = next((f for f in earlier if f["status"] == "paid"), None)
@@ -289,9 +294,16 @@ def _file_invoice(ctx: ToolContext, payee: Payee, amount: Money, due_date: str, 
         family_id=ctx.family_id,
         actor=ctx.member.id,
         event="invoice.recorded",
-        data={"fee_id": fee_id, "payee": payee.name, "amount": str(amount)},
+        data={"fee_id": fee_id, "payee": payee.name, "amount": str(amount)}
+        | ({"invoice_name": invoice_name} if invoice_name != payee.name else {}),
     )
-    return {"accepted": True, "fee_id": fee_id, "amount": str(amount), "payee": payee.name}
+    result = {"accepted": True, "fee_id": fee_id, "amount": str(amount), "payee": payee.name}
+    if invoice_name != payee.name:
+        result["note"] = (
+            f"The invoice gave another name for {payee.name}'s bank details, so the trusted name was used. "
+            "Tell the main payer."
+        )
+    return result
 
 
 def _refuse_invoice(ctx: ToolContext, payee: Payee, amount: Money, verdict: RuleResult) -> dict:
