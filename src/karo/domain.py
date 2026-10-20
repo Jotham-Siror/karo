@@ -25,6 +25,7 @@ class Kind(StrEnum):
     ALLOWANCE_SET = "allowance_set"  # create or change the allowance standing order
     ALLOWANCE_RUN = "allowance_run"  # one scheduled allowance payment
     CONVERT = "convert"  # move funds between the family's currencies
+    SEND = "send"  # send money to a saved recipient abroad
     ADD_PAYEE = "add_payee"
     UNFREEZE = "unfreeze"
 

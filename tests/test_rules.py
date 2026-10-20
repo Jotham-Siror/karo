@@ -28,6 +28,7 @@ from conftest import (
     quote,
 )
 from karo.domain import Kind, Payee, Proposal, TrustedPayee
+from karo.money import Money
 from karo.rules import Outcome, check, check_payee, trusted_payee
 
 
@@ -383,3 +384,106 @@ def test_every_failing_rule_is_reported(state):
     stranger = Payee.of("Nobody Ltd", country="GB", currency="GBP", sort_code="00-00-01", account_number="00000001")
     p = fee_proposal(payee=stranger, quote=None)
     assert {"trusted_payee", "quote"} <= blocked_by(check(p, state, propose()))
+
+
+# --- Sending to a saved recipient abroad ------------------------------------------------------
+
+FRIEND = Payee.of("Paul Mbarga", country="CM", currency="XAF", method="mtn_cm", phone="+237671234567")
+
+
+def xaf(amount: str):
+    return Money.parse(amount, "XAF")
+
+
+def send_proposal(**changes) -> Proposal:
+    base = Proposal(
+        id="p-send",
+        family_id=FAM,
+        kind=Kind.SEND,
+        requested_by=MUM.id,
+        amount=xaf("5000"),
+        payee=FRIEND,
+        quote=quote(kes("1152.08"), xaf("5000")),
+    )
+    return replace(base, **changes)
+
+
+def _with_friend(state, trusted_ago=timedelta(days=30)):
+    paul = TrustedPayee("tp-paul", FAM, FRIEND, NOW - trusted_ago)
+    return replace(state, trusted_payees=state.trusted_payees + (paul,))
+
+
+def test_a_send_to_a_saved_recipient_passes_at_proposal_and_at_execution(state):
+    # Bug caught: the new kind missing from a rule list, so a normal send is blocked or skips a check.
+    p = send_proposal()
+    assert check(p, _with_friend(state), propose()).allowed
+    assert check(p, _with_friend(state), execute(p)).allowed
+
+
+def test_only_the_main_payer_can_propose_a_send(state):
+    # Bug caught: a relative's chat starting a transfer abroad.
+    p = send_proposal(requested_by=UNCLE.id)
+    assert "role" in blocked_by(check(p, _with_friend(state), propose(UNCLE)))
+
+
+def test_a_send_is_stopped_by_a_freeze(state):
+    # Bug caught: money still leaving to a friend after the family froze Karo.
+    assert "freeze" in blocked_by(check(send_proposal(), replace(_with_friend(state), frozen=True), propose()))
+
+
+def test_a_send_over_the_payment_cap_is_blocked(state):
+    # Bug caught: the per-payment limit measured in XAF, or skipped for the new kind.
+    p = send_proposal(quote=quote(kes("2500000.01"), xaf("5000")))
+    assert "payment_cap" in blocked_by(check(p, _with_friend(state), propose()))
+
+
+def test_a_send_counts_towards_the_daily_cap(state):
+    # Bug caught: sends left out of the day's total, so many small ones get past the daily limit.
+    busy = replace(_with_friend(state), outflow_today=kes("2500000"))
+    p = send_proposal(quote=quote(kes("2500000"), xaf("5000")))
+    assert "daily_cap" in blocked_by(check(p, busy, propose()))
+
+
+def test_a_send_to_someone_not_on_the_trusted_list_is_blocked(state):
+    # Bug caught: a payment to a name or number only mentioned in chat.
+    assert "trusted_payee" in blocked_by(check(send_proposal(), state, propose()))
+
+
+def test_a_send_to_a_changed_phone_number_is_blocked_and_flagged(state):
+    # Bug caught: a send to a different number than the one the PIN confirmed when the recipient was added.
+    swapped = Payee.of("Paul Mbarga", **{**dict(FRIEND.details), "phone": "+237699999999"})
+    decision = check(send_proposal(payee=swapped), _with_friend(state), propose())
+    assert "trusted_payee" in blocked_by(decision)
+    assert decision.warnings
+
+
+def test_a_send_needs_enough_funds_at_execution_but_not_when_proposed(state):
+    # Bug caught: a send running with money the family does not hold.
+    poor = replace(_with_friend(state), balances=(kes("1000"),))
+    p = send_proposal()
+    assert check(p, poor, propose()).allowed
+    assert "funds" in blocked_by(check(p, poor, execute(p)))
+
+
+def test_a_send_without_the_main_payers_pin_is_blocked_at_execution(state):
+    # Bug caught: a send running on a proposal the PIN never confirmed.
+    p = send_proposal()
+    assert "confirmation" in blocked_by(check(p, _with_friend(state), execute(p, confirmed_by=None)))
+
+
+def test_a_send_without_a_quote_is_blocked(state):
+    # Bug caught: a send with no price, so the caps have no home-currency value to check.
+    assert "quote" in blocked_by(check(send_proposal(quote=None), _with_friend(state), propose()))
+
+
+def test_a_large_send_to_a_recipient_added_an_hour_ago_waits(state):
+    # Bug caught: the 24 hour hold on new payees applying to fees only.
+    p = send_proposal(amount=xaf("500000"), quote=quote(kes("115207.37"), xaf("500000")))
+    decision = check(p, _with_friend(state, timedelta(hours=1)), propose())
+    assert decision.verdict is Outcome.WAIT
+    assert decision.until == NOW + timedelta(hours=23)
+
+
+def test_a_small_send_to_a_recipient_added_an_hour_ago_does_not_wait(state):
+    # Bug caught: every send to a new recipient held, even small ones under the family's threshold.
+    assert check(send_proposal(), _with_friend(state, timedelta(hours=1)), propose()).allowed

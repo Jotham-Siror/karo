@@ -61,8 +61,10 @@ class Decision:
 
 
 # Which kinds each rule applies to.
-PIN_KINDS = frozenset({Kind.SPLIT, Kind.PAY_FEE, Kind.ALLOWANCE_SET, Kind.CONVERT, Kind.ADD_PAYEE, Kind.UNFREEZE})
-OUTBOUND = frozenset({Kind.PAY_FEE, Kind.ALLOWANCE_RUN})  # money leaving the family
+PIN_KINDS = frozenset(
+    {Kind.SPLIT, Kind.PAY_FEE, Kind.SEND, Kind.ALLOWANCE_SET, Kind.CONVERT, Kind.ADD_PAYEE, Kind.UNFREEZE}
+)
+OUTBOUND = frozenset({Kind.PAY_FEE, Kind.SEND, Kind.ALLOWANCE_RUN})  # money leaving the family
 TO_PAYEE = OUTBOUND | {Kind.ALLOWANCE_SET}
 NEEDS_QUOTE = OUTBOUND | {Kind.CONVERT}
 VALUED = OUTBOUND | {Kind.ALLOWANCE_SET}

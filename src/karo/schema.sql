@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS payouts (
   debit_minor INTEGER NOT NULL,
   debit_currency TEXT NOT NULL,
   home_value_minor INTEGER NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('pay_fee','allowance_run')),
+  kind TEXT NOT NULL CHECK (kind IN ('pay_fee','allowance_run','send')),
   status TEXT NOT NULL CHECK (status IN ('pending','succeeded','failed')),
   simulated INTEGER NOT NULL,
   created_at TEXT NOT NULL,

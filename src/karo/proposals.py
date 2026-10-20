@@ -135,6 +135,8 @@ def summary(p: Proposal, state: FamilyState) -> str:
     match p.kind:
         case Kind.PAY_FEE:
             return f"Pay {p.amount} to {payee}{cost}"
+        case Kind.SEND:
+            return f"Send {p.amount} to {payee}{cost}"
         case Kind.ALLOWANCE_RUN:
             return f"Send the monthly allowance of {p.amount} to {payee}{cost}"
         case Kind.ALLOWANCE_SET:

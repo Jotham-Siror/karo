@@ -223,7 +223,7 @@ def _carry_out(
     conn: sqlite3.Connection, provider_name: str, p: Proposal, state: FamilyState, by: str, now: datetime
 ) -> ExecutionOutcome | _PayoutJob | _SplitDone:
     match p.kind:
-        case Kind.PAY_FEE | Kind.ALLOWANCE_RUN:
+        case Kind.PAY_FEE | Kind.SEND | Kind.ALLOWANCE_RUN:
             return _start_payout(conn, provider_name, p, state, by, now)
         case Kind.SPLIT:
             return _split(conn, p, state, by, now)
@@ -249,6 +249,8 @@ def _matched(p: Proposal, state: FamilyState) -> TrustedPayee | None:
 def _narration(conn: sqlite3.Connection, p: Proposal) -> str:
     if p.kind is Kind.ALLOWANCE_RUN:
         return "Monthly allowance"
+    if p.kind is Kind.SEND:
+        return f"Transfer to {p.payee.name}"
     fee = None if p.fee_id is None else store.get_fee(conn, p.family_id, p.fee_id)
     return f"Fees {fee['invoice_ref']}" if fee is not None and fee["invoice_ref"] else "School fees"
 
