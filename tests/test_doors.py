@@ -275,7 +275,7 @@ def test_an_empty_message_is_not_sent_to_the_agent(conn, provider):
 
 
 _turn_ids = itertools.count()
-LIMIT_REPLY = "That's a lot of messages. Please wait a few minutes and try again."
+LIMIT_REPLY = "That's a lot of messages. Please try again later."
 
 
 def turns(conn, provider, claude, count, *, now=NOW, address="amina", text="hi"):
@@ -330,11 +330,11 @@ def test_turns_drop_out_of_the_count_one_by_one_as_they_age(conn, provider):
 
 
 def test_refused_turns_do_not_keep_the_member_locked_out(conn, provider):
-    # Catches: counting refused messages, so a member who keeps trying never gets back in.
+    # Catches: counting refused messages, so a member who keeps trying never gets back in (needs 30 or more to show).
     claude = FakeClaude([text_response("ok")] * 31)
     turns(conn, provider, claude, 30)
     middle = NOW + timedelta(minutes=30)
-    assert turns(conn, provider, claude, 5, now=middle, text="please") == [LIMIT_REPLY] * 5
+    assert turns(conn, provider, claude, 30, now=middle, text="please") == [LIMIT_REPLY] * 30
     assert turns(conn, provider, claude, 1, now=NOW + timedelta(hours=1), text="now") == ["ok"]
 
 

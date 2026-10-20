@@ -31,7 +31,7 @@ NOTHING_TO_READ = "Please type a message or send a photo or PDF."
 CANNOT_READ_FILE = "Sorry, I can only read photos (JPEG, PNG, GIF or WebP) and PDFs."
 FILE_TOO_BIG = "Sorry, that file is too big. Please send files under 5 MB."
 TOO_MANY_FILES = "Sorry, please send up to 5 files at a time."
-TOO_MANY_TURNS = "That's a lot of messages. Please wait a few minutes and try again."
+TOO_MANY_TURNS = "That's a lot of messages. Please try again later."
 
 MAX_TURNS_PER_HOUR = 30
 _TURN_WINDOW = timedelta(hours=1)

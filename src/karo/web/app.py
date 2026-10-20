@@ -603,6 +603,8 @@ def demo_reset(request: Request):
     for suffix in ("", "-wal", "-shm"):
         Path(f"{settings.db_path}{suffix}").unlink(missing_ok=True)
     ensure_database(settings)
+    # The chat rate limit lives in memory, so deleting the file did not reset it.
+    base.RECENT_TURNS.clear()
     request.session["flash"] = "The demo is back at its starting point."
     return RedirectResponse("/demo", status_code=303)
 

@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from karo import approvals, audit, clock, collections, db, ledger, outbox, proposals, quotes, seed, store
 from karo.agent.claude import FakeClaude, text_response
 from karo.config import Settings
+from karo.doors import base
 from karo.domain import Kind, Payee
 from karo.money import Money
 from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
@@ -758,6 +759,17 @@ def test_reset_starts_the_demo_again_from_a_fresh_database(site):
         assert not [e for e in audit.events(conn, None) if e["event"] == "family.frozen"]
         assert approvals.verify_pin(conn, FAM, "m_amina", PIN, PEPPER, clock.now(conn)).ok
     assert site.client.get("/chat").status_code == 200  # the browser stays logged in
+
+
+def test_reset_clears_the_chat_rate_limit(make_site):
+    # Catches: rehearsals using up Amina's 30 turns, so the live demo answers "That's a lot of messages".
+    site = make_site([text_response("ok")] * 31)
+    site.login()
+    for n in range(30):
+        assert site.chat("hi", message_id=f"client-id-{n:04d}").json() == {"text": "ok"}
+    assert site.chat("hi", message_id="client-id-9999").json() == {"text": base.TOO_MANY_TURNS}
+    site.client.post("/demo/reset")
+    assert site.chat("hi", message_id="client-id-9998").json() == {"text": "ok"}
 
 
 NAIROBI = ZoneInfo("Africa/Nairobi")
