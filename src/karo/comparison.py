@@ -98,7 +98,8 @@ def _examples(fair: Decimal, target: Money, source: str) -> list[Option]:
 
 def _line(pick: Option, examples: list[Option], markup: Decimal | None, simulated: bool) -> str:
     """One plain sentence for the agent to repeat word for word: the price, the arrival and the saving on a wire."""
-    line = f"you pay {_whole(pick.you_pay)} and {_exact(pick.they_receive)} arrives in about a day"
+    # The price is written exactly as the PIN page writes it, so the two never disagree.
+    line = f"you pay {pick.you_pay} and {_exact(pick.they_receive)} arrives in about a day"
     lead = "Way to pay"
     wire = next((o for o in examples if o.name.startswith(_BANK_WIRE)), None)
     # Without the market rate the examples are priced from the provider's own cost, so they always come out dearer.
@@ -107,16 +108,13 @@ def _line(pick: Option, examples: list[Option], markup: Decimal | None, simulate
         saving = wire.you_pay.decimal - pick.you_pay.decimal
         gap = _gap(saving, pick.you_pay.currency)
         if gap is not None:
-            line += f", {gap} {'less' if saving >= 0 else 'more'} than a bank wire"
-        if all(pick.you_pay <= o.you_pay for o in examples):
-            lead = "Cheapest way"
+            # The wire is an illustration, not a quote, and the line says so.
+            line += f", {gap} {'less' if saving >= 0 else 'more'} than a typical bank wire (example figures)"
+            # Only a win over every example counts: matching one is not the cheapest.
+            if all(pick.you_pay < o.you_pay for o in examples):
+                lead = "Cheapest way"
     line = f"{lead}: {line}."
     return line + " (Test payment, simulated, no real money.)" if simulated else line
-
-
-def _whole(money: Money) -> str:
-    """Whole units, rounded up, so a price is never shown lower than it is."""
-    return f"{money.currency} {money.decimal.to_integral_value(ROUND_CEILING):,}"
 
 
 def _exact(money: Money) -> str:

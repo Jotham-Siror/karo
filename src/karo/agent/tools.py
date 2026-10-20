@@ -14,7 +14,20 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
+from karo import (
+    approvals,
+    audit,
+    collections,
+    comparison,
+    countries,
+    db,
+    outbox,
+    proposals,
+    quotes,
+    rates,
+    rules,
+    store,
+)
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -168,9 +181,10 @@ def _saved_recipients(ctx: ToolContext) -> list[dict]:
             entry["country"] = country.name if country else details["country"]
         if "method" in details:
             entry["method"] = methods.get(details["method"], details["method"])
-        tail = "".join(ch for ch in details.get("phone") or details.get("account_number") or "" if ch.isdigit())[-3:]
-        if tail:
-            entry["ends_in"] = tail
+        digits = "".join(ch for ch in details.get("phone") or details.get("account_number") or "" if ch.isdigit())
+        # Never more than half the number, so a short one doesn't give itself away. Three digits or fewer show nothing.
+        if len(digits) > 3:
+            entry["ends_in"] = digits[-min(3, len(digits) // 2) :]
         listed.append(entry)
     return listed
 

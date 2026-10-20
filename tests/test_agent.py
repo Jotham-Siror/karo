@@ -568,8 +568,8 @@ def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can
     fee_id = recorded_fee(conn, provider)
     result = compare_routes(conn, provider, fee_id)
     assert result["line"] == (
-        "Cheapest way: you pay KES 1,038,063 and GBP 6,000 arrives in about a day, KES 41,299 less than a bank wire. "
-        "(Test payment, simulated, no real money.)"
+        "Cheapest way: you pay KES 1,038,062.29 and GBP 6,000 arrives in about a day, "
+        "KES 41,299 less than a typical bank wire (example figures). (Test payment, simulated, no real money.)"
     )
     assert [(o["name"], o["is_example"]) for o in result["options"]] == [
         ("Test payment (simulated, no real money)", False),
@@ -970,6 +970,18 @@ def test_a_saved_recipients_account_and_phone_are_never_shown_in_full(conn, prov
         assert secret not in shown
 
 
+@pytest.mark.parametrize(
+    ("number", "shown"),
+    [("123", None), ("1234", "34"), ("12345", "45"), ("123456", "456"), ("+254 700 123 456", "456")],
+)
+def test_a_short_number_shows_fewer_digits_and_the_shortest_none(conn, provider, number, shown):
+    # Bug caught: a 3 digit number shown whole, and a 4 or 5 digit one mostly shown, by a flat "last 3 digits".
+    add_saved_recipient(conn, FAM, "Short Number", {"country": "KE", "method": "mpesa", "phone": number})
+    status = run_tool("get_status", {}, ctx_for(conn, provider))
+    entry = next(r for r in status["recipients"] if r["name"] == "Short Number")
+    assert entry.get("ends_in") == shown
+
+
 def test_the_university_from_the_directory_is_not_listed_as_a_recipient(conn, provider):
     # Bug caught: offering the university as a person to send money to in "Send money abroad".
     names = [r["name"] for r in run_tool("get_status", {}, ctx_for(conn, provider))["recipients"]]
@@ -1083,9 +1095,17 @@ def test_the_prompt_shows_the_menu_on_a_greeting_and_ends_it_with_the_invitation
 
 
 @pytest.mark.parametrize("member", MENUS)
-def test_the_prompt_reads_a_bare_number_as_that_menu_item(conn, member):
+def test_the_prompt_reads_a_bare_number_as_that_menu_item_right_after_the_menu(conn, member):
     # Bug caught: the AI answering "2" with "2 what?" and making the person type the whole request out.
-    assert "just a number means that menu item" in prompt_for(conn, member)
+    assert "Right after you show the menu, a reply that is just a number means that menu item" in prompt_for(
+        conn, member
+    )
+
+
+@pytest.mark.parametrize("member", MENUS)
+def test_the_prompt_reads_a_bare_number_at_any_other_time_as_an_answer_to_the_last_list(conn, member):
+    # Bug caught: "5" picked from a list of five recipients being read as menu item 5, Freeze everything.
+    assert "At any other time a bare number answers the list or question you just asked" in prompt_for(conn, member)
 
 
 @pytest.mark.parametrize("member", MENUS)
