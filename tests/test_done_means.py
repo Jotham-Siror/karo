@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
 from karo import audit, clock, collections, countries, db, executor, ledger, rules, scheduler
-from karo import seed, store
+from karo import proposals, quotes, seed, store
 from karo.agent.claude import FakeClaude, text_response, tool_response
 from karo.config import Settings
 from karo.doors import base
@@ -828,3 +828,95 @@ def test_done_means_the_whole_story_runs_on_the_stand_in_with_no_internet(world)
         "conversion.auto": 1,
     }
     assert (seen["payout.sent"], seen["allowance.set"], seen["allowance.scheduled"]) == (2, 1, 1)
+
+
+# --- Money goes only to a recipient the PIN has confirmed ----------------------------------------
+
+PAUL_PHONE = "+237671234567"  # made up, but a valid Cameroon mobile number
+PAUL = {"country": "CM", "currency": "XAF", "method": "mtn_cm", "phone": PAUL_PHONE}
+NEW_RECIPIENT = {
+    "name": "Paul Mbarga",
+    "country": "CM",
+    "method": "mtn_cm",
+    "details": [{"field": "phone", "value": "+237 6 71 23 45 67"}],
+}
+
+
+def transfer(amount: str, recipient: str = "Paul Mbarga", currency: str = "XAF") -> tuple[str, dict]:
+    return "propose_transfer", {"recipient": recipient, "amount": amount, "currency": currency}
+
+
+def test_done_means_the_ai_cannot_send_to_a_recipient_not_confirmed_with_the_pin(world):
+    # Bug it catches: a friend named in chat, or added but not yet confirmed, getting money because the code trusted it.
+    amina = store.member(world.conn, FAM, "m_amina")
+    grasping = [
+        tool_response(
+            ("add_recipient", NEW_RECIPIENT),
+            transfer("5000"),  # the same turn, before the PIN
+            transfer("5000", recipient="Eve Nkoulou"),  # never added
+            transfer("5000", recipient="+237 6 99 99 99 99"),  # details pasted in chat as if they were a name
+        ),
+        text_response("Waiting for Amina's PIN."),
+    ]
+
+    turn = world.say("amina", "Send my friend Paul in Cameroon XAF 5000, his MTN number is +237 6 71 23 45 67", grasping)
+
+    added, *tried = results_seen(turn.claude.requests[-1])
+    assert added["status"] == "awaiting_pin"
+    assert all(set(r) == {"error"} for r in tried)
+    # Even a proposal built without the tool is stopped by the rules: the recipient is not on the trusted list yet.
+    target = Money.parse("5000", "XAF")
+    priced = quotes.create_quote(
+        world.conn, world.provider, family_id=FAM, source_currency="KES", target=target, now=world.now()
+    )
+    bypass = proposals.propose(
+        world.conn,
+        family_id=FAM,
+        actor=amina,
+        kind=Kind.SEND,
+        now=world.now(),
+        base_url=BASE_URL,
+        amount=target,
+        payee=Payee.of("Paul Mbarga", **PAUL),
+        quote_id=priced.id,
+    )
+    assert bypass.status == "blocked"
+    assert world.count("trusted_payees", "name = 'Paul Mbarga'") == 0
+    assert world.count("payouts") == 0 and world.provider.payout_calls == 0
+    assert world.ledger_refs() == ["opening_balance"]
+    assert sorted(r["kind"] for r in world.conn.execute("SELECT kind FROM proposals")) == ["add_payee", "send"]
+    # The same request goes through once the PIN has confirmed the recipient, so the stop above was the PIN, not a fault.
+    assert world.confirm().status_code == 200
+    assert world.count("trusted_payees", "name = 'Paul Mbarga' AND source = 'added'") == 1
+    after = world.say("amina", "Now send it", [tool_response(transfer("5000")), text_response("Confirm with your PIN.")])
+    assert result_of(after.claude.requests[-1])["status"] == "awaiting_pin"
+    assert world.count("payouts") == 0  # still nothing moves until that PIN
+
+
+def test_done_means_a_large_send_to_a_recipient_added_today_waits_24_hours(world):
+    # Bug it catches: a stolen chat or a swapped number emptying the account on the first day a recipient exists.
+    world.say("amina", "Add Paul", [tool_response(("add_recipient", NEW_RECIPIENT)), text_response("Confirm.")])
+    assert world.confirm().status_code == 200
+    large, small = "200000", "5000"  # about KES 46,000 and KES 1,150, either side of the KES 34,600 threshold
+
+    first = world.say("amina", "Send Paul 200000", [tool_response(transfer(large)), text_response("Confirm.")])
+    assert result_of(first.claude.requests[-1])["status"] == "awaiting_pin"
+    assert "can run after" in world.conn.execute(
+        "SELECT text FROM outbox WHERE member_id = 'm_amina' ORDER BY id DESC LIMIT 1"
+    ).fetchone()["text"]
+    assert world.confirm().status_code == 200
+    held = world.conn.execute("SELECT status FROM proposals WHERE kind = 'send'").fetchone()
+    assert held["status"] == "waiting"
+    assert world.count("payouts") == 0 and world.provider.payout_calls == 0
+
+    world.say("amina", "Send Paul 5000", [tool_response(transfer(small)), text_response("Confirm.")])
+    assert world.confirm().status_code == 200
+    (payout,) = world.conn.execute("SELECT * FROM payouts").fetchall()
+    assert (payout["kind"], payout["status"], payout["amount_minor"], payout["currency"]) == (
+        "send", "succeeded", 5000, "XAF"
+    )
+
+    clock.advance(world.conn, 24 * 3600 + 60)
+    world.say("amina", "Send Paul 200000 now", [tool_response(transfer(large)), text_response("Confirm.")])
+    assert world.confirm().status_code == 200
+    assert world.count("payouts", "status = 'succeeded'") == 2
