@@ -917,6 +917,8 @@ def test_done_means_a_large_send_to_a_recipient_added_today_waits_24_hours(world
     )
 
     clock.advance(world.conn, 24 * 3600 + 60)
-    world.say("amina", "Send Paul 200000 now", [tool_response(transfer(large)), text_response("Confirm.")])
+    # The hold is over, so Karo asks again by itself, with a new price and a new PIN link. Nobody asks twice.
+    scheduler.tick(world.conn, world.provider, now=world.now(), base_url=BASE_URL)
     assert world.confirm().status_code == 200
-    assert world.count("payouts", "status = 'succeeded'") == 2
+    paid = world.conn.execute("SELECT amount_minor FROM payouts WHERE status = 'succeeded' ORDER BY rowid")
+    assert [row["amount_minor"] for row in paid] == [5000, 200000]
