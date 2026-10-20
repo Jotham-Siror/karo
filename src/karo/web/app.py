@@ -158,7 +158,9 @@ def _page(
 
 
 def _whatsapp_url(request: Request) -> str | None:
-    digits = re.sub(r"[^0-9]", "", request.app.state.settings.twilio_whatsapp_from or "")
+    settings = request.app.state.settings
+    # Only when WhatsApp is really set up: a number alone would send the person to a chat Karo cannot answer.
+    digits = re.sub(r"[^0-9]", "", settings.twilio_whatsapp_from or "") if settings.whatsapp_enabled else ""
     return f"https://wa.me/{digits}" if digits else None
 
 
@@ -379,7 +381,7 @@ def _at_text(moment: datetime, now: datetime, tz: ZoneInfo) -> str:
 def _link_gone(request: Request, conn: sqlite3.Connection, token: str, now: datetime) -> Response:
     """A link that can't be used again. If its PIN was entered, say what became of the proposal, so pressing Confirm
     a second time isn't a dead end. An unknown or expired token gets the plain not-found and nothing more."""
-    used = approvals.used_link(conn, token)
+    used = approvals.used_link(conn, token, now)
     found = None if used is None else store.get_proposal(conn, used.family_id, used.proposal_id)
     if found is None:
         return _notice(request, conn, EXPIRED, status_code=404)
@@ -479,7 +481,13 @@ def _run_confirmed(
         )
         return _notice(request, conn, PROCESSING, heading="On its way", tone="info", way_back=True)
     heading, tone = _RESULT_HEADINGS.get(outcome.status, ("Not done", "bad"))
-    return _notice(request, conn, outcome.message, heading=heading, tone=tone, way_back=True)
+    message = outcome.message
+    if outcome.warning:
+        heading, tone = "Done, but check this", "info"
+    elif outcome.status == "executed" and (ticked := executor.TICKED.match(message)):
+        # A receipt that opens "Sent ✓" is its own heading; "Done ✓" above it would tick twice.
+        heading, message = ticked.group(0), message[ticked.end() :].strip()
+    return _notice(request, conn, message, heading=heading, tone=tone, way_back=True)
 
 
 # --- money in: the stand-in checkout and the provider's notices ----------------------------------

@@ -25,6 +25,8 @@ _HASHER = PasswordHasher()
 # fullmatch on [0-9]: `^\d{4,6}$` would also accept "1234\n" and non-ASCII digits.
 _PIN_FORMAT = re.compile(r"[0-9]{4,6}")
 
+USED_LINK_READABLE_FOR = timedelta(hours=24)
+
 ConfirmStatus = Literal["confirmed", "wrong_pin", "locked", "invalid_link", "not_awaiting"]
 
 
@@ -184,16 +186,22 @@ def open_link(conn: sqlite3.Connection, token: str, now: datetime) -> LinkInfo |
     return LinkInfo(row["proposal_id"], row["member_id"], row["family_id"])
 
 
-def used_link(conn: sqlite3.Connection, token: str) -> UsedLink | None:
-    """A link whose PIN was already entered, so the page can say what became of it. Expiry doesn't matter here: the
-    holder confirmed it in time. An unused or unknown token gives nothing back. The family comes from the link's own
+def used_link(conn: sqlite3.Connection, token: str, now: datetime) -> UsedLink | None:
+    """A link whose PIN was already entered, so the page can say what became of it. That lasts a day after it was
+    used, enough for a second press or a look back the next morning, and no longer: the URL lives on in chat
+    history and logs. An unused, expired or unknown token gives nothing back. The family comes from the link's own
     member, so looking the proposal up with it can't show another family's."""
     row = conn.execute(
         "SELECT l.proposal_id, l.used_at, m.family_id FROM confirm_links l JOIN members m ON m.id = l.member_id "
         "WHERE l.token_hash = ? AND l.used_at IS NOT NULL",
         (_token_hash(token),),
     ).fetchone()
-    return None if row is None else UsedLink(row["proposal_id"], row["family_id"], clock.parse(row["used_at"]))
+    if row is None:
+        return None
+    used_at = clock.parse(row["used_at"])
+    if now >= used_at + USED_LINK_READABLE_FOR:
+        return None
+    return UsedLink(row["proposal_id"], row["family_id"], used_at)
 
 
 def has_live_link(conn: sqlite3.Connection, family_id: str, proposal_id: str, now: datetime) -> bool:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -53,6 +54,7 @@ class ExecutionOutcome:
     status: ExecutionStatus
     message: str
     payout_id: str | None = None
+    warning: bool = False  # done, but something is left for the main payer to read; the page must stay up
 
 
 @dataclass(frozen=True)
@@ -130,7 +132,7 @@ def _ask_for_shares(
                 data={"fee_id": done.fee_id, "error": type(error).__name__},
             )
             outbox.notify(conn, store.main_payer(conn, family_id).id, LINKS_LATER, now)
-        return replace(done.outcome, message=f"{done.outcome.message} {LINKS_LATER}")
+        return replace(done.outcome, message=f"{done.outcome.message} {LINKS_LATER}", warning=True)
     return done.outcome
 
 
@@ -346,7 +348,7 @@ def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
 
 def _pending(job: _PayoutJob) -> ExecutionOutcome:
     p = job.proposal
-    message = f"The payment of {p.amount} to {job.payee_name} is on its way. Reference {job.reference}."
+    message = f"On its way: {p.amount} to {job.payee_name}. I'll message you when it lands."
     return ExecutionOutcome("pending", message, job.payout_id)
 
 
@@ -446,11 +448,19 @@ def done_text(p: Proposal, state: FamilyState) -> str:
     return "That has been done."
 
 
+# A line that opens with its own tick word ("Sent ✓", "Done ✓") needs no second one in front.
+TICKED = re.compile(r"\w+ ✓")
+
+
+def note_for(message: str) -> str:
+    return message if TICKED.match(message) else f"Done ✓ {message}"
+
+
 def _done(conn: sqlite3.Connection, p: Proposal, state: FamilyState, now: datetime) -> ExecutionOutcome:
     """For a kind with no receipt or payment link of its own: the main payer is told in the chat and on WhatsApp too,
     because the PIN page is the only other place the result shows and she may have left it."""
     message = done_text(p, state)
-    outbox.notify(conn, state.main_payer.id, f"Done ✓ {message}", now)
+    outbox.notify(conn, state.main_payer.id, note_for(message), now)
     return _executed(conn, p, now, message)
 
 

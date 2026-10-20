@@ -599,7 +599,8 @@ def test_the_right_pin_pays_and_shows_the_receipt(site):
     token = start(site)
     response = enter(site, token)
     assert response.status_code == 200
-    assert "Sent ✓ GBP 6,000.00 to University of Westbridge" in response.text
+    assert "<h1>Sent ✓</h1>" in response.text
+    assert "GBP 6,000.00 to University of Westbridge. Cost KES" in response.text
     assert "Test payment, simulated, no real money." in response.text
     assert status_of_only_proposal(site) == "executed"
     assert [r["status"] for r in site.query("SELECT status FROM payouts")] == ["succeeded"]
@@ -672,6 +673,12 @@ def test_the_page_after_the_right_pin_says_done_and_what_was_done(site):
     assert "Jonathan Siror is saved as a recipient." in page
 
 
+def test_a_payment_page_does_not_say_done_and_sent_one_after_the_other(site):
+    # Catches: "Done ✓" above a receipt that already says "Sent ✓", so the page ticks twice.
+    page = enter(site, start(site)).text
+    assert "<h1>Sent ✓</h1>" in page and "Done" not in page and "Sent ✓ GBP" not in page
+
+
 def test_a_browser_with_a_session_is_sent_back_to_the_chat_after_four_seconds(site):
     # Catches: the person left on a finished page with nothing to take them back to the chat.
     site.login()
@@ -683,9 +690,26 @@ def test_a_browser_without_a_session_is_not_sent_anywhere_on_its_own(site):
     assert 'http-equiv="refresh"' not in enter(site, add_jonathan(site)).text
 
 
+def whatsapp_site(settings, sent: list | None = None, **overrides) -> Site:
+    """The app with WhatsApp switched on (all three Twilio settings) and a sender that records instead of sending."""
+    configured = replace(
+        settings, twilio_account_sid="AC-test", twilio_auth_token="auth-test", twilio_whatsapp_from=WHATSAPP_FROM
+    )
+    configured = replace(configured, **overrides)
+    site = Site(settings)
+    record = sent if sent is not None else []
+    site.client = TestClient(
+        create_app(
+            configured, client=site.claude, provider=site.provider, whatsapp_sender=lambda to, body: record.append((to, body))
+        ),
+        follow_redirects=False,
+    )
+    return site
+
+
 def test_without_a_session_the_done_page_offers_whatsapp_and_the_chat(settings):
     # Catches: a person who came from a WhatsApp link with no way to get back to that conversation.
-    site = Site(replace(settings, twilio_whatsapp_from=WHATSAPP_FROM))
+    site = whatsapp_site(settings)
     page = enter(site, add_jonathan(site)).text
     assert '<a class="button" href="https://wa.me/14155238886">Back to WhatsApp</a>' in page
     assert '<a class="button" href="/chat">Back to the chat</a>' in page
@@ -693,9 +717,16 @@ def test_without_a_session_the_done_page_offers_whatsapp_and_the_chat(settings):
 
 def test_with_a_session_the_done_page_does_not_offer_whatsapp(settings):
     # Catches: a person already in the web chat being offered a second way back that leaves the page they came to use.
-    site = Site(replace(settings, twilio_whatsapp_from=WHATSAPP_FROM))
+    site = whatsapp_site(settings)
     site.login()
     assert "wa.me" not in enter(site, add_jonathan(site)).text
+
+
+def test_a_whatsapp_number_without_the_rest_of_the_setup_gets_no_button(settings):
+    # Catches: a button to a number the app cannot send from, because the Twilio account or token is not set.
+    site = whatsapp_site(settings, twilio_account_sid=None)
+    page = enter(site, add_jonathan(site)).text
+    assert "wa.me" not in page and "Back to the chat" in page
 
 
 def test_with_no_whatsapp_number_set_the_done_page_has_no_whatsapp_button(site):
@@ -744,6 +775,26 @@ def test_a_used_link_says_plainly_how_its_proposal_ended(site, status, words_for
     assert "is saved" not in page
 
 
+def test_a_used_link_is_still_readable_just_inside_24_hours_after_use(site):
+    # Catches: the explanation vanishing early, so a second press the next morning is a dead end.
+    token = add_jonathan(site)
+    enter(site, token)
+    with site.connect() as conn:
+        clock.advance(conn, 24 * 3600 - 60)
+    assert "already confirmed" in site.client.get(f"/confirm/{token}").text
+
+
+def test_a_used_link_is_a_plain_not_found_24_hours_after_use(site):
+    # Catches: a link in an old chat, browser history or a log showing the payee and amount for ever.
+    token = add_jonathan(site)
+    enter(site, token)
+    with site.connect() as conn:
+        clock.advance(conn, 24 * 3600 + 60)
+    for response in (site.client.get(f"/confirm/{token}"), enter(site, token)):
+        assert response.status_code == 404
+        assert EXPIRED in response.text and "Jonathan" not in response.text
+
+
 def test_an_expired_link_that_was_never_used_stays_a_plain_not_found(site):
     # Catches: the used-link page leaking what a proposal was to anyone holding an old, unused link.
     token = add_jonathan(site)
@@ -767,12 +818,7 @@ def test_a_used_link_whose_member_is_in_another_family_stays_a_plain_not_found(s
 def test_the_outcome_note_goes_out_on_whatsapp_right_after_the_pin(settings):
     # Catches: the result reaching only the PIN page and the web chat, so a person who confirmed from WhatsApp hears nothing.
     sent: list[tuple[str, str]] = []
-    site = Site(settings)
-    configured = replace(settings, twilio_account_sid="AC-test", twilio_auth_token="auth-test", twilio_whatsapp_from=WHATSAPP_FROM)
-    sender = lambda to, body: sent.append((to, body))  # noqa: E731
-    site.client = TestClient(
-        create_app(configured, client=site.claude, provider=site.provider, whatsapp_sender=sender), follow_redirects=False
-    )
+    site = whatsapp_site(settings, sent)
     site.query("INSERT INTO identities (channel, address, member_id) VALUES ('whatsapp', 'whatsapp:+254700000001', 'm_amina')")
     enter(site, add_jonathan(site))
     assert ("whatsapp:+254700000001", "Done ✓ Jonathan Siror is saved as a recipient.") in sent
@@ -1271,13 +1317,21 @@ def test_a_split_whose_links_partly_fail_is_done_and_says_what_is_left(make_site
     site = make_site(provider=DropsTheSecondLink.from_config(SECRET, BASE_URL))
     page = enter(site, split_token(site))
     text = words(page)
-    assert page.status_code == 200 and "<h1>Done ✓</h1>" in page.text
+    assert page.status_code == 200 and "<h1>Done, but check this</h1>" in page.text
     assert "Some payment links couldn't be sent yet; Karo will retry when you send reminders." in text
     assert PROCESSING not in text
     assert status_of_only_proposal(site) == "executed"
     assert len(site.query("SELECT id FROM shares")) == 2 and len(site.query("SELECT id FROM collections")) == 1
     told = site.query("SELECT text FROM outbox WHERE member_id = 'm_amina' AND text LIKE 'Some payment links%'")
     assert len(told) == 1
+
+
+def test_a_split_with_failed_links_does_not_leave_the_page_for_a_browser_with_a_session(make_site):
+    # Catches: the "links couldn't be sent" warning vanishing after 4 seconds because the split counts as a success.
+    site = make_site(provider=DropsTheSecondLink.from_config(SECRET, BASE_URL))
+    site.login()
+    page = enter(site, split_token(site))
+    assert "couldn't be sent yet" in words(page) and 'http-equiv="refresh"' not in page.text
 
 
 def test_a_link_that_was_replaced_says_so_and_cannot_be_paid(site):

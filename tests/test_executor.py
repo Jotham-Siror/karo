@@ -1125,3 +1125,24 @@ def test_every_outcome_note_is_a_single_line(conn, provider, kind):
     run(conn, provider, proposal_id)
     (_, text), *_ = sent_since(conn, last)
     assert text.splitlines() == [text] and len(text) <= 100
+
+
+def test_a_pending_payment_says_it_is_on_its_way_without_a_reference(conn, provider):
+    # Bug caught: "Reference karo-prop_..." shown to a family that only needs to know the money is on its way.
+    fund(conn)
+    result = run(conn, ScriptedProvider(status="pending"), confirmed_fee_payment(conn, provider))
+    assert result.status == "pending"
+    assert result.message == "On its way: GBP 6,000.00 to University of Westbridge. I'll message you when it lands."
+
+
+@pytest.mark.parametrize(
+    ("text", "note"),
+    [
+        ("Jonathan Siror is saved as a recipient.", "Done ✓ Jonathan Siror is saved as a recipient."),
+        ("Sent ✓ GBP 6,000.00 to University of Westbridge.", "Sent ✓ GBP 6,000.00 to University of Westbridge."),
+        ("Done ✓ Allowance set.", "Done ✓ Allowance set."),
+    ],
+)
+def test_a_note_that_already_starts_with_a_tick_word_gets_no_second_one(text, note):
+    # Bug caught: "Done ✓ Sent ✓ ..." in the chat, a tick and a verb said twice.
+    assert executor.note_for(text) == note
