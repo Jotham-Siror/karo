@@ -9,6 +9,7 @@ This report covers the code at commit `1352c5a`, tagged `submission-v2` on GitHu
 | Rules, proposals, PIN page, executor, AI agent, web chat, WhatsApp, audit log, scheduler, proof export, sending abroad | Built, reviewed and tested |
 | WhatsApp through Twilio | Built, reviewed and tested; every incoming message's Twilio signature is checked. The demo video's main part is a recording of a real phone on WhatsApp against the live server |
 | Flutterwave v3 adapter | Built and reviewed; opt-in with `KARO_PROVIDER=flutterwave` (Flutterwave collections in test mode, stand-in payouts). The recorded demo uses the stand-in. Flutterwave refuses transfers for our test merchant ("merchant is not enabled to make transfers"), so payouts stay simulated |
+| Payaza adapter | Added after the `submission-v2` tag (commit `77cbb9b`) and switched off. `KARO_PROVIDER=payaza` refuses to start without Payaza keys and refuses any key that is not a test key; incoming notices must carry Payaza's HMAC-SHA512 signature. Not yet run against Payaza from Karo |
 
 ## 1. Security model in brief
 

@@ -2,7 +2,7 @@
 
 Team Fedha: Maela Mouto, Jotham Siror, May Jelimo (Strathmore University, Nairobi). Product: Karo.
 2026 Shenzhen FinTechathon, International Track, Topic C (cross-border and student finance).
-State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests.
+State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests. After that tag, commit `77cbb9b` added a Payaza adapter that is switched off (section 8); nothing else changed.
 
 ---
 
@@ -196,7 +196,7 @@ The web page uses Deep Chat 2.5.1, posts to `/api/chat`, and polls `/api/inbox` 
 - **Single worker, confirmed in code.** In-process locks guard one agent turn per member and channel (`agent/loop.py`), one scheduler tick at a time (`scheduler.py`) and one WhatsApp delivery at a time (`doors/whatsapp.py`). The stand-in provider keeps state in memory. The ledger rules "we run one worker".
 - **SQLite** file `data/karo.db` (`KARO_DB`), WAL mode, explicit `BEGIN IMMEDIATE` transactions, one connection per request and per tick.
 - **Public HTTPS** through a Cloudflare named tunnel to port 8000 at `https://karo.linxke.com`. `PUBLIC_BASE_URL` is used for links sent to phones and for the Twilio signature check.
-- **Settings** come from environment variables (`config.py`). Startup fails without the PIN pepper, session secret, demo password, stand-in secret and Anthropic key. The WhatsApp route exists only when all three Twilio settings are set. `KARO_PROVIDER` is `standin` (the default) or `flutterwave`, which collects relatives' shares through Flutterwave's test mode and keeps quotes and payouts on the stand-in unless `KARO_FLW_PAYOUTS=flutterwave`, because our test account cannot make transfers.
+- **Settings** come from environment variables (`config.py`). Startup fails without the PIN pepper, session secret, demo password, stand-in secret and Anthropic key. The WhatsApp route exists only when all three Twilio settings are set. `KARO_PROVIDER` is `standin` (the default) or `flutterwave`, which collects relatives' shares through Flutterwave's test mode and keeps quotes and payouts on the stand-in unless `KARO_FLW_PAYOUTS=flutterwave`, because our test account cannot make transfers. `payaza` (switched off, added after the submission tag) works the same way with Payaza collecting.
 
 ---
 
@@ -455,6 +455,7 @@ A new currency also needs a price: on the stand-in, a rate pair in `config/stand
 | Relatives' collections in the app | **Simulated** on the stand-in in the recorded demo; its checkout page says so. With `KARO_PROVIDER=flutterwave` they go through Flutterwave's hosted test checkout instead |
 | Relatives' collections in Flutterwave test mode | **Real test mode, no real money**, shown separately by `proof/smoke/smoke-20261020T002026Z.json`: hosted checkout links created for M-Pesa (KES) and MTN Uganda (UGX); a KES 100 M-Pesa charge re-verified with Flutterwave as successful. The MTN Uganda direct charge started, but its re-check found no transaction |
 | Flutterwave adapter in the app | **Built**, opt-in (`KARO_PROVIDER=flutterwave`): payment links, payment checks and signed notices against Flutterwave's test API, tested against recorded responses (`tests/test_flutterwave.py`). Not used in the recorded demo |
+| Payaza adapter | **Built, switched off**: ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`, which refuses to start without test keys). Not yet run against Payaza from Karo. When on, Payaza only collects (KES M-Pesa, UGX mobile money); quotes and payouts stay on the stand-in, like the Flutterwave option. KES, UGX and XAF collections and payouts need Payaza to enable them for the account (`providers/payaza.py`, `tests/test_payaza.py`) |
 | Flutterwave payouts | **Not available**: once the IP allowlist was set, Flutterwave answered "merchant is not enabled to make transfers" for our test account (`proof/smoke/smoke-20261020T010245Z.json`). Payouts therefore run on the stand-in. Flutterwave test payouts succeed only because the reference ends `_PMCK`, which tells test mode to succeed |
 | Paying the UK university, sending money abroad, the allowance | **Simulated** on the stand-in; each receipt says "Test payment, simulated, no real money" |
 | Provider exchange quote | **Simulated**: stand-in rates (`config/standin_rates.json`), labelled "Test payment (simulated, no real money)". Flutterwave's rate call failed in the smoke run (TLS disconnect) |
@@ -469,7 +470,7 @@ A new currency also needs a price: on the stand-in, a rate pair in `config/stand
 
 ## 9. Testing
 
-**Run:** `uv run pytest`. Tests are built to run offline: `FakeClaude` replaces the model, the stand-in replaces the provider, and `respx` mocks HTTP. Result at submission: **1,215 passed** (the code at commit `1352c5a`). Almost every test has a one-line comment naming the bug it catches.
+**Run:** `uv run pytest`. Tests are built to run offline: `FakeClaude` replaces the model, the stand-in replaces the provider, and `respx` mocks HTTP. Result at submission: **1,215 passed** (the code at commit `1352c5a`). With the switched-off Payaza adapter and its 65 tests (commit `77cbb9b`): **1,280 passed**. Almost every test has a one-line comment naming the bug it catches.
 
 | File | Covers |
 | --- | --- |
@@ -487,6 +488,7 @@ A new currency also needs a price: on the stand-in, a rate pair in `config/stand
 | `test_whatsapp.py` | Twilio signature, dedupe, media, chunking, delivery |
 | `test_send.py` | Sending abroad: recipients, the send kind through every rule, the PIN, the receipt |
 | `test_flutterwave.py` | The Flutterwave adapter against recorded test-mode responses; the hybrid provider |
+| `test_payaza.py` | The switched-off Payaza adapter with mocked HTTP: test keys only, notice signature, collections, status checks (added after the submission tag) |
 | `test_csp.py` | The Content-Security-Policy on every page |
 | `test_done_means.py` | The plan's "Done means" list |
 

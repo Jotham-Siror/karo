@@ -30,6 +30,7 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 | AI agent | Real: Claude, `claude-opus-5-5` |
 | Relatives paying their share, in the app | Simulated on the stand-in provider. Its checkout page says "simulated, no real money" |
 | Flutterwave test mode | Built into the app as an option (`KARO_PROVIDER=flutterwave`: Flutterwave collects the shares, the stand-in pays out). Proven against Flutterwave by `scripts/smoke_flutterwave.py`: hosted payment links for M-Pesa (KES) and MTN Uganda (UGX), and an M-Pesa test charge confirmed by Flutterwave. Test mode moves no real money |
+| Payaza adapter | Ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`). Not yet run against Payaza from Karo. KES, UGX and XAF collections and payouts need Payaza to enable them for the account. Added after the `submission-v2` tag |
 | Paying the UK university, sending money abroad, the allowance | Simulated on the stand-in. Every receipt says so. Flutterwave refuses transfers for our test account |
 | Mid-market exchange rate | Real, from open.er-api.com |
 | Provider exchange quote | Simulated (stand-in rates), labelled on screen |
@@ -78,7 +79,7 @@ Run **one** uvicorn worker. The scheduler and some locks live inside the process
 uv run pytest
 ```
 
-Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submission-v2`). The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
+Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submission-v2`). With the switched-off Payaza adapter and its 65 tests added after that tag (commit `77cbb9b`): **1,280 passed**. The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
 
 | File | What it checks |
 | --- | --- |
