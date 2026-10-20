@@ -106,6 +106,7 @@ button.danger, button.danger:hover { background: var(--bad); }
 .error, .notice { padding: 0.6rem 0.9rem; border-radius: 6px; margin: 0.75rem 0; }
 .error, .notice.bad { color: var(--bad); background: var(--bad-bg); }
 .notice.ok { color: var(--ok); background: var(--ok-bg); }
+.notice.warn { color: var(--warn-ink); background: var(--warn-bg); border-left: 4px solid var(--warn-ink); }
 .notice.info { color: var(--ink); background: var(--info-bg); border: 1px solid var(--line); border-left: 4px solid var(--info); }
 .chain { font-weight: 700; font-size: 1.1rem; }
 

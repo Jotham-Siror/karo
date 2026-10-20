@@ -483,7 +483,10 @@ def _run_confirmed(
     heading, tone = _RESULT_HEADINGS.get(outcome.status, ("Not done", "bad"))
     message = outcome.message
     if outcome.warning:
-        heading, tone = "Done, but check this", "info"
+        heading, tone = "Done, but check this", "warn"
+    elif outcome.status == "pending":
+        # The heading already says it is on its way.
+        message = message.removeprefix(executor.ON_ITS_WAY)
     elif outcome.status == "executed" and (ticked := executor.TICKED.match(message)):
         # A receipt that opens "Sent ✓" is its own heading; "Done ✓" above it would tick twice.
         heading, message = ticked.group(0), message[ticked.end() :].strip()

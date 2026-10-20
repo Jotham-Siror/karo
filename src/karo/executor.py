@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 ExecutionStatus = Literal["executed", "failed", "pending", "blocked", "waiting", "not_confirmed", "unsupported"]
 
+ON_ITS_WAY = "On its way: "  # the result page makes this prefix its heading
+
 LINKS_LATER = "Some payment links couldn't be sent yet; Karo will retry when you send reminders."
 
 ALLOWANCE_DAY = 1  # the demo's "1st of the month"; a chosen day comes later
@@ -348,7 +350,7 @@ def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
 
 def _pending(job: _PayoutJob) -> ExecutionOutcome:
     p = job.proposal
-    message = f"On its way: {p.amount} to {job.payee_name}. I'll message you when it lands."
+    message = f"{ON_ITS_WAY}{p.amount} to {job.payee_name}. I'll message you when it lands."
     return ExecutionOutcome("pending", message, job.payout_id)
 
 

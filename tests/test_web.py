@@ -26,6 +26,7 @@ from karo.config import Settings
 from karo.doors import base
 from karo.domain import Kind, Payee
 from karo.money import Money
+from karo.providers.base import PayoutResult
 from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
 from karo.web import app as web_app
 from karo.web.app import HideConfirmTokens, build_provider, create_app, run_scheduled_tick
@@ -85,6 +86,13 @@ class DroppingProvider:
 
     def payout_status(self, **kwargs):
         return self.inner.payout_status(**kwargs)
+
+
+class PendingProvider(DroppingProvider):
+    """Quotes like the stand-in, and takes a payout but says it has not landed yet."""
+
+    def payout(self, **kwargs):
+        return PayoutResult(kwargs["reference"], "PEND-1", "pending", True, "pending")
 
 
 class Site:
@@ -1318,6 +1326,7 @@ def test_a_split_whose_links_partly_fail_is_done_and_says_what_is_left(make_site
     page = enter(site, split_token(site))
     text = words(page)
     assert page.status_code == 200 and "<h1>Done, but check this</h1>" in page.text
+    assert '<p class="notice warn">' in page.text
     assert "Some payment links couldn't be sent yet; Karo will retry when you send reminders." in text
     assert PROCESSING not in text
     assert status_of_only_proposal(site) == "executed"
@@ -1332,6 +1341,19 @@ def test_a_split_with_failed_links_does_not_leave_the_page_for_a_browser_with_a_
     site.login()
     page = enter(site, split_token(site))
     assert "couldn't be sent yet" in words(page) and 'http-equiv="refresh"' not in page.text
+
+
+def test_the_warning_tone_has_a_style(site):
+    # Catches: a notice class that is used but never styled, so a warning looks like plain text.
+    assert ".notice.warn" in site.client.get("/static/style.css").text
+
+
+def test_a_pending_payment_page_says_it_is_on_its_way_once(make_site):
+    # Catches: "On its way" as the heading and again as the first words of the message.
+    site = make_site(provider=PendingProvider(StandInProvider.from_config(SECRET, BASE_URL)))
+    main = words(enter(site, start(site))).split("<main>")[1]
+    assert "<h1>On its way</h1>" in main and main.count("On its way") == 1
+    assert "GBP 6,000.00 to University of Westbridge. I'll message you when it lands." in main
 
 
 def test_a_link_that_was_replaced_says_so_and_cannot_be_paid(site):
