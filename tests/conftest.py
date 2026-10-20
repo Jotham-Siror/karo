@@ -25,6 +25,7 @@ from karo.domain import (
     StandingOrder,
     TrustedPayee,
 )
+from karo.doors.base import RECENT_TURNS
 from karo.money import Money
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
@@ -47,6 +48,12 @@ EXCHANGE_URL = "https://open.er-api.com/v6/latest/{source}"
 
 def rates_payload(**rates: float) -> dict:
     return {"result": "success", "rates": rates}
+
+
+@pytest.fixture(autouse=True)
+def no_one_over_the_chat_limit():
+    """The chat rate limit counts in memory for the whole run; without this, tests share one member's turns."""
+    RECENT_TURNS.clear()
 
 
 @pytest.fixture

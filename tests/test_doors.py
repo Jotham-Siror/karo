@@ -1,9 +1,11 @@
 """The shared front door every channel goes through. Every test names the bug it would catch."""
 
 import base64
+import itertools
 import json
+import re
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import anthropic
 import httpx
@@ -145,6 +147,38 @@ def test_other_messages_are_not_taken_for_a_pin(conn, provider, text):
     assert events(conn, "pin.typed_in_chat") == []
 
 
+@pytest.mark.parametrize("text", ["my PIN is 4821", "pin: 482190", "PIN-4821 ok?", "Please use pin 0000 for me"])
+def test_a_pin_inside_a_sentence_is_refused_and_never_kept(conn, provider, text):
+    # Catches: "my PIN is 4821" slipping past the bare-digits guard into the AI, the history and the log.
+    claude = FakeClaude([])
+    seeded = {e["seq"] for e in audit.events(conn, None, limit=1000)}
+    reply = send(conn, provider, claude, message(text))
+    assert reply == "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page."
+    assert claude.requests == []
+    assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+    assert len(events(conn, "pin.typed_in_chat")) == 1
+    digits = re.search(r"[0-9]{4,6}", text).group()
+    after = [e["data"] for e in audit.events(conn, None, limit=1000) if e["seq"] not in seeded]
+    assert after and digits not in json.dumps(after)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Invoice 2026-10 from Westbridge, due 15 Nov 2026, total GBP 6000, ref 48213",
+        "PIN page",
+        "where is the pin page for 482 or 12",
+        "I pinned invoice 4821 to the fridge, then went shipping",
+        "4821 pinhole",
+    ],
+)
+def test_a_message_with_only_one_half_of_a_pin_goes_to_the_agent(conn, provider, text):
+    # Catches: the wider PIN guard refusing invoices, dates and amounts, or matching "pin" inside other words.
+    claude = FakeClaude([text_response("Okay.")])
+    assert send(conn, provider, claude, message(text)) == "Okay."
+    assert events(conn, "pin.typed_in_chat") == []
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -211,3 +245,74 @@ def test_an_empty_message_is_not_sent_to_the_agent(conn, provider):
     reply = send(conn, provider, claude, message("   "))
     assert reply == "Please type a message or send a photo or PDF."
     assert claude.requests == []
+
+
+_turn_ids = itertools.count()
+LIMIT_REPLY = "That's a lot of messages. Please wait a few minutes and try again."
+
+
+def turns(conn, provider, claude, count, *, now=NOW, address="amina", text="hi"):
+    """Sends `count` different messages and returns the replies. Every id is new, so none is taken for a retry."""
+    return [
+        send(conn, provider, claude, message(text, message_id=f"turn-{next(_turn_ids)}", address=address), now=now)
+        for _ in range(count)
+    ]
+
+
+def test_the_31st_turn_in_an_hour_is_refused_without_the_agent(conn, provider):
+    # Catches: a flood of chat turns reaching the paid AI without limit.
+    claude = FakeClaude([text_response("ok")] * 30)
+    assert turns(conn, provider, claude, 30) == ["ok"] * 30
+    assert turns(conn, provider, claude, 1, text="one more") == [LIMIT_REPLY]
+    assert len(claude.requests) == 30
+
+
+def test_freeze_still_works_when_the_member_is_over_the_limit(conn, provider):
+    # Catches: the rate limit sitting in front of the emergency stop, so a busy chat cannot freeze the family.
+    claude = FakeClaude([text_response("ok")] * 30)
+    turns(conn, provider, claude, 30)
+    reply = send(conn, provider, claude, message("FREEZE", message_id="freeze-1"))
+    assert "frozen" in reply.lower()
+    assert frozen(conn)
+
+
+def test_the_pin_refusal_still_applies_when_the_member_is_over_the_limit(conn, provider):
+    # Catches: the rate limit answering first, so a PIN typed over the limit is neither refused nor logged.
+    claude = FakeClaude([text_response("ok")] * 30)
+    turns(conn, provider, claude, 30)
+    reply = send(conn, provider, claude, message("my PIN is 4821", message_id="pin-1"))
+    assert reply == base.PIN_IN_CHAT
+    assert len(events(conn, "pin.typed_in_chat")) == 1
+
+
+def test_the_limit_clears_an_hour_after_the_turns(conn, provider):
+    # Catches: a member locked out for good after one burst because the count never expires.
+    claude = FakeClaude([text_response("ok")] * 31)
+    turns(conn, provider, claude, 30)
+    later = NOW + timedelta(hours=1)
+    assert turns(conn, provider, claude, 1, now=later, text="back again") == ["ok"]
+
+
+def test_turns_drop_out_of_the_count_one_by_one_as_they_age(conn, provider):
+    # Catches: a fixed block of time instead of a rolling hour, which resets all at once and lets 30 more through.
+    claude = FakeClaude([text_response("ok")] * 40)
+    turns(conn, provider, claude, 10)
+    turns(conn, provider, claude, 20, now=NOW + timedelta(minutes=45))
+    later = NOW + timedelta(minutes=61)
+    assert turns(conn, provider, claude, 11, now=later, text="later") == ["ok"] * 10 + [LIMIT_REPLY]
+
+
+def test_refused_turns_do_not_keep_the_member_locked_out(conn, provider):
+    # Catches: counting refused messages, so a member who keeps trying never gets back in.
+    claude = FakeClaude([text_response("ok")] * 31)
+    turns(conn, provider, claude, 30)
+    middle = NOW + timedelta(minutes=30)
+    assert turns(conn, provider, claude, 5, now=middle, text="please") == [LIMIT_REPLY] * 5
+    assert turns(conn, provider, claude, 1, now=NOW + timedelta(hours=1), text="now") == ["ok"]
+
+
+def test_one_members_turns_do_not_use_up_another_members_limit(conn, provider):
+    # Catches: one shared counter, so a single busy relative blocks the whole family.
+    claude = FakeClaude([text_response("ok")] * 31)
+    turns(conn, provider, claude, 30)
+    assert turns(conn, provider, claude, 1, address="baraka") == ["ok"]

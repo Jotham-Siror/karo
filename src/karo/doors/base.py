@@ -9,8 +9,10 @@ import base64
 import logging
 import re
 import sqlite3
+import threading
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from karo import audit, proposals, store
 from karo.agent import loop
@@ -29,6 +31,13 @@ NOTHING_TO_READ = "Please type a message or send a photo or PDF."
 CANNOT_READ_FILE = "Sorry, I can only read photos (JPEG, PNG, GIF or WebP) and PDFs."
 FILE_TOO_BIG = "Sorry, that file is too big. Please send files under 5 MB."
 TOO_MANY_FILES = "Sorry, please send up to 5 files at a time."
+TOO_MANY_TURNS = "That's a lot of messages. Please wait a few minutes and try again."
+
+MAX_TURNS_PER_HOUR = 30
+_TURN_WINDOW = timedelta(hours=1)
+# When each member's recent turns were handled. In this process only, so a restart forgets them; tests clear it.
+RECENT_TURNS: dict[str, deque[datetime]] = {}
+_turns_lock = threading.Lock()
 
 # The API refuses images over 5 MB.
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
@@ -38,6 +47,8 @@ _IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 _PDF_TYPE = "application/pdf"
 # The shape approvals accepts as a PIN. [0-9], not \d, which would also match digits no PIN can contain.
 PIN_SHAPE = re.compile(r"[0-9]{4,6}")
+_PIN_WORD = re.compile(r"\bpin\b", re.IGNORECASE)
+_PIN_NUMBER = re.compile(r"\b[0-9]{4,6}\b")
 
 
 @dataclass(frozen=True)
@@ -71,7 +82,7 @@ def handle(
         return UNKNOWN_SENDER
 
     text = msg.text.strip()
-    if PIN_SHAPE.fullmatch(text):
+    if _looks_like_a_typed_pin(text):
         # Not stored, not shown to the agent, and left out of the log: the audit row records only that it happened.
         audit.record(
             conn,
@@ -91,6 +102,8 @@ def handle(
     content = _content_blocks(text, msg.attachments)
     if not content:
         return NOTHING_TO_READ
+    if not _take_a_turn(member.id, now):
+        return TOO_MANY_TURNS
     try:
         return loop.run_turn(
             conn, client, provider, member=member, channel=msg.channel, content=content, now=now, base_url=base_url
@@ -107,6 +120,23 @@ def handle(
             data={"error": type(error).__name__},
         )
         return AGENT_ERROR
+
+
+def _looks_like_a_typed_pin(text: str) -> bool:
+    # The digits are never compared with the real PIN: that would let anyone guess it in chat, around the lockout.
+    return bool(PIN_SHAPE.fullmatch(text) or (_PIN_WORD.search(text) and _PIN_NUMBER.search(text)))
+
+
+def _take_a_turn(member_id: str, now: datetime) -> bool:
+    """Counts a turn for the member and returns True, or returns False at the limit. Refused turns are not counted."""
+    with _turns_lock:
+        turns = RECENT_TURNS.setdefault(member_id, deque())
+        while turns and turns[0] <= now - _TURN_WINDOW:
+            turns.popleft()
+        if len(turns) >= MAX_TURNS_PER_HOUR:
+            return False
+        turns.append(now)
+        return True
 
 
 def _attachment_problem(attachments: list[tuple[str, bytes]]) -> str | None:
