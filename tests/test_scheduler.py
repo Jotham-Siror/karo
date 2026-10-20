@@ -382,6 +382,101 @@ def test_a_run_for_a_new_payee_waits_and_then_goes_without_a_pin(conn, provider)
     assert count(conn, "confirmations") == 0
 
 
+def allowance_proposal(conn, provider, at: datetime) -> str:
+    """The main payer asks for the GBP 500 allowance to the student at `at`. Returns the proposal id."""
+    quote = quotes.create_quote(conn, provider, family_id=FAM, source_currency="KES", target=gbp("500.00"), now=at)
+    outcome = proposals.propose(
+        conn,
+        family_id=FAM,
+        actor=store.member(conn, FAM, "m_amina"),
+        kind=Kind.ALLOWANCE_SET,
+        now=at,
+        base_url=BASE_URL,
+        amount=quote.target,
+        payee=trusted(conn, "tp_jabali"),
+        quote_id=quote.id,
+    )
+    assert outcome.status == "awaiting_pin"
+    return outcome.proposal_id
+
+
+def approve_allowance(conn, provider, at: datetime) -> None:
+    """The real way an allowance is set: asked for, confirmed with the PIN and put in place, all at `at`."""
+    allowance_proposal(conn, provider, at)
+    assert run(conn, provider, confirm(conn, at), at).status == "executed"
+
+
+def test_an_allowance_set_on_the_20th_first_runs_on_the_1st_of_next_month(conn, provider):
+    # Catches: "GBP 500 on the 1st" approved on the 20th being paid at the next tick, which the PIN page didn't say.
+    fund(conn)
+    approved = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+    approve_allowance(conn, provider, approved)
+    tick(conn, provider, approved)
+    tick(conn, provider, datetime(2026, 10, 31, 12, 0, tzinfo=UTC))
+    assert allowance_payouts(conn) == []
+    assert count(conn, "proposals") == 1  # only the one that set it up: no run was even proposed
+    tick(conn, provider, datetime(2026, 11, 1, 6, 0, tzinfo=UTC))
+    (paid,) = allowance_payouts(conn)
+    assert paid["created_at"].startswith("2026-11-01")
+
+
+def test_an_allowance_set_today_waits_until_the_demo_clock_reaches_the_1st(conn, provider):
+    # Catches: the first run counted from real time, or from the order's own day, so the demo jump never shows it.
+    fund(conn)
+    approve_allowance(conn, provider, clock.now(conn))
+    tick_now(conn, provider)
+    assert allowance_payouts(conn) == []
+    hours_later(conn, 24 * 40)  # a clean month or more ahead: the 1st has certainly come
+    tick_now(conn, provider)
+    assert len(allowance_payouts(conn)) == 1
+
+
+def test_an_allowance_approved_on_the_day_itself_waits_for_next_months_day(conn, provider):
+    # Catches: approved on the 1st at 10:00 for "the 1st" and paid that same afternoon.
+    fund(conn)
+    approved = datetime(2026, 11, 1, 7, 0, tzinfo=UTC)  # 10:00 on 1 November in Nairobi
+    approve_allowance(conn, provider, approved)
+    tick(conn, provider, approved + timedelta(minutes=1))
+    tick(conn, provider, datetime(2026, 11, 30, 12, 0, tzinfo=UTC))
+    assert allowance_payouts(conn) == []
+    tick(conn, provider, datetime(2026, 12, 1, 6, 0, tzinfo=UTC))
+    (paid,) = allowance_payouts(conn)
+    assert paid["created_at"].startswith("2026-12-01")
+
+
+def test_the_day_of_approval_is_the_familys_local_day_not_utc(conn, provider):
+    # Catches: approval at 01:00 on 1 November in Nairobi counted as 31 October, so the 1st looked still to come.
+    fund(conn)
+    approve_allowance(conn, provider, datetime(2026, 10, 31, 22, 0, tzinfo=UTC))
+    tick(conn, provider, datetime(2026, 11, 1, 6, 0, tzinfo=UTC))
+    assert allowance_payouts(conn) == []
+    tick(conn, provider, datetime(2026, 12, 1, 6, 0, tzinfo=UTC))
+    assert len(allowance_payouts(conn)) == 1
+
+
+def test_an_allowance_approved_last_month_runs_this_month(conn, provider):
+    # Catches: a rule so strict that an allowance set on 20 September skips the 1st of October.
+    fund(conn)
+    approve_allowance(conn, provider, datetime(2026, 9, 20, 9, 0, tzinfo=UTC))
+    tick(conn, provider, datetime(2026, 10, 1, 6, 0, tzinfo=UTC))
+    (paid,) = allowance_payouts(conn)
+    assert paid["created_at"].startswith("2026-10-01")
+
+
+def test_an_order_with_no_recorded_confirmation_counts_from_when_it_was_proposed(conn, provider):
+    # Catches: an order whose PIN record is missing being treated as approved long ago, and paid at once.
+    fund(conn)
+    proposed = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+    proposal_id = allowance_proposal(conn, provider, proposed)
+    order_id = add_standing_order(conn)
+    conn.execute("UPDATE standing_orders SET proposal_id = ? WHERE id = ?", (proposal_id, order_id))
+    assert count(conn, "confirmations") == 0
+    tick(conn, provider, proposed + timedelta(hours=1))
+    assert allowance_payouts(conn) == []
+    tick(conn, provider, datetime(2026, 11, 1, 6, 0, tzinfo=UTC))
+    assert len(allowance_payouts(conn)) == 1
+
+
 def lapsed_notices(conn) -> list[str]:
     return [t for t in texts(conn, "m_amina") if "didn't run in time" in t]
 

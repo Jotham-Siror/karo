@@ -239,9 +239,35 @@ def _pay_allowance(run: _Run) -> None:
     if _already_paid(run, window):
         return
     for order in store.load_state(run.conn, run.family_id, run.now).standing_orders:
-        if local.day >= order.day_of_month:
+        if _is_due(run, order, local):
             with _isolated(run, "allowance", order.id):
                 _run_order(run, order, config.policy.home_currency, window)
+
+
+def _is_due(run: _Run, order: StandingOrder, local: datetime) -> bool:
+    """The order's day has come this month, and that day is after the day the PIN approved the order.
+
+    The main payer approved "on the 1st of each month", so the first run is the first such day after she approved it,
+    never the day itself or an earlier day of the same month."""
+    if local.day < order.day_of_month:
+        return False
+    approved = _approved_at(run, order.id)
+    if approved is None:
+        return True
+    return date(local.year, local.month, order.day_of_month) > approved.astimezone(local.tzinfo).date()
+
+
+def _approved_at(run: _Run, order_id: str) -> datetime | None:
+    """When the PIN approved the order, or when it was proposed if no confirmation is recorded. None for an order
+    with no proposal behind it at all."""
+    row = run.conn.execute(
+        "SELECT COALESCE(c.at, p.created_at) AS at FROM standing_orders o "
+        "JOIN proposals p ON p.id = o.proposal_id AND p.family_id = o.family_id "
+        "LEFT JOIN confirmations c ON c.proposal_id = p.id "
+        "WHERE o.id = ? AND o.family_id = ?",
+        (order_id, run.family_id),
+    ).fetchone()
+    return None if row is None else clock.parse(row["at"])
 
 
 def _month_window(local: datetime) -> tuple[str, str]:
