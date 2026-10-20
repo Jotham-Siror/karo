@@ -92,6 +92,14 @@ def pay(name: str) -> bool:
     done = c.post(path)
     return amount is not None and page.status_code == 200 and done.status_code == 200 and str(done.url).endswith("/paid")
 
+def menu(ok) -> None:
+    reply = chat("amina", "hi")
+    show("hi ->", reply, 500)
+    ok("1" in reply and "Send money abroad" in reply, "a greeting gets the numbered menu")
+    reply = chat("amina", "3")
+    show("3 ->", reply, 400)
+    ok(re.search(r"paid|no fees?|nobody|no one", reply, re.I) is not None, "the reply to 3 talks about who has paid")
+
 def fake_invoice(ok) -> None:
     start = mark()
     show("fake invoice ->", chat("amina", FAKE))
@@ -267,6 +275,7 @@ def student_view(ok) -> None:
     ok("500" in reply, "his reply shows the allowance amount")
 
 SCENES = [
+    ("0:10 menu on a greeting, a number picks an item", menu),
     ("0:30 fake invoice blocked", fake_invoice),
     ("1:00 split confirmed with the PIN", split_and_pin),
     ("1:30 shares paid, late one reminded", shares_paid),

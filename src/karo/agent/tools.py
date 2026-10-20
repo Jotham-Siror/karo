@@ -674,8 +674,9 @@ _TOOLS: tuple[_Tool, ...] = (
     ),
     _Tool(
         "propose_allowance",
-        "Propose setting the student's monthly allowance, paid into the student's own account on file. Nothing "
-        "happens until the main payer confirms with a PIN.",
+        "Propose setting the student's monthly allowance, paid into the student's own account on file. It is always "
+        "paid on the 1st of each month, starting with the first 1st after the PIN confirms it, so there is no day to "
+        "set. Nothing happens until the main payer confirms with a PIN.",
         _object(
             amount=_text(f"The monthly amount. {_AMOUNT}"),
             currency=_text("Three-letter currency code of the student's account, e.g. GBP."),
