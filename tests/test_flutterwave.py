@@ -424,6 +424,34 @@ def test_a_payout_flutterwave_refuses_because_the_merchant_cannot_transfer_is_fa
     assert "not enabled to make transfers" in result.message
 
 
+# Flutterwave's own failures, as the saved smoke runs show them: an HTTP 400 that says nothing about the payment.
+SMOKE_NETWORK_FAILURES = [
+    "Client network socket disconnected before secure TLS connection was established",
+    "Cannot read properties of undefined (reading 'filter')",
+]
+
+
+@pytest.mark.parametrize("message", SMOKE_NETWORK_FAILURES)
+def test_a_network_failure_flutterwave_reports_as_a_400_leaves_the_payout_pending(provider, flw, message):
+    # Bug caught: a payout that may have gone through read as failed, so the executor refunds money that left.
+    flw.post("/transfers").respond(400, json=refusal(message))
+    with pytest.raises(ConnectionError):
+        pay_out(provider)
+
+
+def test_a_refusal_that_is_not_on_the_known_list_leaves_the_payout_pending(provider, flw):
+    # Bug caught: any unfamiliar 400 refunding the family; an unknown wording holds the money until someone looks.
+    flw.post("/transfers").respond(400, json=refusal("Something Flutterwave has never said before"))
+    with pytest.raises(ConnectionError):
+        pay_out(provider)
+
+
+def test_a_payout_refused_for_an_unlisted_ip_is_failed(provider, flw):
+    # Bug caught: a refusal made before any transfer exists (the first smoke run) left pending for ever.
+    flw.post("/transfers").respond(400, json=refusal("Please enable IP Whitelisting to access this service"))
+    assert pay_out(provider).status == "failed"
+
+
 def test_a_duplicate_reference_is_pending_never_failed(provider, flw):
     # Bug caught: the re-send of a payout that already went through read as failed, refunding money that left.
     flw.post("/transfers").respond(400, json=refusal("Transfer with this reference already exists"))
@@ -484,6 +512,14 @@ def test_payout_status_not_found_is_pending_never_failed(provider, flw, code, bo
     flw.get("/transfers/190626").respond(code, json=body)
     result = provider.payout_status(reference="karo-prop_1", provider_id="190626")
     assert (result.status, result.provider_id) == ("pending", None)
+
+
+@pytest.mark.parametrize("message", SMOKE_NETWORK_FAILURES)
+def test_payout_status_raises_on_a_network_failure_reported_as_a_400(provider, flw, message):
+    # Bug caught: Flutterwave's own failure read as an answer about the transfer, so the executor re-sends or refunds.
+    flw.get("/transfers/190626").respond(400, json=refusal(message))
+    with pytest.raises(ConnectionError):
+        provider.payout_status(reference="karo-prop_1", provider_id="190626")
 
 
 def test_payout_status_with_no_transfer_id_is_pending_without_a_request(provider, flw):

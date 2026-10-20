@@ -1,10 +1,12 @@
 """Flutterwave v3, test mode only.
 
 How a reply is read, because it decides whether money is refunded or credited:
-- An answer that says no (an HTTP 4xx with a message) is a verdict. A payout refused that way is `failed`.
 - No answer (a dropped connection, a timeout, a 5xx, a bad key, a rate limit, an unreadable body) raises
   `ConnectionError`. The executor leaves the payout pending and a later check settles it. Marking it `failed` here
   would refund money that may already be on its way.
+- Flutterwave reports some of its own failures as an HTTP 400 too (see proof/smoke/), so a 400 on a payout is not a
+  verdict by itself. Only a message on `_PAYOUT_REFUSALS`, a refusal made before any transfer exists, makes a payout
+  `failed`. Any other error answer raises `ConnectionError`, which leaves the payout pending for reconcile.
 - A request Flutterwave refuses before anything happens (no rate, a bad payment option) raises `ValueError`, the
   error the stand-in raises when it has no price.
 """
@@ -32,6 +34,9 @@ WEBHOOK_HEADER = "verif-hash"
 # Test mode succeeds a transfer whose reference ends like this.
 TEST_MODE_SUCCESS = "_PMCK"
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+# Messages that refuse a transfer before one exists, seen in proof/smoke/. Add one only on evidence: the cost of a
+# message missing here is a payout held pending, the cost of a wrong one is a refund of money that left.
+_PAYOUT_REFUSALS = ("not enabled to make transfers", "ip whitelisting")
 # Replies that say nothing about the payment itself: a bad key, a request timeout, a rate limit.
 _NO_VERDICT = frozenset({401, 403, 408, 429})
 _TRANSFER_STATUS: dict[str, Status] = {
@@ -156,7 +161,9 @@ class FlutterwaveProvider:
         if _is_duplicate(body):
             # The first call landed and only its answer was lost. Failing this would refund money that left.
             return PayoutResult(reference, None, "pending", True, "Flutterwave already has this reference.")
-        return PayoutResult(reference, None, "failed", True, f"Flutterwave refused the payout: {_message(body)}")
+        if _is_known_refusal(body):
+            return PayoutResult(reference, None, "failed", True, f"Flutterwave refused the payout: {_message(body)}")
+        raise ConnectionError(f"Flutterwave's payout answer is not a known refusal (HTTP {code}): {_message(body)}")
 
     def payout_status(self, *, reference: str, provider_id: str | None) -> PayoutResult:
         # Not "failed" for anything Flutterwave cannot find: a transfer still being created isn't visible yet.
@@ -169,7 +176,7 @@ class FlutterwaveProvider:
             return _transfer_result(reference, data)
         if code == 404 or _not_found(body):
             return not_found
-        raise ValueError(f"Flutterwave would not give the status of transfer {provider_id}: {_message(body)}")
+        raise ConnectionError(f"Flutterwave gave no usable status for transfer {provider_id} (HTTP {code}).")
 
     def parse_notice(self, headers: Mapping[str, str], body: bytes) -> Notice | None:
         sent = {name.lower(): value for name, value in headers.items()}.get(WEBHOOK_HEADER)
@@ -215,6 +222,11 @@ def _message(body: dict) -> str:
 def _not_found(body: dict) -> bool:
     message = _message(body).lower()
     return "not found" in message or "no transaction" in message or "no transfer" in message
+
+
+def _is_known_refusal(body: dict) -> bool:
+    message = _message(body).lower()
+    return any(refusal in message for refusal in _PAYOUT_REFUSALS)
 
 
 def _is_duplicate(body: dict) -> bool:
