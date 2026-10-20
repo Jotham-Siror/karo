@@ -22,3 +22,7 @@ build/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Runtime files (tunnel log, demo databases)
+data/
+*.log
