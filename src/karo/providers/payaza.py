@@ -16,8 +16,12 @@ How a reply is read, as in flutterwave.py, because it decides whether money is r
 - No answer (a dropped connection, a timeout, a bad key, a rate limit, an unreadable body) raises `ConnectionError`.
   The executor leaves the payout pending and a later check settles it.
 - A payout is `failed` only on a refusal Payaza made before any transfer exists (no balance, a wrong PIN, a wrong bank
-  code), or when nothing was sent at all. Any other answer raises `ConnectionError`, and a reference Payaza cannot find
-  or does not recognise stays `pending`.
+  code), or when nothing was sent at all. A no-balance refusal counts only if Payaza has no record of the reference
+  (otherwise an earlier call landed and the record's status is returned). Any other answer raises `ConnectionError`,
+  and a reference Payaza cannot find or does not recognise stays `pending`.
+- A collection is `succeeded` only when the transaction's own status says completed, never on the envelope code.
+- Known gap: the M-Pesa prompt is sent inside `create_collection`, before collections.py stores the row, so a failed
+  insert leaves a prompt Karo cannot credit. It cannot be closed inside this adapter.
 - Anything this account is not set up for raises `PayazaNotEnabled` (a `ValueError`, what the stand-in raises when it
   has no price) before a request is made; a payout the same way comes back `failed` with "Nothing was sent".
 """
@@ -66,7 +70,10 @@ _PAYOUT_STATUS: dict[str, Status] = {
 }
 # Messages that refuse a payout before one exists, from alianza's adapter. Add one only on evidence: the cost of a
 # message missing here is a payout held pending, the cost of a wrong one is a refund of money that left.
-_PAYOUT_REFUSALS = re.compile(r"insufficient balance|invalid transaction pin", re.IGNORECASE)
+_PIN_REFUSAL = re.compile(r"invalid transaction pin", re.IGNORECASE)
+# Unlike a wrong PIN, this can follow a payout that landed (the first call emptied the balance, its answer was lost, the
+# re-send is refused), so it is believed only after Payaza is asked about the reference.
+_BALANCE_REFUSAL = re.compile(r"insufficient balance", re.IGNORECASE)
 
 
 class PayazaNotEnabled(ValueError):
@@ -183,7 +190,8 @@ class PayazaProvider:
         answer = str(body.get("response_code", ""))
         raw = str(body.get("transaction_status") or answer)
         amount = _amount(body.get("transaction_amount"), body.get("currency"))
-        if answer == "00" or raw in ("Completed", "Funds Received"):
+        # The envelope code "00" is not read as paid: only the transaction's own status is.
+        if raw in ("Completed", "Funds Received"):
             if amount is None:
                 raise ValueError(f"Payaza called {tx_ref} successful without an amount.")
             return CollectionStatus(tx_ref, "succeeded", amount, _text(body.get("transaction_reference")))
@@ -244,10 +252,15 @@ class PayazaProvider:
                 reference, reference, "pending", True, "Payaza has the payout (test mode). Transfer pending."
             )
         message = str(body.get("response_message") or "")
-        if _PAYOUT_REFUSALS.search(message) or body.get("resp_code") == "X02":
-            return PayoutResult(
-                reference, None, "failed", True, f"Payaza refused the payout: {message or body['resp_code']}"
-            )
+        refused = PayoutResult(
+            reference, None, "failed", True, f"Payaza refused the payout: {message or body.get('resp_code')}"
+        )
+        if _PIN_REFUSAL.search(message):
+            return refused
+        if _BALANCE_REFUSAL.search(message) or body.get("resp_code") == "X02":
+            # Ask Payaza about the reference first: a record means an earlier call landed, and its status is the answer.
+            known = self.payout_status(reference=reference, provider_id=None)
+            return refused if known.provider_id is None or known.status == "failed" else known
         raise ConnectionError(f"Payaza's payout answer is not a known refusal (HTTP {code}): {_message(body)}")
 
     def payout_status(self, *, reference: str, provider_id: str | None) -> PayoutResult:

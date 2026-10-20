@@ -192,6 +192,14 @@ def test_a_completed_collection_is_succeeded_with_its_amount(payaza, provider):
     assert request.headers["x-productid"] == "app"
 
 
+@pytest.mark.parametrize("status", ["Pending", "Initialized", ""])
+def test_the_envelope_code_alone_does_not_make_a_collection_succeeded(payaza, provider, status):
+    # Bug caught: "00" meaning "the status query worked" read as "paid", crediting a payment that has not happened.
+    payaza.get(CHECK).mock(return_value=httpx.Response(200, json=checked("00", status)))
+    result = provider.verify_collection("karo-col_1")
+    assert (result.status, result.provider_id) == ("pending", None)
+
+
 def test_a_collection_still_waiting_for_the_payer_is_pending(payaza, provider):
     # Bug caught: crediting the family while the M-Pesa prompt is still open on the payer's phone.
     payaza.get(CHECK).mock(return_value=httpx.Response(200, json=checked("09", "Initialized")))
@@ -372,6 +380,7 @@ def test_an_explicit_refusal_is_failed_even_when_payaza_sends_it_with_a_500(paya
     # Bug caught: a payout Payaza refused (no balance) held pending forever, or the refusal lost behind a 500.
     body = {"response_code": 500, "response_message": "Insufficient Balance", "resp_code": "500"}
     payaza.post(PAYOUT).mock(return_value=httpx.Response(status, json=body))
+    payaza.get(STATUS + "karo-prop_1").mock(return_value=httpx.Response(404, json={"message": "not found"}))
     result = pay(provider)
     assert result.status == "failed"
     assert "Insufficient Balance" in result.message
@@ -382,7 +391,37 @@ def test_a_wrong_pin_and_a_wrong_bank_code_are_refusals(payaza, provider):
     payaza.post(PAYOUT).mock(return_value=httpx.Response(200, json={"response_message": "Invalid transaction pin"}))
     assert pay(provider).status == "failed"
     payaza.post(PAYOUT).mock(return_value=httpx.Response(200, json={"resp_code": "X02", "response_message": ""}))
+    payaza.get(STATUS + "karo-prop_1").mock(return_value=httpx.Response(404, json={"message": "not found"}))
     assert pay(provider).status == "failed"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("NIP_PENDING", "pending"), ("ESCROW_SUCCESS", "pending"), ("NIP_SUCCESS", "succeeded")]
+)
+def test_a_balance_refusal_is_not_failed_when_payaza_already_has_the_reference(payaza, provider, raw, expected):
+    # Bug caught: a re-send answered "insufficient balance" because the first payout landed and emptied the account,
+    # read as a refusal, so the executor posts a reversal and the family pays twice.
+    body = {"response_code": 500, "response_message": "Insufficient Balance", "resp_code": "500"}
+    payaza.post(PAYOUT).mock(return_value=httpx.Response(200, json=body))
+    payaza.get(STATUS + "karo-prop_1").mock(return_value=httpx.Response(200, json=payout_state(raw)))
+    result = pay(provider)
+    assert (result.status, result.provider_id) == (expected, "karo-prop_1")
+
+
+def test_a_balance_refusal_is_failed_when_payaza_reports_the_reference_failed(payaza, provider):
+    # Bug caught: a recorded NIP_FAILURE left pending forever because the refusal path ignored the record.
+    body = {"response_message": "Insufficient Balance"}
+    payaza.post(PAYOUT).mock(return_value=httpx.Response(200, json=body))
+    payaza.get(STATUS + "karo-prop_1").mock(return_value=httpx.Response(200, json=payout_state("NIP_FAILURE")))
+    assert pay(provider).status == "failed"
+
+
+def test_a_balance_refusal_with_no_usable_lookup_raises_instead_of_failing(payaza, provider):
+    # Bug caught: a refusal turned into a refund while Payaza's record of the reference could not be read.
+    payaza.post(PAYOUT).mock(return_value=httpx.Response(200, json={"response_message": "Insufficient Balance"}))
+    payaza.get(STATUS + "karo-prop_1").mock(return_value=httpx.Response(503, json={"message": "down"}))
+    with pytest.raises(ConnectionError):
+        pay(provider)
 
 
 def test_an_answer_that_is_not_a_known_refusal_is_a_connection_error_not_failed(payaza, provider):
