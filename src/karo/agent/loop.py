@@ -27,7 +27,7 @@ NO_ANSWER_REPLY = "Sorry, I couldn't put an answer together. Please try again."
 STATUS_NOTE = "From Karo's records as this message arrives, replacing any status earlier in this chat:"
 
 # "<" before a status tag, in either direction and with stray spaces.
-_STATUS_TAG_START = re.compile(r"<(?=\s*/?\s*karo_status)", re.IGNORECASE)
+_STATUS_TAG_START = re.compile(r"<(?=[\s/]*karo_status)", re.IGNORECASE)
 
 _TURN_LOCKS: dict[str, threading.Lock] = {}
 

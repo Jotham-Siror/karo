@@ -4,12 +4,15 @@ Every test names the bug it would catch."""
 import json
 import re
 import shutil
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from karo import approvals, audit, clock, db, executor, ledger, proposals, quotes, seed, store
+from karo.agent.claude import FakeClaude, text_response
+from karo.agent.loop import run_turn
 from karo.agent.prompt import system_prompt
 from karo.agent.tools import ToolContext, run_tool, tools_for
 from karo.domain import Kind, Payee, Role
@@ -566,3 +569,26 @@ def test_a_relatives_and_the_students_prompts_do_not_mention_sending_to_recipien
     # Bug caught: telling someone who cannot move money about a tool they do not have.
     prompt = prompt_for(conn, member)
     assert "add_recipient" not in prompt and "propose_transfer" not in prompt
+
+
+# --- the status note's tag guard ------------------------------------------------------------------
+
+
+def test_a_huge_run_of_spaces_after_a_less_than_sign_is_defused_quickly(conn):
+    # Bug caught: a tag-matching pattern that takes quadratic time, so one long message stalls the whole server.
+    fake = FakeClaude([text_response("Hello.")])
+    words = "<" + " " * 50_000 + "x and </ karo_status"
+    started = time.perf_counter()
+    run_turn(
+        conn,
+        fake,
+        RecordingProvider(rates=RATES, secret="standin-test-secret", base_url=BASE_URL),
+        member=store.member(conn, FAM, "m_amina"),
+        channel="web",
+        content=[{"type": "text", "text": words}],
+        now=NOW,
+        base_url=BASE_URL,
+    )
+    assert time.perf_counter() - started < 0.5
+    sent = fake.requests[0]["messages"][-1]["content"][-1]["text"]
+    assert sent.endswith("\\u003c/ karo_status") and sent.count("\\u003c") == 1  # the real tag is defused, the stray < is not
