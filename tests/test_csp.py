@@ -98,37 +98,68 @@ class Markup(HTMLParser):
         self.script_urls += [f"<{tag} {name}>" for name, value in attrs if (value or "").strip().lower().startswith("javascript:")]
 
 
-def markup_of(template: Path) -> Markup:
+JINJA = re.compile(r"\{#.*?#\}|\{%.*?%\}|\{\{.*?\}\}", re.DOTALL)
+
+
+def markup_of(source: str) -> Markup:
+    # Jinja goes first: a quote inside one of its strings (the "I'm Karo" in chat.html) would end an attribute early.
     markup = Markup()
-    markup.feed(template.read_text(encoding="utf-8"))
+    markup.feed(JINJA.sub("", source))
     return markup
+
+
+def template_markup(template: Path) -> Markup:
+    return markup_of(template.read_text(encoding="utf-8"))
+
+
+def test_the_scan_finds_an_inline_script_and_skips_one_with_a_src():
+    # Catches: a scan that passes every template because it cannot tell inline code from a script file.
+    assert markup_of("<p>x</p><script>alert(1)</script>").inline_scripts == 1
+    assert markup_of('<script src="/static/a.js"></script>').inline_scripts == 0
+
+
+def test_the_scan_finds_an_inline_event_handler():
+    # Catches: a scan that misses an onclick attribute, so the handler dies under the policy with no test failing.
+    assert markup_of('<button onclick="go()">Go</button>').handlers == ["<button onclick>"]
+
+
+def test_the_scan_finds_a_javascript_link():
+    # Catches: a scan that misses href="javascript:..." in any letter case.
+    assert markup_of('<a href=" JavaScript:go()">Go</a>').script_urls == ["<a href>"]
+
+
+def test_the_scan_is_not_thrown_by_an_apostrophe_inside_a_jinja_value():
+    # Catches: the "I'm Karo" in chat.html ending the attribute early, so words after it (like "only") read as attributes.
+    source = """<deep-chat intro='{{ {"text": "I'm only here"}|tojson }}' onclick="go()"></deep-chat>"""
+    assert markup_of(source).handlers == ["<deep-chat onclick>"]
 
 
 @pytest.mark.parametrize("template", PAGE_TEMPLATES + [TEMPLATES / "base.html"], ids=lambda p: p.name)
 def test_no_template_has_an_inline_script(template):
     # Catches: a later inline <script> that the policy blocks, so a page feature dies with only a console message.
-    assert markup_of(template).inline_scripts == 0
+    assert template_markup(template).inline_scripts == 0
 
 
 @pytest.mark.parametrize("template", PAGE_TEMPLATES + [TEMPLATES / "base.html"], ids=lambda p: p.name)
 def test_no_template_has_an_inline_event_handler(template):
     # Catches: an onclick/onsubmit attribute, which the policy blocks, so the button or the confirm prompt does nothing.
-    assert markup_of(template).handlers == []
+    assert template_markup(template).handlers == []
 
 
 @pytest.mark.parametrize("template", PAGE_TEMPLATES + [TEMPLATES / "base.html"], ids=lambda p: p.name)
 def test_no_template_has_a_javascript_link(template):
     # Catches: href="javascript:..." which the policy blocks the same way as an inline script.
-    assert markup_of(template).script_urls == []
+    assert template_markup(template).script_urls == []
 
 
 # --- the moved page scripts ----------------------------------------------------------------------
 
 
-def test_the_chat_page_loads_its_script_from_a_file(site):
-    # Catches: the chat page losing its script (the sign-in redirect, the message ids, the inbox polling) in the move.
+def test_the_chat_page_runs_its_script_while_the_page_loads_not_deferred(site):
+    # Catches: `defer` running the script after Deep Chat has started, so onComponentRender is set too late and the
+    # inbox poll that delivers the PIN link never starts.
     site.login()
-    assert '<script src="/static/chat.js" defer></script>' in page_at(site, "/chat")
+    assert '<script src="/static/chat.js"></script>' in page_at(site, "/chat")
 
 
 def test_the_chat_script_is_served_as_javascript(site):

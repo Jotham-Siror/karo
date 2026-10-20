@@ -17,5 +17,7 @@
 
 <script type="module" src="https://cdn.jsdelivr.net/npm/deep-chat@2.5.1/dist/deepChat.bundle.js"
         integrity="sha384-djz34nrOoloJkHQBH1qoINnqdsX56zqoFpMpT0m3ghPF0o0otOUvWZEFwUViT9iF" crossorigin="anonymous"></script>
-<script src="/static/chat.js" defer></script>
+{# Not deferred: like the inline script it replaced, it must run while the page loads, before Deep Chat starts, so
+   onComponentRender is set in time to start the inbox poll that delivers the PIN link. #}
+<script src="/static/chat.js"></script>
 {% endblock %}
