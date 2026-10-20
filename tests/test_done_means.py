@@ -610,6 +610,7 @@ def test_done_means_one_family_cannot_see_anothers_records(world):
         "frozen": False,
         "balances": [],
         "allowance": None,
+        "recipients": [],  # the Otienos have Jabali Otieno saved; the Mwangis have none, and must not be shown his
         "open_proposals": [],
     }
     assert status == only_their_own
