@@ -24,7 +24,7 @@ from karo import clock
 from karo.clock import iso
 from karo.domain import CheckContext, Confirmation, FamilyState, Kind, Member, Payee, Proposal, Stage, TrustedPayee
 from karo.money import Money
-from karo.providers.base import PayoutResult, Provider
+from karo.providers.base import PayoutResult, Provider, payout_name
 from karo.rules import Decision, Outcome
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ def execute(
     if conn.in_transaction:
         # Joined to an outer transaction, the payouts row would not be committed before the provider is called.
         raise RuntimeError("execute must not run inside a transaction.")
-    step = _prepare(conn, provider.name, family_id=family_id, proposal_id=proposal_id, now=now)
+    step = _prepare(conn, payout_name(provider), family_id=family_id, proposal_id=proposal_id, now=now)
     if isinstance(step, _SplitDone):
         return _ask_for_shares(conn, provider, step, family_id=family_id, now=now, base_url=base_url)
     if isinstance(step, ExecutionOutcome):
@@ -333,8 +333,10 @@ def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
         if row["status"] == "pending":
             _record(conn, job, result, now)
             row = _payout_row(conn, job)
+        log_check = _log_check(conn)
     if row["status"] == "succeeded":
-        return ExecutionOutcome("executed", _receipt(job, row["provider_id"], bool(row["simulated"])), job.payout_id)
+        receipt = _receipt(job, row["provider_id"], bool(row["simulated"]), log_check)
+        return ExecutionOutcome("executed", receipt, job.payout_id)
     if row["status"] == "failed":
         return ExecutionOutcome("failed", _failure_text(job), job.payout_id)
     return _pending(job)
@@ -388,15 +390,20 @@ def _record(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
         store.update_proposal(conn, p.family_id, p.id, status="executed", now=now)
         if p.kind is Kind.PAY_FEE and p.fee_id is not None:
             conn.execute("UPDATE fees SET status = 'paid' WHERE id = ? AND family_id = ?", (p.fee_id, p.family_id))
-        outbox.notify(conn, main.id, _receipt(job, result.provider_id, result.simulated), now)
+        outbox.notify(conn, main.id, _receipt(job, result.provider_id, result.simulated, _log_check(conn)), now)
 
 
-def _receipt(job: _PayoutJob, provider_id: str | None, simulated: bool) -> str:
+def _log_check(conn: sqlite3.Connection) -> str:
+    """The start of the newest audit hash. Read in the transaction that writes the receipt, after the payout's row."""
+    return conn.execute("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1").fetchone()["hash"][:12]
+
+
+def _receipt(job: _PayoutJob, provider_id: str | None, simulated: bool, log_check: str) -> str:
     p = job.proposal
     text = f"Paid {p.amount} to {job.payee_name} (cost {p.quote.source}). Reference {job.reference}"
     if provider_id:
         text += f", provider ID {provider_id}"
-    return text + (" (simulated)." if simulated else ".")
+    return text + (" (simulated)." if simulated else ".") + f" Log check {log_check}"
 
 
 def _failure_text(job: _PayoutJob) -> str:

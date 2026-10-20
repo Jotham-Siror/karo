@@ -303,6 +303,33 @@ def test_a_confirmed_fee_payment_is_paid_once_and_recorded_everywhere(conn, prov
     assert "(simulated)" in receipt
 
 
+def paid_fee(conn, provider):
+    fund(conn)
+    proposal_id = confirmed_fee_payment(conn, provider)
+    return run(conn, provider, proposal_id)
+
+
+def test_the_receipt_ends_with_the_audit_hash_that_closes_the_payout(conn, provider):
+    # Bug caught: a "Log check" taken before the payout's audit row, so it points at the wrong place.
+    paid_fee(conn, provider)
+    receipt = texts(conn, "m_amina")[-1]
+    code = re.search(r"Log check ([0-9a-f]{12})$", receipt).group(1)
+    assert code == events(conn, "payout.sent")[0]["hash"][:12]
+    assert code in {e["hash"][:12] for e in audit.events(conn)}
+
+
+def test_the_receipt_does_not_break_the_audit_chain(conn, provider):
+    # Bug caught: reading the head in a way that writes to the log, or out of step with it, so verify fails.
+    paid_fee(conn, provider)
+    assert audit.verify(conn) == (True, None)
+
+
+def test_the_reply_to_the_person_is_the_same_receipt_as_the_outbox_message(conn, provider):
+    # Bug caught: the web page showing one Log check and the main payer's message another.
+    result = paid_fee(conn, provider)
+    assert result.message == texts(conn, "m_amina")[-1]
+
+
 def test_executing_twice_pays_once(conn, provider):
     # Bug caught: a retried or double-clicked confirm pays the university twice.
     fund(conn)
