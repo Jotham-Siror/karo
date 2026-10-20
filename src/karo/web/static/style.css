@@ -1,15 +1,22 @@
 :root {
-  --ink: #1d2733;
-  --muted: #5c6b7a;
-  --paper: #f6f7f9;
+  /* Joseph's palette. Baltic Blue is the brand colour; Lavender is the page tint; Powder Blue draws borders and dividers. */
+  --ink: #17324a;
+  /* Body-size secondary text. Lavender Grey is too light for that, so this is a slate near the ink. */
+  --muted: #4a6076;
+  --paper: #eeeeff;
   --card: #ffffff;
-  --line: #d9dee4;
-  --brand: #0f6b5c;
+  --line: #9fb4c7;
+  --brand: #28587b;
+  --brand-hover: #1f4563;
   --brand-ink: #ffffff;
-  --ok: #19704a;
-  --ok-bg: #e4f4ec;
-  --info: #1f4f8f;
-  --info-bg: #e7eff9;
+  /* Lavender Grey: only for bold large text and for borders, because it is 3.9:1 on white. */
+  --label: #7f7caf;
+  /* Muted Teal is a fill with dark ink text, never text itself. */
+  --ok: #17324a;
+  --ok-bg: #9fb798;
+  --info: #28587b;
+  --info-bg: #ffffff;
+  /* Error and warning colours are unchanged: they carry meaning. */
   --bad: #a3271f;
   --bad-bg: #fbe9e7;
   --warn-bg: #fff3d6;
@@ -31,13 +38,14 @@ body {
   align-items: center;
   gap: 0.25rem 1rem;
   padding: 0.6rem 1rem;
-  background: var(--card);
-  border-bottom: 1px solid var(--line);
+  background: var(--brand);
+  color: var(--brand-ink);
 }
-.brand { font-weight: 700; font-size: 1.2rem; color: var(--brand); text-decoration: none; }
-.who { color: var(--muted); }
+.top .brand { font-weight: 700; font-size: 1.2rem; color: var(--brand-ink); text-decoration: none; }
+.who { color: var(--paper); }
 .top nav { margin-left: auto; display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; }
-.top a { color: var(--brand); }
+.top a { color: var(--paper); }
+.top a:focus-visible { outline-color: var(--brand-ink); }
 
 .banner {
   padding: 0.4rem 1rem;
@@ -47,9 +55,13 @@ body {
   text-align: center;
 }
 
+a { color: var(--brand); }
+:focus-visible { outline: 3px solid var(--brand); outline-offset: 2px; }
+
 main { max-width: 42rem; margin: 0 auto; padding: 1rem; }
 h1 { font-size: 1.5rem; margin: 0.5rem 0; }
-h2 { font-size: 1.1rem; margin: 0 0 0.5rem; }
+h2 { font-size: 1.2rem; margin: 0 0 0.5rem; }
+.card h2 { color: var(--label); }
 .lead { color: var(--muted); }
 .hint { color: var(--muted); font-size: 0.9rem; }
 
@@ -67,7 +79,7 @@ input, select {
   min-height: 2.75rem;
   padding: 0.5rem 0.75rem;
   font: inherit;
-  border: 1px solid var(--line);
+  border: 1px solid var(--label);
   border-radius: 6px;
   background: #fff;
   color: inherit;
@@ -88,12 +100,13 @@ button, .button {
   text-decoration: none;
   cursor: pointer;
 }
-button.danger { background: var(--bad); }
+button:hover, .button:hover { background: var(--brand-hover); }
+button.danger, button.danger:hover { background: var(--bad); }
 
 .error, .notice { padding: 0.6rem 0.9rem; border-radius: 6px; margin: 0.75rem 0; }
 .error, .notice.bad { color: var(--bad); background: var(--bad-bg); }
 .notice.ok { color: var(--ok); background: var(--ok-bg); }
-.notice.info { color: var(--info); background: var(--info-bg); }
+.notice.info { color: var(--ink); background: var(--info-bg); border: 1px solid var(--line); border-left: 4px solid var(--info); }
 .chain { font-weight: 700; font-size: 1.1rem; }
 
 .summary { font-size: 1.2rem; font-weight: 600; }
@@ -103,12 +116,15 @@ button.danger { background: var(--bad); }
 .checks { list-style: none; margin: 0; padding: 0; }
 .checks li { padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
 .checks li:last-child { border-bottom: 0; }
+summary { color: var(--brand); font-weight: 600; cursor: pointer; }
 .checks .wait strong, .checks .wait { color: var(--info); }
 .checks .block strong, .checks .block { color: var(--bad); }
 
-.scroll { overflow-x: auto; }
+.scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
 table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--ink); border-bottom: 2px solid var(--brand); }
+tr:last-child td { border-bottom: 0; }
 td.data { font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; min-width: 14rem; }
 .mono { font-family: ui-monospace, Consolas, monospace; }
 
