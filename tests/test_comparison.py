@@ -164,6 +164,17 @@ def test_the_provider_rate_is_marked_up_over_the_market_by_what_it_costs_extra(c
     assert result.markup_pct == Decimal("2.04")  # KES 1,224,489.80 paid against a fair KES 1,200,000.00
 
 
+def test_the_market_rate_is_given_as_the_price_of_one_unit_of_what_arrives(conn, exchange_api):
+    # Bug caught: the rate shown the wrong way round, "1 KES = 200 GBP", or missing when the market rate is known.
+    result = compare(conn, provider_at("0.0049"), exchange_api, mid=0.005)
+    assert result.market_rate == "1 GBP = 200.00 KES"
+
+
+def test_without_the_market_rate_there_is_no_market_rate_to_show(conn, exchange_api):
+    # Bug caught: a made-up market rate shown when the rate service is down.
+    assert compare(conn, provider_at("0.0049"), exchange_api, mid=None).market_rate is None
+
+
 def test_a_provider_cheaper_than_the_market_has_a_negative_markup_and_its_line_shows_no_minus(conn, exchange_api):
     # Bug caught: a minus sign in the line a person reads, such as "KES -24,000 less than a bank wire".
     result = compare(conn, provider_at("0.0051"), exchange_api, mid=0.005)

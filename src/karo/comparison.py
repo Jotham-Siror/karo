@@ -43,6 +43,8 @@ class Comparison:
     # How far above the market rate the provider's rate is, in percent to 2 places. Negative if it is below.
     # None when no market rate could be had.
     markup_pct: Decimal | None
+    # What one unit of the target costs at the market rate, like "1 GBP = 172.41 KES". None with no market rate.
+    market_rate: str | None
 
 
 def compare(
@@ -56,14 +58,23 @@ def compare(
 
     if mid is None:
         # With no market rate the examples are priced off the provider's own cost, so they still give a sense of scale.
-        fair, markup = quote.source.decimal, None
+        fair, markup, market_rate = quote.source.decimal, None, None
     else:
         fair = target.decimal / mid
         markup = ((quote.source.decimal / fair - 1) * 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
+        market_rate = _market_rate_text(mid, source, target.currency)
 
     examples = _examples(fair, target, source)
     simulated = payout_name(provider) == "standin"
-    return Comparison((pick, *examples), pick, _line(pick, examples, markup, simulated), quote.id, markup)
+    line = _line(pick, examples, markup, simulated)
+    return Comparison((pick, *examples), pick, line, quote.id, markup, market_rate)
+
+
+def _market_rate_text(mid: Decimal, source: str, target_currency: str) -> str:
+    """`mid` is target units per source unit; people think in what one unit of the target costs."""
+    price = Decimal(1) / mid
+    places = Decimal("0.01") if price >= 1 else Decimal("0.0001")
+    return f"1 {target_currency} = {price.quantize(places, ROUND_HALF_UP):,} {source}"
 
 
 def _label(provider_name: str) -> str:

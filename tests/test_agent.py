@@ -571,7 +571,6 @@ def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can
         "Cheapest way: you pay KES 1,038,063 and GBP 6,000 arrives in about a day, KES 41,299 less than a bank wire. "
         "(Test payment, simulated, no real money.)"
     )
-    assert "rate_source" not in result
     assert [(o["name"], o["is_example"]) for o in result["options"]] == [
         ("Test payment (simulated, no real money)", False),
         ("Bank wire (example)", True),
@@ -591,18 +590,23 @@ def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can
     assert "http" not in json.dumps(result)
 
 
-def test_the_result_carries_no_attribution_because_the_line_makes_no_market_rate_claim(conn, provider, exchange_api):
-    # Bug caught: handing the AI an attribution for a market-rate sentence the line no longer contains.
+def test_the_result_keeps_the_market_rate_the_markup_and_the_source_for_when_asked_about_the_rate(
+    conn, provider, exchange_api
+):
+    # Bug caught: "is that a good rate?" unanswerable, because the result dropped the market rate and its source.
     exchange_api.get(KES_RATES).respond(json=rates_payload(GBP=0.0058))
     result = compare_routes(conn, provider, recorded_fee(conn, provider))
-    assert "rate_source" not in result and "market rate" not in result["line"]
+    assert result["market_rate"] == "1 GBP = 172.41 KES"
+    assert result["markup_pct"] == "0.35"
+    assert result["rate_source"] == "Rates by Exchange Rate API"
+    assert "market rate" not in result["line"]
 
 
 def test_with_no_market_rate_the_result_has_no_markup_and_no_attribution(conn, provider, exchange_api):
     # Bug caught: telling the AI to cite a market rate that was never available.
     exchange_api.get(KES_RATES).mock(side_effect=[httpx.ConnectError("offline")])
     result = compare_routes(conn, provider, recorded_fee(conn, provider))
-    assert "rate_source" not in result
+    assert not {"rate_source", "markup_pct", "market_rate"} & set(result)
     assert "market rate" not in result["line"] and "Exchange Rate API" not in result["line"]
     assert result["quote_id"].startswith("q_")
 
@@ -1154,6 +1158,13 @@ def test_the_students_freeze_item_tells_them_to_reply_freeze(conn):
 def test_no_prompt_tells_anyone_to_reply_stop(conn, member):
     # Bug caught: a person told to reply STOP, which the Twilio sandbox treats as an unsubscribe from Karo.
     assert "STOP" not in prompt_for(conn, member)
+
+
+def test_the_main_payers_prompt_answers_a_question_about_the_rate_with_the_markup_and_the_source(conn):
+    # Bug caught: "is that a good rate?" answered from memory, with no markup figure and no source named.
+    main = prompt_for(conn, "m_amina")
+    assert "If asked about the rate, give the markup_pct over the market_rate and name the rate_source" in main
+    assert "rate_source" not in prompt_for(conn, "m_baraka") and "rate_source" not in prompt_for(conn, "m_jabali")
 
 
 def test_the_main_payers_fee_step_says_the_invoice_can_come_as_a_file_or_photo(conn):

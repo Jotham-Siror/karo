@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rules, store
+from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -360,7 +360,7 @@ def _compare_routes(ctx: ToolContext, args: dict) -> dict:
         )
     except ValueError as exc:  # the provider has no price for this pair of currencies
         raise _BadInput(str(exc)) from exc
-    return {
+    result = {
         "quote_id": found.quote_id,
         "line": found.line,
         "options": [
@@ -374,6 +374,12 @@ def _compare_routes(ctx: ToolContext, args: dict) -> dict:
             for o in found.options
         ],
     }
+    if found.markup_pct is not None:
+        # The line stays short; these answer "is that a good rate?". A negative markup_pct means below the market.
+        result["market_rate"] = found.market_rate
+        result["markup_pct"] = str(found.markup_pct)
+        result["rate_source"] = rates.ATTRIBUTION
+    return result
 
 
 def _propose_fee_payment(ctx: ToolContext, args: dict) -> dict:
