@@ -2,7 +2,7 @@
 
 Team Fedha: Maela Mouto, Jotham Siror, May Jelimo (Strathmore University, Nairobi). Product: Karo.
 2026 Shenzhen FinTechathon, International Track, Topic C (cross-border and student finance).
-State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests. After that tag, commit `77cbb9b` added a Payaza adapter that is switched off (section 8), and the fixes listed in section 5.3 of the security self-assessment changed the code on branch `build` (newest commit `987f84d`). This document describes the code with those fixes; where one changed a statement, the statement names it.
+State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests. After that tag, commit `77cbb9b` added a Payaza adapter that is switched off (section 8), and the fixes listed in section 5.3 of the security self-assessment, committed on 20 October before the 23:59 Beijing deadline, changed the code on branch `build` (newest commit `987f84d`). This document describes the code with those fixes; where one changed a statement, the statement names it.
 
 ---
 

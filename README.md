@@ -15,7 +15,7 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 
 ## After submission
 
-The `submission-v2` tag is the state that was submitted. A review of the whole branch the same day found no critical issue. Commits made after the tag carry the fixes for what it did find, listed in section 5.3 of the [security self-assessment](docs/security-self-assessment.md):
+The `submission-v2` tag is the state that was submitted. A review of the whole branch the same day found no critical issue. Commits made after the tag, all on 20 October between 17:03 and 17:41 Nairobi time, before the 23:59 Beijing deadline, carry the fixes for what it did find, listed in section 5.3 of the [security self-assessment](docs/security-self-assessment.md):
 
 - A pending payment link is checked with the provider every 10 minutes, so a lost notice still credits the share.
 - A confirmed request that never reached a payout is run again after 2 minutes.

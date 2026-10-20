@@ -265,7 +265,7 @@ Writing this report included a fresh review of the whole code base against the j
 
 ### 5.3 Third check: whole-branch review after submission, 20 October
 
-After the submission, four reviewers each read one area of the whole branch (money, the AI boundary, the doors and web, the providers), starting from the open items in the build ledger. One orchestrator checked every Important finding against the code. There were no Critical findings: nobody found a way to double a payout, pay without the rules, bypass the PIN, reach another family, or put a confirm link, PIN or key in front of the AI. The verdict was that the submitted state is sound. The Important findings were fixed on branch `build`, each with tests that fail without the fix. The two things not fixed were decided on purpose and are listed in the table.
+After the submission was sent, and still before the deadline (23:59 Beijing time, 18:59 Nairobi; the fixes below were committed between 17:03 and 17:41 Nairobi), four reviewers each read one area of the whole branch (money, the AI boundary, the doors and web, the providers), starting from the open items in the build ledger. One orchestrator checked every Important finding against the code. There were no Critical findings: nobody found a way to double a payout, pay without the rules, bypass the PIN, reach another family, or put a confirm link, PIN or key in front of the AI. The verdict was that the submitted state is sound. The Important findings were fixed on branch `build`, each with tests that fail without the fix. The two things not fixed were decided on purpose and are listed in the table.
 
 | # | Finding | Status | How it was fixed or why it was kept | Commit | Tests |
 | --- | --- | --- | --- | --- | --- |
