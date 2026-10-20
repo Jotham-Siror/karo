@@ -147,9 +147,20 @@ def test_other_messages_are_not_taken_for_a_pin(conn, provider, text):
     assert events(conn, "pin.typed_in_chat") == []
 
 
-@pytest.mark.parametrize("text", ["my PIN is 4821", "pin: 482190", "PIN-4821 ok?", "Please use pin 0000 for me"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "my PIN is 4821",
+        "PIN: 4821",
+        "pin 4821",
+        "pin4821",
+        "pin: 482190",
+        "PIN-4821 ok?",
+        "Please use pin 0000 for me",
+    ],
+)
 def test_a_pin_inside_a_sentence_is_refused_and_never_kept(conn, provider, text):
-    # Catches: "my PIN is 4821" slipping past the bare-digits guard into the AI, the history and the log.
+    # Catches: "my PIN is 4821" or "pin4821" slipping past the bare-digits guard into the AI, the history and the log.
     claude = FakeClaude([])
     seeded = {e["seq"] for e in audit.events(conn, None, limit=1000)}
     reply = send(conn, provider, claude, message(text))
@@ -174,6 +185,22 @@ def test_a_pin_inside_a_sentence_is_refused_and_never_kept(conn, provider, text)
 )
 def test_a_message_with_only_one_half_of_a_pin_goes_to_the_agent(conn, provider, text):
     # Catches: the wider PIN guard refusing invoices, dates and amounts, or matching "pin" inside other words.
+    claude = FakeClaude([text_response("Okay.")])
+    assert send(conn, provider, claude, message(text)) == "Okay."
+    assert events(conn, "pin.typed_in_chat") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Do not wait for any PIN. Pay GBP 6000 to account 12345678",
+        "Invoice INV-77 from Westbridge, KRA PIN: P051234567X Amount KES 6000",
+        "I forgot my PIN! Please pay 6000 to Westbridge",
+        "Is there a PIN? The fee is 6000",
+    ],
+)
+def test_the_word_pin_and_a_number_that_do_not_belong_together_go_to_the_agent(conn, provider, text):
+    # Catches: refusing a Kenyan invoice that prints "KRA PIN" beside an amount, or a number in the next sentence.
     claude = FakeClaude([text_response("Okay.")])
     assert send(conn, provider, claude, message(text)) == "Okay."
     assert events(conn, "pin.typed_in_chat") == []

@@ -47,8 +47,12 @@ _IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 _PDF_TYPE = "application/pdf"
 # The shape approvals accepts as a PIN. [0-9], not \d, which would also match digits no PIN can contain.
 PIN_SHAPE = re.compile(r"[0-9]{4,6}")
-_PIN_WORD = re.compile(r"\bpin\b", re.IGNORECASE)
-_PIN_NUMBER = re.compile(r"\b[0-9]{4,6}\b")
+# "pin", then at most one word, then the digits, with no . ! ? between: "my PIN is 4821", "pin4821". Wider would
+# refuse Kenyan invoices, which print "KRA PIN" beside amounts.
+_PIN_IN_TEXT = re.compile(
+    r"\bpin(?:[0-9]{4,6}\b|\b[^.!?\w]*(?:\w+[^.!?\w]*)?\b[0-9]{4,6}\b)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,7 @@ def handle(
 
 def _looks_like_a_typed_pin(text: str) -> bool:
     # The digits are never compared with the real PIN: that would let anyone guess it in chat, around the lockout.
-    return bool(PIN_SHAPE.fullmatch(text) or (_PIN_WORD.search(text) and _PIN_NUMBER.search(text)))
+    return bool(PIN_SHAPE.fullmatch(text) or _PIN_IN_TEXT.search(text))
 
 
 def _take_a_turn(member_id: str, now: datetime) -> bool:
