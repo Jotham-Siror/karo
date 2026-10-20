@@ -7,10 +7,10 @@ import pytest
 from karo import countries
 
 
-def test_the_default_settings_hold_kenya_uganda_and_britain():
+def test_the_default_settings_hold_kenya_uganda_britain_and_cameroon():
     # Bug caught: a country dropped from, or misspelt in, config/countries.json.
     loaded = countries.load()
-    assert set(loaded) == {"KE", "UG", "GB"}
+    assert set(loaded) == {"KE", "UG", "GB", "CM"}
     assert (loaded["KE"].currency, loaded["KE"].timezone) == ("KES", "Africa/Nairobi")
     assert (loaded["UG"].currency, loaded["UG"].timezone) == ("UGX", "Africa/Kampala")
     assert (loaded["GB"].currency, loaded["GB"].timezone) == ("GBP", "Europe/London")
@@ -117,3 +117,48 @@ def test_westbridge_details_are_the_ones_the_rules_tests_trust():
     westbridge = next(e for e in countries.institutions() if e["name"] == "University of Westbridge")
     assert (westbridge["country"], westbridge["currency"]) == ("GB", "GBP")
     assert (westbridge["sort_code"], westbridge["account_number"]) == ("20-40-60", "41234567")
+
+
+def test_cameroon_is_sendable_from_settings_alone():
+    # Bug caught: Cameroon needing code (a currency or phone region written in Python) instead of a settings entry.
+    cameroon = countries.get("CM")
+    assert (cameroon.name, cameroon.currency) == ("Cameroon", "XAF")
+    assert (cameroon.phone_region, cameroon.timezone) == ("CM", "Africa/Douala")
+    assert cameroon.payout_fields == ("phone",)
+    assert [(m.id, m.label) for m in cameroon.payout_methods] == [
+        ("mtn_cm", "MTN Mobile Money"),
+        ("orange_cm", "Orange Money"),
+    ]
+
+
+def test_payout_methods_differ_by_country():
+    # Bug caught: offering M-Pesa for a bank in Britain, or a bank transfer where only mobile money works.
+    assert [m.id for m in countries.get("KE").payout_methods] == ["mpesa"]
+    assert [m.id for m in countries.get("UG").payout_methods] == ["mtn_ug", "airtel_ug"]
+    assert [m.id for m in countries.get("GB").payout_methods] == ["bank"]
+
+
+def test_a_country_with_no_payout_methods_listed_still_loads(tmp_path):
+    # Bug caught: the new payout list being required, so every older settings file stops loading.
+    path = tmp_path / "countries.json"
+    path.write_text(
+        json.dumps(
+            {
+                "TZ": {
+                    "name": "Tanzania",
+                    "currency": "TZS",
+                    "timezone": "Africa/Dar_es_Salaam",
+                    "phone_region": "TZ",
+                    "collect_methods": [],
+                    "payout_fields": ["phone"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert countries.load(path)["TZ"].payout_methods == ()
+
+
+def test_a_cameroon_number_is_normalised_to_e164():
+    # Bug caught: a Cameroon number being read with another country's dialling code.
+    assert countries.normalise_phone("6 71 23 45 67", "CM") == "+237671234567"

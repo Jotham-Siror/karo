@@ -108,6 +108,15 @@ def test_the_shipped_rates_load_from_config():
     assert loaded.quote("GBP", Money.parse("1000.00", "KES")).rate == Decimal("173")
 
 
+def test_the_shipped_rates_price_a_send_to_cameroon_from_kenya_and_britain():
+    # Bug caught: no stand-in rate into XAF, so a send to Cameroon is refused before it can be priced.
+    loaded = StandInProvider.from_config(SECRET, BASE_URL)
+    from_kenya = loaded.quote("KES", Money.parse("5000", "XAF"))
+    assert (from_kenya.rate, from_kenya.source) == (Decimal("4.34"), Money(115208, "KES"))  # 1152.07.. rounded up
+    from_britain = loaded.quote("GBP", Money.parse("7500", "XAF"))
+    assert (from_britain.rate, from_britain.source) == (Decimal("750"), Money(1000, "GBP"))
+
+
 def test_rates_load_from_a_given_path(tmp_path):
     # Bug caught: the path argument ignored, so a test or demo cannot use its own rates.
     path = tmp_path / "rates.json"

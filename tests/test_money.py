@@ -48,3 +48,11 @@ def test_decimal_value_and_format_follow_the_currency():
     assert Money(600_000, "GBP").decimal == Decimal("6000.00")
     assert Money(600_000, "GBP").format("en_GB") == "£6,000.00"
     assert "." not in Money(1500, "UGX").format("en_UG")
+
+
+def test_xaf_has_no_decimal_places():
+    # Bug caught: assuming two decimals would store XAF 5,000 as 500,000 and send a hundred times too much.
+    assert Money.parse("5000", "XAF").minor == 5000
+    assert str(Money.parse("5000", "XAF")) == "XAF 5,000"
+    with pytest.raises(ValueError):
+        Money.parse("5000.50", "XAF")

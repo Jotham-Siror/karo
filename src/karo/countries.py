@@ -20,6 +20,14 @@ class CollectMethod:
 
 
 @dataclass(frozen=True)
+class PayoutMethod:
+    """A way to send money into a country, such as mobile money or a bank account."""
+
+    id: str
+    label: str
+
+
+@dataclass(frozen=True)
 class Country:
     name: str
     currency: str
@@ -27,6 +35,7 @@ class Country:
     phone_region: str
     collect_methods: tuple[CollectMethod, ...]
     payout_fields: tuple[str, ...]
+    payout_methods: tuple[PayoutMethod, ...] = ()
 
 
 def load(path: str | Path | None = None) -> dict[str, Country]:
@@ -42,6 +51,7 @@ def load(path: str | Path | None = None) -> dict[str, Country]:
                 CollectMethod(m["id"], m["label"], m["flutterwave_option"]) for m in entry["collect_methods"]
             ),
             payout_fields=tuple(entry["payout_fields"]),
+            payout_methods=tuple(PayoutMethod(m["id"], m["label"]) for m in entry.get("payout_methods", [])),
         )
         for code, entry in raw.items()
     }

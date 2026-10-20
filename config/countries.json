@@ -8,7 +8,10 @@
       {"id": "mpesa", "label": "M-Pesa", "flutterwave_option": "mpesa"},
       {"id": "card", "label": "Card", "flutterwave_option": "card"}
     ],
-    "payout_fields": ["phone"]
+    "payout_fields": ["phone"],
+    "payout_methods": [
+      {"id": "mpesa", "label": "M-Pesa"}
+    ]
   },
   "UG": {
     "name": "Uganda",
@@ -19,7 +22,11 @@
       {"id": "mtn_ug", "label": "MTN Mobile Money", "flutterwave_option": "mobilemoneyuganda"},
       {"id": "card", "label": "Card", "flutterwave_option": "card"}
     ],
-    "payout_fields": ["phone"]
+    "payout_fields": ["phone"],
+    "payout_methods": [
+      {"id": "mtn_ug", "label": "MTN Mobile Money"},
+      {"id": "airtel_ug", "label": "Airtel Money"}
+    ]
   },
   "GB": {
     "name": "United Kingdom",
@@ -29,6 +36,21 @@
     "collect_methods": [
       {"id": "card", "label": "Card", "flutterwave_option": "card"}
     ],
-    "payout_fields": ["sort_code", "account_number"]
+    "payout_fields": ["sort_code", "account_number"],
+    "payout_methods": [
+      {"id": "bank", "label": "Bank transfer"}
+    ]
+  },
+  "CM": {
+    "name": "Cameroon",
+    "currency": "XAF",
+    "timezone": "Africa/Douala",
+    "phone_region": "CM",
+    "collect_methods": [],
+    "payout_fields": ["phone"],
+    "payout_methods": [
+      {"id": "mtn_cm", "label": "MTN Mobile Money"},
+      {"id": "orange_cm", "label": "Orange Money"}
+    ]
   }
 }
