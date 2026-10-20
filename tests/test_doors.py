@@ -127,7 +127,7 @@ def test_an_unknown_sender_gets_a_plain_refusal_and_no_agent_call(conn, provider
     assert claude.requests == []
 
 
-@pytest.mark.parametrize("word", ["stop", "FREEZE", "  Simamisha \n"])
+@pytest.mark.parametrize("word", ["stop", "FREEZE", "  Simamisha \n", "STOP!", "Freeze.", "stop!!"])
 def test_a_freeze_word_freezes_without_the_agent(conn, provider, word):
     # Catches: the emergency stop going through the AI, which is slow and could be talked out of it.
     claude = FakeClaude([])

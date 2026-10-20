@@ -13,6 +13,19 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 - **Technical documentation:** [docs/technical-documentation.md](docs/technical-documentation.md)
 - **Security self-assessment:** [docs/security-self-assessment.md](docs/security-self-assessment.md)
 
+## After submission
+
+The `submission-v2` tag is the state that was submitted. A review of the whole branch the same day found no critical issue. Commits made after the tag carry the fixes for what it did find, listed in section 5.3 of the [security self-assessment](docs/security-self-assessment.md):
+
+- A pending payment link is checked with the provider every 10 minutes, so a lost notice still credits the share.
+- A confirmed request that never reached a payout is run again after 2 minutes.
+- A share is reminded at most once a day, including when the AI asks.
+- The monthly allowance's check and proposal happen in one transaction.
+- An invoice is filed under the trusted payee's stored name, and the chat links only Karo's own pages.
+- A bare number in chat is refused as a PIN only while a confirm link is live, and "STOP!" freezes.
+- Forged provider notices are collapsed to one audit row a minute.
+- A Flutterwave payout with a lost first answer is looked up by reference, and two Payaza (off) mappings are fixed.
+
 ## How a money move works
 
 1. **Propose.** Claude reads the chat or the invoice and calls a *propose* tool. It has no tool that pays, approves, unfreezes, changes limits or edits the trusted payee list.
@@ -30,7 +43,7 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 | AI agent | Real: Claude, `claude-opus-5-5` |
 | Relatives paying their share, in the app | Simulated on the stand-in provider. Its checkout page says "simulated, no real money" |
 | Flutterwave test mode | Built into the app as an option (`KARO_PROVIDER=flutterwave`: Flutterwave collects the shares, the stand-in pays out). Proven against Flutterwave by `scripts/smoke_flutterwave.py`: hosted payment links for M-Pesa (KES) and MTN Uganda (UGX), and an M-Pesa test charge confirmed by Flutterwave. Test mode moves no real money |
-| Payaza adapter | Ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`). Not yet run against Payaza from Karo. KES, UGX and XAF collections and payouts need Payaza to enable them for the account. Added after the `submission-v2` tag |
+| Payaza adapter | Ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`). Not yet run against Payaza from Karo. KES, UGX and XAF collections and payouts need Payaza to enable them for the account. Two wrong mappings found in review are fixed; one gap is left (the M-Pesa prompt is sent before the collection row is stored), so it stays off. Added after the `submission-v2` tag |
 | Paying the UK university, sending money abroad, the allowance | Simulated on the stand-in. Every receipt says so. Flutterwave refuses transfers for our test account |
 | Mid-market exchange rate | Real, from open.er-api.com |
 | Provider exchange quote | Simulated (stand-in rates), labelled on screen |
@@ -79,7 +92,7 @@ Run **one** uvicorn worker. The scheduler and some locks live inside the process
 uv run pytest
 ```
 
-Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submission-v2`). With the switched-off Payaza adapter and its 65 tests added after that tag (commit `77cbb9b`): **1,280 passed**. The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
+Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submission-v2`). With the switched-off Payaza adapter and its 65 tests added after that tag (commit `77cbb9b`): **1,280 passed**. With the fixes listed under "After submission" (branch `build`, commit `987f84d`): **1,317 passed**. The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
 
 | File | What it checks |
 | --- | --- |
@@ -114,7 +127,7 @@ Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submi
 
 ### End-to-end check with the real Claude
 
-With the app running, this drives the 10 demo scenes through the web page in short casual messages, with the invoices sent as PDFs, and prints PASS or FAIL per scene. It uses the real Claude API, so it costs API credit. It also resets the demo, so never aim it at a demo you want to keep. On the submitted code it passed all ten.
+With the app running, this drives the 10 demo scenes through the web page in short casual messages, with the invoices sent as PDFs, and prints PASS or FAIL per scene. It uses the real Claude API, so it costs API credit. It also resets the demo, so never aim it at a demo you want to keep. On the submitted code it passed all ten, and it passed all ten again on the fixed code at `987f84d`.
 
 ```bash
 uv run python scripts/e2e_web_check.py http://localhost:8000

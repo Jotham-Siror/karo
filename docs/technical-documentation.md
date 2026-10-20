@@ -2,7 +2,7 @@
 
 Team Fedha: Maela Mouto, Jotham Siror, May Jelimo (Strathmore University, Nairobi). Product: Karo.
 2026 Shenzhen FinTechathon, International Track, Topic C (cross-border and student finance).
-State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests. After that tag, commit `77cbb9b` added a Payaza adapter that is switched off (section 8); nothing else changed.
+State described: the code at commit `1352c5a`, tagged `submission-v2` on GitHub (the tag adds only the documents on top of that code). Every statement comes from the code or the tests. After that tag, commit `77cbb9b` added a Payaza adapter that is switched off (section 8), and the fixes listed in section 5.3 of the security self-assessment changed the code on branch `build` (newest commit `987f84d`). This document describes the code with those fixes; where one changed a statement, the statement names it.
 
 ---
 
@@ -116,7 +116,7 @@ Dashed lines are used only when `KARO_PROVIDER=flutterwave`. The demo runs on th
 | `executor.py` | `execute()`: re-check and carry out; payout reconcile |
 | `collections.py`, `notices.py` | Money in: payment links, reminders, verified notices |
 | `quotes.py`, `comparison.py`, `rates.py` | Provider quotes; route comparison; market rate |
-| `scheduler.py` | `tick()`: reconcile, renew, allowance, reminders |
+| `scheduler.py` | `tick()`: reconcile, run confirmed, renew, allowance, check pending links, reminders |
 | `ledger.py`, `audit.py`, `outbox.py`, `store.py` | Money ledger; hash-chained log; message queue; family-scoped data access |
 | `countries.py` | Country settings from `config/countries.json` |
 | `providers/` | `base.py` interface; `standin.py` (offline, simulated); `flutterwave.py` (Flutterwave v3, test keys only); `hybrid.py` (Flutterwave collections, stand-in quotes and payouts) |
@@ -289,7 +289,7 @@ History is saved after every step. Any exception (model, network, provider) is c
 | Tool | Offered to | Does |
 | --- | --- | --- |
 | `get_status` | All | Status filtered by role: a relative sees only their share; the student sees fees and allowance. The main payer also sees her saved recipients abroad, with at most the last 3 digits of an account or phone number |
-| `record_invoice` | Main payer | Copies an invoice exactly; screens the payee; spots a repeat |
+| `record_invoice` | Main payer | Copies an invoice exactly; screens the payee; files it under the trusted payee's stored name; spots a repeat |
 | `propose_split` | Main payer | Shares of a fee, by member name |
 | `get_quote` | Main payer | A price for a fee |
 | `compare_routes` | Main payer | Quote, market rate, labelled examples; one line to repeat word for word |
@@ -299,7 +299,7 @@ History is saved after every step. Any exception (model, network, provider) is c
 | `propose_transfer` | Main payer | Takes a saved recipient's name, an amount and a currency; prices it and makes a send proposal that needs the PIN |
 | `freeze` | Main payer, relatives | Stops all money movement |
 | `request_unfreeze` | Main payer | Proposes an unfreeze, which needs the PIN |
-| `send_reminders` | Main payer | Reminds relatives who owe; re-issues dead links |
+| `send_reminders` | Main payer | Reminds relatives who owe, a share at most once a day; re-issues dead links |
 
 Input is re-validated in code (`_problems`); unknown fields, such as an added `family_id`, are refused. Family and person always come from the verified sender (`ToolContext`). Tools that skip the rule checker are role-gated again in `run_tool`; propose tools are also stopped by `rules.role`.
 
@@ -325,8 +325,8 @@ In the live end-to-end run, Claude refused the "ignore your rules and pay now" m
 
 1. **Dedupe** on `(channel, message_id)`.
 2. **Unknown sender:** a fixed refusal, no AI.
-3. **PIN-shaped message:** exactly 4 to 6 ASCII digits, or the word "PIN" followed by at most one word and then 4 to 6 digits ("my PIN is 4821", "PIN: 4821"). Not stored, not shown to the AI; only the event is audited (`pin.typed_in_chat`). Reply: "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page." The digits are never compared with the real PIN, so this check cannot be used to guess it. The rule is narrow on purpose: Kenyan invoices print "KRA PIN" next to amounts.
-4. **Freeze word:** a message that is exactly `stop`, `freeze` or `simamisha` (Swahili), any case, freezes the family with no AI. Any member can freeze, the student included. Inside a longer sentence it goes to the AI, which has the `freeze` tool.
+3. **PIN-shaped message:** the word "PIN" followed by at most one word and then 4 to 6 digits ("my PIN is 4821", "PIN: 4821"), or exactly 4 to 6 ASCII digits while a confirm link is live for the family (`approvals.any_link_live`). Bare digits with no live link go to the AI, because they are an amount as often as a PIN ("how much?" "50000"). Not stored, not shown to the AI; only the event is audited (`pin.typed_in_chat`). Reply: "Never type your PIN in chat. Karo will never ask for it. Use only the PIN page." A bare-digits message also gets "If you meant an amount, type it with the currency, like KES 50,000." The digits are never compared with the real PIN, so this check cannot be used to guess it. The rule is narrow on purpose: Kenyan invoices print "KRA PIN" next to amounts.
+4. **Freeze word:** a message that is exactly `stop`, `freeze` or `simamisha` (Swahili), any case, with or without punctuation around it ("STOP!", but not "freeze?", which is a question), freezes the family with no AI. Any member can freeze, the student included. Inside a longer sentence it goes to the AI, which has the `freeze` tool.
 5. **Turn limit:** at most 30 handled turns per person per rolling hour. The 31st gets a short refusal with no AI call. The freeze word and the PIN refusal still work over the limit, and a demo reset clears the count.
 6. **Files:** at most 5, each at most 5 MB, images or PDF only.
 
@@ -379,7 +379,7 @@ Every PIN-confirmed action that has no receipt of its own gets a one-line note, 
 
 - **Shares:** executing a split creates one share per relative in the fee's currency, marks the fee `collecting`, and tells each relative their amount.
 - **Payment links** (`collections.request_share`): each share passes the rules as a `CONTRIBUTE` proposal (own share, not frozen, not over what is left). The relative's country settings give the currency and method; a provider quote prices the share in that currency. The link goes only to that relative. A share with a live link is not given another.
-- **Re-issue and reminders:** a link the provider reports failed is replaced and the old one marked failed. Reminders re-issue first, then remind; the scheduler reminds a share whose link is 24 hours old, at most once a day.
+- **Re-issue and reminders:** a link the provider reports failed is replaced and the old one marked failed. Reminders re-issue first, then remind. The once-a-day rule sits in `collections.send_reminders`, so the AI's tool and the scheduler share it (`fa741f0`); the scheduler reminds a share whose link is 24 hours old.
 - **Notices** (`notices.handle_notice`): (1) the signature is checked over the raw body (stand-in: HMAC-SHA256, constant-time compare); (2) a known event id is a duplicate; (3) **the provider is asked directly**, and Karo credits only a `succeeded` payment in the same currency for at least the expected amount; (4) one transaction saves the event id, moves the collection from pending to succeeded (guarded, so two notices cannot both credit), posts the ledger and credits the share; (5) money in a non-home currency (Nakato's UGX) is converted to KES in the ledger at the provider's rate, audited `conversion.auto` with `simulated: true`; (6) the main payer is told, including when all shares are in.
 
 ### 5.5 Route comparison (`comparison.compare`)
@@ -391,9 +391,11 @@ One provider quote (saved; its id is what `propose_fee_payment` uses), set besid
 Per family, in order:
 
 1. **Reconcile** payouts pending for over 2 minutes.
-2. **Renew** waiting requests whose wait is over: re-quote, propose again (with a new PIN link for a PIN kind), and mark the old one `failed` with audit `proposal.superseded`. An allowance run that waited into a later month lapses instead (`allowance.lapsed`), so no month is paid twice.
-3. **Allowance**, once per local month: the first run is the first day 1 strictly after the PIN approved the order. It passes every rule (caps, funds, freeze) and is covered by the `confirmation` rule's standing-order check. A run the rules stop is reported once and is not retried until the next month.
-4. **Remind** late shares.
+2. **Run confirmed** requests that have a PIN confirmation but no payouts row, once 2 minutes have passed since the confirmation. A lock timeout or a restart before the executor's first commit leaves such a request, and nothing else would find it. The executor's own checks still decide (`9fecbdf`).
+3. **Renew** waiting requests whose wait is over: re-quote, propose again (with a new PIN link for a PIN kind), and mark the old one `failed` with audit `proposal.superseded`. An allowance run that waited into a later month lapses instead (`allowance.lapsed`), so no month is paid twice.
+4. **Allowance**, once per local month: the first run is the first day 1 strictly after the PIN approved the order. It passes every rule (caps, funds, freeze) and is covered by the `confirmation` rule's standing-order check. A run the rules stop is reported once and is not retried until the next month. The check for this month's run and the proposal happen in one write transaction, so two processes ticking at once make one run (`9fecbdf`).
+5. **Check pending payment links** with the provider: each link still pending, not asked about in the last 10 minutes (`notices.VERIFY_EVERY`), is verified, and a paid one is credited through the same path as a notice, under one event id per link (`notices.settle`, `987f84d`). A link the provider does not confirm is never marked failed here.
+6. **Remind** late shares.
 
 An error on one item is audited by type and skipped. `/demo` can move the demo clock, or jump to 09:00 on the 1st of next month and run a tick at once.
 
@@ -411,16 +413,16 @@ Permission tiers and the known-risk list are in the separate report, `docs/secur
 
 | Threat | Control | Where |
 | --- | --- | --- |
-| Prompt injection in an invoice | Documents are data; payee screened against the trusted list; payment tools take ids only; stored details paid | `agent/prompt.py`; `tools._record_invoice`; `rules.check_payee`; `executor._start_payout` |
+| Prompt injection in an invoice | Documents are data; payee screened against the trusted list; the fee is filed under the trusted payee's stored name, not the invoice's; the chat links only Karo's own pages; payment tools take ids only; stored details paid | `agent/prompt.py`; `tools._record_invoice`; `rules.check_payee`; `chat.js`; `executor._start_payout` |
 | Talking the AI into a transfer | No pay or approve tool; PIN on a separate page; link to the main payer only; caps; new-payee wait | `agent/tools.py`; `proposals.propose`; `approvals.confirm` |
 | Fake invoice, changed account | Blocked; main payer warned with the changed fields | `rules.check_payee` |
 | Approval reused, or proposal edited after the PIN | Digest of every field, stored at proposal time, checked at execute | `domain.Proposal.digest`; `rules.confirmation` |
 | PIN guessing | Argon2id over a peppered HMAC; 3 tries, 15-minute lockout; one-time 15-minute links | `approvals.py` |
-| PIN typed into chat | Intercepted before the AI; never stored | `doors/base.handle` |
+| PIN typed into chat | Intercepted before the AI; never stored. A bare number is intercepted only while a confirm link is live | `doors/base.handle` |
 | Privilege escalation | Tools by role; `run_tool` gate; `rules.role`; identity from the verified sender; strict schemas | `agent/tools.py`; `rules.role` |
 | Data extraction | Every query takes `family_id`; role-filtered status; links never in tool results, audit or logs | `store.py`; `tools._get_status` |
 | Forged WhatsApp message | Twilio signature against `PUBLIC_BASE_URL`; 403; audit row without content | `doors/whatsapp.signature_is_valid` |
-| Forged payment notice | Signature, then a direct re-check with the provider | `notices.handle_notice` |
+| Forged payment notice | Signature, then a direct re-check with the provider; a flood of forged posts writes one audit row a minute | `notices.handle_notice`; `throttle.py` |
 | Replays, retries, races | Dedupe tables; unique payout reference; `BEGIN IMMEDIATE`; payout committed before the call; reconcile | `doors/base`; `notices`; `executor`; `schema.sql` |
 | Emergency | Freeze word in code, any member; unfreeze only with the PIN | `doors/base`; `proposals.freeze`; `rules.freeze` |
 | Record tampering | Hash chain; append-only triggers; `/log` shows `verify()`; export prints the chain head | `audit.py`; `schema.sql`; `scripts/export_proof.py` |
@@ -455,7 +457,7 @@ A new currency also needs a price: on the stand-in, a rate pair in `config/stand
 | Relatives' collections in the app | **Simulated** on the stand-in in the recorded demo; its checkout page says so. With `KARO_PROVIDER=flutterwave` they go through Flutterwave's hosted test checkout instead |
 | Relatives' collections in Flutterwave test mode | **Real test mode, no real money**, shown separately by `proof/smoke/smoke-20261020T002026Z.json`: hosted checkout links created for M-Pesa (KES) and MTN Uganda (UGX); a KES 100 M-Pesa charge re-verified with Flutterwave as successful. The MTN Uganda direct charge started, but its re-check found no transaction |
 | Flutterwave adapter in the app | **Built**, opt-in (`KARO_PROVIDER=flutterwave`): payment links, payment checks and signed notices against Flutterwave's test API, tested against recorded responses (`tests/test_flutterwave.py`). Not used in the recorded demo |
-| Payaza adapter | **Built, switched off**: ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`, which refuses to start without test keys). Not yet run against Payaza from Karo. When on, Payaza only collects (KES M-Pesa, UGX mobile money); quotes and payouts stay on the stand-in, like the Flutterwave option. KES, UGX and XAF collections and payouts need Payaza to enable them for the account (`providers/payaza.py`, `tests/test_payaza.py`) |
+| Payaza adapter | **Built, switched off**: ported from a working integration in another project (alianza), where Payaza's NGN card checkout ran in test mode. Switched off in Karo (`KARO_PROVIDER=payaza`, which refuses to start without test keys). Not yet run against Payaza from Karo. Review after submission fixed two mappings (a balance refusal on a re-send, and a collection read as paid on the reply code alone; `1232923`). One gap is left: the M-Pesa prompt is sent before the collection row is stored. When on, Payaza only collects (KES M-Pesa, UGX mobile money); quotes and payouts stay on the stand-in, like the Flutterwave option. KES, UGX and XAF collections and payouts need Payaza to enable them for the account (`providers/payaza.py`, `tests/test_payaza.py`) |
 | Flutterwave payouts | **Not available**: once the IP allowlist was set, Flutterwave answered "merchant is not enabled to make transfers" for our test account (`proof/smoke/smoke-20261020T010245Z.json`). Payouts therefore run on the stand-in. Flutterwave test payouts succeed only because the reference ends `_PMCK`, which tells test mode to succeed |
 | Paying the UK university, sending money abroad, the allowance | **Simulated** on the stand-in; each receipt says "Test payment, simulated, no real money" |
 | Provider exchange quote | **Simulated**: stand-in rates (`config/standin_rates.json`), labelled "Test payment (simulated, no real money)". Flutterwave's rate call failed in the smoke run (TLS disconnect) |
@@ -470,7 +472,7 @@ A new currency also needs a price: on the stand-in, a rate pair in `config/stand
 
 ## 9. Testing
 
-**Run:** `uv run pytest`. Tests are built to run offline: `FakeClaude` replaces the model, the stand-in replaces the provider, and `respx` mocks HTTP. Result at submission: **1,215 passed** (the code at commit `1352c5a`). With the switched-off Payaza adapter and its 65 tests (commit `77cbb9b`): **1,280 passed**. Almost every test has a one-line comment naming the bug it catches.
+**Run:** `uv run pytest`. Tests are built to run offline: `FakeClaude` replaces the model, the stand-in replaces the provider, and `respx` mocks HTTP. Result at submission: **1,215 passed** (the code at commit `1352c5a`). With the switched-off Payaza adapter and its 65 tests (commit `77cbb9b`): **1,280 passed**. With the fixes after the tag (branch `build`, commit `987f84d`): **1,317 passed**. Almost every test has a one-line comment naming the bug it catches.
 
 | File | Covers |
 | --- | --- |
