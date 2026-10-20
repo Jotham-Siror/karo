@@ -25,6 +25,8 @@ _ENV_NAMES = {
     "standin_secret": "KARO_STANDIN_SECRET",
     "flw_secret_key": "FLW_SECRET_KEY",
     "flw_webhook_hash": "FLW_WEBHOOK_HASH",
+    "payaza_public_key": "PAYAZA_PUBLIC_KEY",
+    "payaza_secret_key": "PAYAZA_SECRET_KEY",
     "demo_pin": "DEMO_PIN",
     "twilio_account_sid": "TWILIO_ACCOUNT_SID",
     "twilio_auth_token": "TWILIO_AUTH_TOKEN",
@@ -51,6 +53,8 @@ class Settings:
     # "flutterwave" sends payouts through Flutterwave. The default keeps them on the stand-in: the test account here
     # cannot make transfers.
     flw_payouts: str = "standin"
+    payaza_public_key: str | None = field(default=None, repr=False)
+    payaza_secret_key: str | None = field(default=None, repr=False)
     demo_pin: str | None = field(default=None, repr=False)
     twilio_account_sid: str | None = field(default=None, repr=False)
     twilio_auth_token: str | None = field(default=None, repr=False)
@@ -107,6 +111,8 @@ def load_settings(env_file: Path | None = ENV_FILE) -> Settings:
         flw_secret_key=read("FLW_SECRET_KEY"),
         flw_webhook_hash=read("FLW_WEBHOOK_HASH"),
         flw_payouts=read("KARO_FLW_PAYOUTS", defaults.flw_payouts),
+        payaza_public_key=read("PAYAZA_PUBLIC_KEY"),
+        payaza_secret_key=read("PAYAZA_SECRET_KEY"),
         demo_pin=read("DEMO_PIN"),
         twilio_account_sid=read("TWILIO_ACCOUNT_SID"),
         twilio_auth_token=read("TWILIO_AUTH_TOKEN"),

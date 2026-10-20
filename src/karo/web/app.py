@@ -37,6 +37,7 @@ from karo.domain import Member
 from karo.money import Money
 from karo.providers.base import Provider
 from karo.providers.hybrid import flutterwave_hybrid
+from karo.providers.payaza import payaza_hybrid
 from karo.providers.standin import StandInProvider
 
 logger = logging.getLogger(__name__)
@@ -712,6 +713,9 @@ def build_provider(settings: Settings) -> Provider:
             payouts=settings.flw_payouts,
             base_url=settings.public_base_url,
         )
+    if settings.provider == "payaza":
+        settings.require("payaza_public_key", "payaza_secret_key")
+        return payaza_hybrid(settings.payaza_public_key, settings.payaza_secret_key, base_url=settings.public_base_url)
     if settings.provider != "standin":
         raise RuntimeError(f"KARO_PROVIDER={settings.provider!r} is not available. Use 'standin' or 'flutterwave'.")
     settings.require("standin_secret")
