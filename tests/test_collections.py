@@ -3,7 +3,7 @@
 import json
 import re
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -450,9 +450,9 @@ def test_a_link_whose_payment_is_not_yet_booked_is_not_replaced(conn, provider):
 # --- reminders ---------------------------------------------------------------------------------
 
 
-def remind(conn, provider, fee_id: str, family_id: str = FAM, **kw) -> int:
+def remind(conn, provider, fee_id: str, family_id: str = FAM, now: datetime = NOW, **kw) -> int:
     return collections.send_reminders(
-        conn, provider, family_id=family_id, fee_id=fee_id, now=NOW, base_url=BASE_URL, **kw
+        conn, provider, family_id=family_id, fee_id=fee_id, now=now, base_url=BASE_URL, **kw
     )
 
 
@@ -541,6 +541,17 @@ def test_reminders_for_another_familys_fee_go_nowhere(conn, provider):
     before = count(conn, "outbox")
     assert remind(conn, provider, fee_id, family_id=OTHER) == 0
     assert count(conn, "outbox") == before
+
+
+def test_a_share_is_reminded_at_most_once_a_day_whoever_asks(conn, provider):
+    # Catches: the AI's reminder tool messaging the same relatives again and again in one day.
+    fee_id = run_split(conn, provider)
+    assert remind(conn, provider, fee_id) == 3
+    messages, audited = count(conn, "outbox"), len(events(conn, "reminder.sent"))
+    assert remind(conn, provider, fee_id) == 0
+    assert (count(conn, "outbox"), len(events(conn, "reminder.sent"))) == (messages, audited)
+    assert remind(conn, provider, fee_id, now=NOW + timedelta(hours=24)) == 3
+    assert len(events(conn, "reminder.sent")) == audited + 3
 
 
 def test_each_reminder_is_audited_with_who_asked(conn, provider):

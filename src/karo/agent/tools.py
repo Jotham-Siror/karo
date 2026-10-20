@@ -616,7 +616,7 @@ def _send_reminders(ctx: ToolContext, args: dict) -> dict:
         actor=ctx.member.id,
     )
     if sent == 0:
-        return {"reminders_sent": 0, "message": "Nobody needed a reminder: everyone has paid, or has no link yet."}
+        return {"reminders_sent": 0, "message": "Nobody needed a reminder: everyone has paid, was reminded today, or has no link yet."}
     return {"reminders_sent": sent, "message": f"Sent {sent} {'reminder' if sent == 1 else 'reminders'}."}
 
 

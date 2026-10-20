@@ -32,7 +32,6 @@ from karo.rules import Outcome
 logger = logging.getLogger(__name__)
 
 REMIND_AFTER = timedelta(hours=24)  # how long a payment link goes unpaid before the first reminder
-REMIND_EVERY = timedelta(hours=24)
 
 # The demo button runs a tick while the background one may be running. The database stops two at once from making
 # two allowance runs; this stops them both fetching a quote and asking the provider about the same payouts.
@@ -395,7 +394,8 @@ def _remind_late_shares(run: _Run) -> None:
 
 
 def _late_shares(run: _Run) -> Iterator[tuple[str, str]]:
-    """(fee id, share id) of each share still owing whose link is a day old and who wasn't reminded in the last day."""
+    """(fee id, share id) of each share still owing whose link is a day old. `send_reminders` skips anyone already
+    reminded today."""
     for fee in store.fees(run.conn, run.family_id):
         for share in store.shares_for_fee(run.conn, run.family_id, fee["id"]):
             if share["paid_minor"] >= share["amount_minor"]:
@@ -403,14 +403,4 @@ def _late_shares(run: _Run) -> Iterator[tuple[str, str]]:
             link = store.latest_pending_collection(run.conn, run.family_id, share["id"])
             if link is None or clock.parse(link["created_at"]) > run.now - REMIND_AFTER:
                 continue
-            if not _reminded_since(run, share["id"], run.now - REMIND_EVERY):
-                yield fee["id"], share["id"]
-
-
-def _reminded_since(run: _Run, share_id: str, since: datetime) -> bool:
-    row = run.conn.execute(
-        "SELECT 1 FROM audit WHERE family_id = ? AND event = 'reminder.sent' AND at >= ? "
-        "AND json_extract(data_json, '$.share_id') = ? LIMIT 1",
-        (run.family_id, clock.iso(since), share_id),
-    ).fetchone()
-    return row is not None
+            yield fee["id"], share["id"]

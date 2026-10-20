@@ -7,7 +7,7 @@ then commits the collection row, its audit entry and the message together.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from karo import audit, countries, db, outbox, proposals, rules, store
 from karo.clock import iso
@@ -166,6 +166,18 @@ def request_all(
     return asked
 
 
+REMIND_EVERY = timedelta(hours=24)  # a share is reminded at most this often, whoever asks
+
+
+def _reminded_since(conn: sqlite3.Connection, family_id: str, share_id: str, since: datetime) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM audit WHERE family_id = ? AND event = 'reminder.sent' AND at > ? "
+        "AND json_extract(data_json, '$.share_id') = ? LIMIT 1",
+        (family_id, iso(since), share_id),
+    ).fetchone()
+    return row is not None
+
+
 def _shares_to_remind(
     conn: sqlite3.Connection, family_id: str, fee_id: str, share_id: str | None
 ) -> list[sqlite3.Row]:
@@ -184,7 +196,7 @@ def send_reminders(
     share_id: str | None = None,
 ) -> int:
     """Reminds each member who still owes on the fee. Returns how many people were messaged. With `share_id`, only
-    that share's owner is reminded.
+    that share's owner is reminded. A share reminded in the last `REMIND_EVERY` is skipped and not counted.
 
     A share with no live link is given a new one first (its own message is the notice, so it gets no second one).
     That is a provider call, so this must not run inside a transaction."""
@@ -208,6 +220,8 @@ def send_reminders(
                 continue
             if share["id"] in fresh:
                 sent += 1
+                continue
+            if _reminded_since(conn, family_id, share["id"], now - REMIND_EVERY):
                 continue
             outbox.notify(
                 conn,
