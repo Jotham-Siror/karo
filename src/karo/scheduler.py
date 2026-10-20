@@ -1,7 +1,8 @@
 """The background tick: what has to happen because time has passed.
 
-For each family, in this order: payouts left pending are asked about again, waiting requests whose wait is over are
-made again, the monthly allowance is paid, and late shares are reminded. Money still moves only through the executor,
+For each family, in this order: payouts left pending are asked about again, PIN-confirmed requests that never got as
+far as a payout are run, waiting requests whose wait is over are made again, the monthly allowance is paid, and late
+shares are reminded. Money still moves only through the executor,
 and the allowance only because the main payer's PIN already approved the standing order behind it.
 
 An error from the provider or the network on one item is audited (by type only) and the item is left for the next
@@ -33,8 +34,8 @@ logger = logging.getLogger(__name__)
 REMIND_AFTER = timedelta(hours=24)  # how long a payment link goes unpaid before the first reminder
 REMIND_EVERY = timedelta(hours=24)
 
-# The demo button runs a tick while the background one may be running. Two at once would both find no allowance run
-# yet this month and make one each.
+# The demo button runs a tick while the background one may be running. The database stops two at once from making
+# two allowance runs; this stops them both fetching a quote and asking the provider about the same payouts.
 _ONE_TICK_AT_A_TIME = threading.Lock()
 
 
@@ -55,6 +56,7 @@ def tick(conn: sqlite3.Connection, provider: Provider, *, now: datetime, base_ur
         for row in conn.execute("SELECT id FROM families ORDER BY rowid").fetchall():
             run = _Run(conn, provider, row["id"], now, base_url)
             _reconcile_payouts(run)
+            _run_confirmed(run)
             _renew_waiting(run)
             _pay_allowance(run)
             _remind_late_shares(run)
@@ -89,6 +91,25 @@ def _reconcile_payouts(run: _Run) -> None:
     for row in rows:
         with _isolated(run, "payout", row["id"]):
             _execute(run, row["proposal_id"])
+
+
+def _run_confirmed(run: _Run) -> None:
+    """Runs what the PIN confirmed but the executor never got to commit: a lock timeout or a restart before its first
+    commit leaves no payouts row for the step above to find. Within the grace the PIN page may still be running it.
+
+    Only PIN-confirmed requests: an allowance run has no confirmation and `_run_order` picks it up within its own month.
+    The executor moves anything it stops to blocked or waiting, and anything it starts gets a payouts row, so neither
+    comes back here."""
+    older_than = clock.iso(run.now - executor.RECONCILE_GRACE)
+    rows = run.conn.execute(
+        "SELECT p.id FROM proposals p JOIN confirmations c ON c.proposal_id = p.id "
+        "WHERE p.family_id = ? AND p.status = 'confirmed' AND c.at < ? "
+        "AND NOT EXISTS (SELECT 1 FROM payouts o WHERE o.proposal_id = p.id) ORDER BY c.at, p.rowid",
+        (run.family_id, older_than),
+    ).fetchall()
+    for row in rows:
+        with _isolated(run, "confirmed", row["id"]):
+            _execute(run, row["id"])
 
 
 def _execute(run: _Run, proposal_id: str) -> None:
@@ -290,13 +311,11 @@ def _already_paid(run: _Run, window: tuple[str, str]) -> bool:
 def _run_order(run: _Run, order: StandingOrder, home_currency: str, window: tuple[str, str]) -> None:
     # A run made this month counts as the month's attempt whatever became of it, or a run the cap stops would be
     # made and announced again every 30 seconds. One a crash left confirmed is the exception: nothing came of it yet.
-    attempt = run.conn.execute(
-        "SELECT id, status FROM proposals WHERE family_id = ? AND kind = ? AND created_at >= ? AND created_at < ? "
-        "AND json_extract(payload_json, '$.standing_order_id') = ? ORDER BY rowid DESC LIMIT 1",
-        (run.family_id, Kind.ALLOWANCE_RUN.value, *window, order.id),
-    ).fetchone()
+    attempt = _attempt(run, order, window)
     if attempt is None:
-        outcome = _propose_run(run, order, home_currency)
+        outcome = _propose_run(run, order, home_currency, window)
+        if outcome is None:
+            return
         if outcome.status != "confirmed":
             _explain_stop(run, outcome)
             return
@@ -308,7 +327,18 @@ def _run_order(run: _Run, order: StandingOrder, home_currency: str, window: tupl
     _execute(run, proposal_id)
 
 
-def _propose_run(run: _Run, order: StandingOrder, home_currency: str) -> ProposalOutcome:
+def _attempt(run: _Run, order: StandingOrder, window: tuple[str, str]) -> sqlite3.Row | None:
+    return run.conn.execute(
+        "SELECT id, status FROM proposals WHERE family_id = ? AND kind = ? AND created_at >= ? AND created_at < ? "
+        "AND json_extract(payload_json, '$.standing_order_id') = ? ORDER BY rowid DESC LIMIT 1",
+        (run.family_id, Kind.ALLOWANCE_RUN.value, *window, order.id),
+    ).fetchone()
+
+
+def _propose_run(
+    run: _Run, order: StandingOrder, home_currency: str, window: tuple[str, str]
+) -> ProposalOutcome | None:
+    """None if another tick made this month's run while the quote was being fetched; that tick runs it."""
     quote = quotes.create_quote(
         run.conn,
         run.provider,
@@ -317,28 +347,33 @@ def _propose_run(run: _Run, order: StandingOrder, home_currency: str) -> Proposa
         target=order.amount,
         now=run.now,
     )
-    # Proposed as the main payer, the one member the rules accept for a run, so the proposal log names her. The
-    # executor runs it with nobody behind it, as the scheduler's, and this entry says so.
-    outcome = proposals.propose(
-        run.conn,
-        family_id=run.family_id,
-        actor=store.main_payer(run.conn, run.family_id),
-        kind=Kind.ALLOWANCE_RUN,
-        now=run.now,
-        base_url=run.base_url,
-        amount=quote.target,
-        payee=order.payee,
-        quote_id=quote.id,
-        standing_order_id=order.id,
-    )
-    audit.record(
-        run.conn,
-        at=run.now,
-        family_id=run.family_id,
-        actor="system",
-        event="allowance.scheduled",
-        data={"standing_order_id": order.id, "proposal_id": outcome.proposal_id},
-    )
+    # The quote is a provider call, so it is fetched before the write lock is taken. Looking again for this month's run
+    # under that lock is what stops two processes ticking at once from each making one.
+    with db.transaction(run.conn):
+        if _attempt(run, order, window) is not None:
+            return None
+        # Proposed as the main payer, the one member the rules accept for a run, so the proposal log names her. The
+        # executor runs it with nobody behind it, as the scheduler's, and this entry says so.
+        outcome = proposals.propose(
+            run.conn,
+            family_id=run.family_id,
+            actor=store.main_payer(run.conn, run.family_id),
+            kind=Kind.ALLOWANCE_RUN,
+            now=run.now,
+            base_url=run.base_url,
+            amount=quote.target,
+            payee=order.payee,
+            quote_id=quote.id,
+            standing_order_id=order.id,
+        )
+        audit.record(
+            run.conn,
+            at=run.now,
+            family_id=run.family_id,
+            actor="system",
+            event="allowance.scheduled",
+            data={"standing_order_id": order.id, "proposal_id": outcome.proposal_id},
+        )
     return outcome
 
 

@@ -1,9 +1,11 @@
 """The scheduler's tick: allowance runs, reminders, waiting proposals and stuck payouts. Every test names the bug it
 would catch."""
 
+import contextlib
 import json
 import re
 import shutil
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -656,6 +658,82 @@ def test_a_payout_left_pending_is_reconciled_once_it_is_old_enough(conn, provide
     assert provider.payout_calls == 1
 
 
+def locked_out(*args, **kwargs):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def confirmed_but_never_started(conn, provider, monkeypatch) -> str:
+    """A fee payment confirmed with the PIN whose execute then failed before its payouts row was written, as the
+    PIN page leaves it after a lock timeout or a restart."""
+    proposal_id = propose_fee(conn, provider, trusted(conn, "tp_westbridge"), target="6000.00").proposal_id
+    assert confirm(conn) == proposal_id
+    with monkeypatch.context() as patched:
+        patched.setattr(executor, "_start_payout", locked_out)
+        with pytest.raises(sqlite3.OperationalError):
+            run(conn, provider, proposal_id)
+    assert store.get_proposal(conn, FAM, proposal_id)[1]["status"] == "confirmed"
+    assert count(conn, "payouts") == 0
+    return proposal_id
+
+
+def test_a_confirmed_payment_whose_execute_failed_before_its_payout_is_run_once_after_the_grace(
+    conn, provider, monkeypatch
+):
+    # Catches: a PIN-confirmed payment that never got a payouts row staying confirmed for good, with no message.
+    fund(conn)
+    proposal_id = confirmed_but_never_started(conn, provider, monkeypatch)
+
+    tick(conn, provider, NOW + timedelta(minutes=1))
+    assert store.get_proposal(conn, FAM, proposal_id)[1]["status"] == "confirmed"
+    assert provider.payout_calls == 0
+
+    for minutes in (3, 4, 60):
+        tick(conn, provider, NOW + timedelta(minutes=minutes))
+    assert store.get_proposal(conn, FAM, proposal_id)[1]["status"] == "executed"
+    assert count(conn, "payouts") == 1
+    assert provider.payout_calls == 1
+    assert texts(conn, "m_amina")[-1].startswith("Sent ✓")
+
+
+def test_a_confirmed_payment_the_tick_finds_frozen_is_blocked_and_told_once(conn, provider, monkeypatch):
+    # Catches: a payment the sweep stops being swept again every tick, telling the main payer on every one.
+    fund(conn)
+    proposal_id = confirmed_but_never_started(conn, provider, monkeypatch)
+    conn.execute("UPDATE families SET frozen = 1 WHERE id = ?", (FAM,))
+    before = len(texts(conn, "m_amina"))
+
+    for minutes in (3, 4, 5):
+        tick(conn, provider, NOW + timedelta(minutes=minutes))
+    assert store.get_proposal(conn, FAM, proposal_id)[1]["status"] == "blocked"
+    assert len(texts(conn, "m_amina")) == before + 1
+    assert "frozen" in texts(conn, "m_amina")[-1]
+    assert provider.payout_calls == 0
+
+
+def test_the_sweep_leaves_alone_what_is_not_confirmed_or_already_has_a_payout(conn, provider):
+    # Catches: a sweep that picks by "confirmed with the PIN" alone, and so asks the provider about a payout another
+    # execute is still sending, or re-runs a request that already ended.
+    fund(conn)
+    ended = {}
+    for status in ("blocked", "waiting", "executed", "failed"):
+        proposal_id = propose_fee(conn, provider, trusted(conn, "tp_westbridge")).proposal_id
+        assert confirm(conn) == proposal_id
+        store.update_proposal(conn, FAM, proposal_id, status=status, now=NOW)
+        ended[proposal_id] = status
+    dropping = DroppedAfterSending(provider)
+    sending = propose_fee(conn, dropping, trusted(conn, "tp_westbridge")).proposal_id
+    assert confirm(conn) == sending
+    # Confirmed at NOW but only started four minutes later, so its payout row is still young at the tick.
+    with pytest.raises(ConnectionError):
+        run(conn, dropping, sending, NOW + timedelta(minutes=4))
+
+    tick(conn, dropping, NOW + timedelta(minutes=5))
+    assert {pid: store.get_proposal(conn, FAM, pid)[1]["status"] for pid in ended} == ended
+    assert dropping.status_calls == 0
+    assert provider.payout_calls == 1
+    assert count(conn, "payouts") == 1
+
+
 # --- errors -------------------------------------------------------------------------------------
 
 
@@ -726,5 +804,42 @@ def test_two_ticks_at_once_run_the_allowance_once(conn, db_path, provider):
                 started.join(20)
 
     assert failures == []
+    assert len(allowance_payouts(conn)) == 1
+    assert provider.payout_calls == 1
+
+
+def test_two_processes_ticking_at_once_make_one_allowance_run(conn, db_path, provider, monkeypatch):
+    # Catches: two worker processes (which share no in-process lock) each finding no run this month and each paying.
+    monkeypatch.setattr(scheduler, "_ONE_TICK_AT_A_TIME", contextlib.nullcontext())
+    fund(conn)
+    add_standing_order(conn)
+    gated = Gated(provider)
+    failures = []
+
+    def one_tick():
+        connection = db.connect(db_path)
+        try:
+            tick(connection, gated)
+        except Exception as error:  # reported on the test's thread, not lost in this one
+            failures.append(error)
+        finally:
+            connection.close()
+
+    ticks = [threading.Thread(target=one_tick) for _ in range(2)]
+    try:
+        for started in ticks:
+            started.start()
+        # Both are inside their quote, past the first look for a run, before either may go on.
+        deadline = time.monotonic() + 10
+        while gated.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert gated.calls == 2
+    finally:
+        gated.release.set()
+        for started in ticks:
+            started.join(20)
+
+    assert failures == []
+    assert proposal_statuses(conn, "allowance_run") == ["executed"]
     assert len(allowance_payouts(conn)) == 1
     assert provider.payout_calls == 1
