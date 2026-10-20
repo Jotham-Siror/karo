@@ -23,6 +23,7 @@ MAX_MESSAGES = 60
 REFUSAL_REPLY = "Sorry, I can't help with that one."
 TOO_MANY_STEPS_REPLY = "Sorry, that took too many steps. Please try again."
 NO_ANSWER_REPLY = "Sorry, I couldn't put an answer together. Please try again."
+STATUS_NOTE = "From Karo's records as this message arrives, replacing any status earlier in this chat:"
 
 _TURN_LOCKS: dict[str, threading.Lock] = {}
 
@@ -63,7 +64,8 @@ def _run_turn(
     reads_a_document = any(block.get("type") in ("image", "document") for block in content)
     effort = "medium" if reads_a_document else "low"
 
-    _append(conn, conversation_id, messages, {"role": "user", "content": _unanswered_calls(messages) + content})
+    note = _status_note(ctx) if messages else []
+    _append(conn, conversation_id, messages, {"role": "user", "content": _unanswered_calls(messages) + note + content})
     for _ in range(MAX_MODEL_CALLS):
         response = client.create(system=system, messages=messages, tools=tools, effort=effort)
         # Checked before the content is read: a refusal can cut a tool call off halfway, and that must never run.
@@ -92,6 +94,14 @@ def _tool_result(call: dict, ctx: ToolContext) -> dict:
     if "error" in result:
         block["is_error"] = True
     return block
+
+
+def _status_note(ctx: ToolContext) -> list[dict]:
+    """Where things stand, fresh, for every message after the first.
+
+    It changes outside the chat (the PIN page, payments coming in), and the prompt telling the model to call
+    get_status first was not enough: it repeated an old "awaiting_pin" result. A first message has no old result."""
+    return [{"type": "text", "text": f"{STATUS_NOTE} {json.dumps(run_tool('get_status', {}, ctx))}"}]
 
 
 def _text_of(blocks: list[dict]) -> str:

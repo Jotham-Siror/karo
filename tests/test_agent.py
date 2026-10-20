@@ -14,7 +14,7 @@ import pytest
 from anthropic.types.beta import BetaFallbackBlock, BetaTextBlock, BetaToolUseBlock
 
 from conftest import EXCHANGE_URL, rates_payload
-from karo import audit, clock, collections, db, ledger, seed, store
+from karo import approvals, audit, clock, collections, db, executor, ledger, seed, store
 from karo.agent.claude import (
     ClaudeClient,
     FakeClaude,
@@ -23,7 +23,7 @@ from karo.agent.claude import (
     text_response,
     tool_response,
 )
-from karo.agent.loop import MAX_MESSAGES, MAX_MODEL_CALLS, REFUSAL_REPLY, run_turn
+from karo.agent.loop import MAX_MESSAGES, MAX_MODEL_CALLS, REFUSAL_REPLY, STATUS_NOTE, run_turn
 from karo.agent.prompt import system_prompt
 from karo.agent.tools import ToolContext, run_tool, tools_for
 from karo.domain import Payee, Role
@@ -1104,6 +1104,33 @@ def test_history_is_append_only_across_two_turns(conn, provider):
     ]
 
 
+def test_a_later_message_carries_where_things_stand_now(conn, provider):
+    # Bug caught: the AI telling Amina her split is "still waiting for your PIN" from an old tool result in the chat,
+    # after she had confirmed it on the PIN page, which the chat never sees.
+    fee_id = recorded_fee(conn, provider)
+    fake = FakeClaude(
+        [
+            tool_response(("propose_split", split_input(fee_id))),
+            text_response("I've sent you a link to confirm with your PIN."),
+            text_response("Sorry, I can't help with that."),
+        ]
+    )
+    say(conn, provider, fake, "split the fee")
+    assert latest_result(fake.requests[1])["status"] == "awaiting_pin"
+    (link,) = [t for t in texts(conn, "m_amina") if "/confirm/" in t]
+    token = re.search(r"/confirm/(\S+)", link).group(1)
+    proposal_id = approvals.confirm(conn, token=token, pin=PIN, pepper=PEPPER, now=NOW).proposal_id
+    executor.execute(conn, provider, family_id=FAM, proposal_id=proposal_id, now=NOW, base_url=BASE_URL)
+
+    say(conn, provider, fake, "can I send money to a friend?")
+    *note, words = fake.requests[2]["messages"][-1]["content"]
+    assert words == {"type": "text", "text": "can I send money to a friend?"}
+    (status_block,) = note
+    status = json.loads(status_block["text"].removeprefix(STATUS_NOTE))
+    assert status["open_proposals"] == []
+    assert status["fees"][0]["status"] == "collecting"
+
+
 def test_thinking_and_tool_blocks_go_back_unchanged(conn, provider):
     # Bug caught: dropping or editing the thinking block, which the API rejects when the tool result is sent back.
     fake = FakeClaude(
@@ -1295,8 +1322,9 @@ def test_a_tool_call_left_without_a_result_is_closed_off_on_the_next_turn(conn, 
     say(conn, provider, fake, "hello?")
     closing = fake.requests[0]["messages"][-1]
     assert closing["role"] == "user"
-    first, second = closing["content"]
+    first, note, second = closing["content"]  # the API wants the tool results first
     assert (first["type"], first["tool_use_id"], first["is_error"]) == ("tool_result", "toolu_open", True)
+    assert note["text"].startswith(STATUS_NOTE)
     assert second == {"type": "text", "text": "hello?"}
 
 
@@ -1345,7 +1373,7 @@ def test_a_second_message_waits_for_the_first_turn_so_no_history_is_lost(conn, p
     for run in runs:
         run.join(5)
     other.close()
-    seen = [m["content"][0].get("text") for m in fake.requests[1]["messages"]]
+    seen = [m["content"][-1].get("text") for m in fake.requests[1]["messages"]]  # the person's words come last
     assert seen == ["first message", "one", "second message"]
 
 

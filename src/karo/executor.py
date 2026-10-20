@@ -434,12 +434,11 @@ def _split(
         )
         relative = state.member(member_id)
         names.append(relative.name)
-        outbox.notify(
-            conn,
-            relative.id,
-            f"{asker.name} has asked you to pay {amount} towards {what}. A payment link will follow.",
-            now,
-        )
+        if relative.id == asker.id:
+            notice = f"Your own share of {what} is {amount}. A payment link will follow."
+        else:
+            notice = f"{asker.name} has asked you to pay {amount} towards {what}. A payment link will follow."
+        outbox.notify(conn, relative.id, notice, now)
     if p.fee_id is not None:
         conn.execute("UPDATE fees SET status = 'collecting' WHERE id = ? AND family_id = ?", (p.fee_id, p.family_id))
     audit.record(

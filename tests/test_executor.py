@@ -829,6 +829,19 @@ def test_a_split_becomes_shares_that_add_up_to_the_fee(conn, provider):
     assert len(events(conn, "split.created")) == 1
 
 
+def test_the_main_payer_is_told_of_their_own_share_as_their_own(conn, provider):
+    # Bug caught: Amina, who made the split, being told "Amina has asked you to pay", as if someone else had asked.
+    fee_id = new_fee(conn)
+    split = (("m_amina", gbp("2000.00")), ("m_baraka", gbp("4000.00")))
+    propose(conn, provider, Kind.SPLIT, amount=gbp("6000.00"), fee_id=fee_id, split=split)
+    run(conn, provider, confirm(conn))
+
+    amina = texts(conn, "m_amina")
+    assert not any("Amina has asked you" in text for text in amina)
+    assert "Your own share of the University of Westbridge fees is GBP 2,000.00. A payment link will follow." in amina
+    assert texts(conn, "m_baraka")[0].startswith("Amina has asked you to pay GBP 4,000.00")
+
+
 def test_a_second_split_confirmed_before_the_first_ran_is_blocked_at_execution(conn, provider):
     # Bug caught: relatives asked for the same fee twice because the second split was only checked when proposed.
     fee_id = new_fee(conn)
