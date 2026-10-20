@@ -384,7 +384,7 @@ def test_done_means_a_message_not_really_from_twilio_is_rejected(world, forgery)
     assert world.count("proposals") == 0 and world.count("payouts") == 0 and world.count("inbound_messages") == 0
     assert world.ledger_refs() == ["opening_balance"] and world.provider.payout_calls == 0
     (rejected,) = events(world.conn, "inbound.rejected", None)
-    assert rejected["data"] == {"channel": "whatsapp"}
+    assert rejected["data"] == {"channel": "whatsapp", "count": 1}
     logged = json.dumps(audit.events(world.conn, None, limit=1000))
     assert "Pay the university fees" not in logged and AMINA_WHATSAPP not in logged
     # So the stop came from the signature alone: the same message signed by Twilio gets through, and the forged one

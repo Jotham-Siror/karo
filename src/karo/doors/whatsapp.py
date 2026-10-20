@@ -6,14 +6,17 @@ the file downloads, the agent and the sending, runs here in a background task wi
 
 from __future__ import annotations
 
+import enum
 import logging
 import sqlite3
 import threading
+import weakref
 from collections.abc import Callable
 from contextlib import closing
+from datetime import datetime, timedelta
 
 import httpx
-from twilio.base.exceptions import TwilioException
+from twilio.base.exceptions import TwilioException, TwilioRestException
 from twilio.http import HttpClient
 from twilio.http.http_client import TwilioHttpClient
 from twilio.request_validator import RequestValidator
@@ -40,9 +43,39 @@ MEDIA_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 # send(to, body): one message to one WhatsApp address (`whatsapp:+254...`). A fake in tests, Twilio in production.
 Sender = Callable[[str, str], None]
 
-# Delivery reads the waiting rows and then marks them. Two tasks at once would both read the same rows and send twice,
-# so they take turns. One process only, which is how Karo runs.
-_DELIVERY = threading.Lock()
+# The file types doors.base reads (photos and PDFs). Another type would make it drop the words sent with the file,
+# so the door skips such a file instead. tests/test_whatsapp.py checks that this list and doors.base agree.
+READABLE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"})
+
+# After a failure that may pass (Twilio down, the network out), leave that member alone this long.
+BACKOFF = timedelta(minutes=5)
+# A flood of forged posts writes one audit row a minute, carrying how many there were.
+REJECTION_WINDOW = timedelta(seconds=60)
+
+
+class _DoorState:
+    """What one running door remembers in memory. It is lost on a restart, which only means one more try."""
+
+    def __init__(self) -> None:
+        # Delivery reads the waiting rows and then marks them, so two at once would send twice. One at a time, and the
+        # second does not wait: it would hold a worker thread behind a slow Twilio call. The next tick catches up.
+        self.delivery = threading.Lock()
+        self.backed_off_until: dict[str, datetime] = {}
+        self.rejections = threading.Lock()
+        self.last_rejection_row: datetime | None = None
+        self.unrecorded_rejections = 0
+
+
+# Kept with the sender it belongs to, so two apps (or two tests) never share a back-off. Dropped with the sender.
+_STATES: weakref.WeakKeyDictionary[Sender, _DoorState] = weakref.WeakKeyDictionary()
+_STATES_LOCK = threading.Lock()
+
+
+def _state(sender: Sender) -> _DoorState:
+    with _STATES_LOCK:
+        if sender not in _STATES:
+            _STATES[sender] = _DoorState()
+        return _STATES[sender]
 
 
 # --- the signed webhook --------------------------------------------------------------------------
@@ -63,12 +96,28 @@ def signature_is_valid(settings: Settings, fields: dict[str, str], signature: st
     return RequestValidator(settings.twilio_auth_token).validate(url, fields, signature)
 
 
-def record_rejection(conn: sqlite3.Connection) -> None:
-    # No content: not the body, the number or the id. A forged message is untrusted text, and the log is shown on
-    # a page.
-    audit.record(
-        conn, at=clock.now(conn), family_id=None, actor="twilio", event="inbound.rejected", data={"channel": CHANNEL}
-    )
+def record_rejection(conn: sqlite3.Connection, sender: Sender) -> None:
+    """Counts a forged post, and writes an audit row for the count when a minute has passed since the last row.
+
+    The posts held back since the last row are counted in the next one. No content in it: not the body, the number
+    or the id. A forged message is untrusted text, and the log is shown on a page.
+    """
+    state = _state(sender)
+    now = clock.now(conn)
+    with state.rejections:
+        state.unrecorded_rejections += 1
+        if state.last_rejection_row is not None and now - state.last_rejection_row < REJECTION_WINDOW:
+            return
+        audit.record(
+            conn,
+            at=now,
+            family_id=None,
+            actor="twilio",
+            event="inbound.rejected",
+            data={"channel": CHANNEL, "count": state.unrecorded_rejections},
+        )
+        state.last_rejection_row = now
+        state.unrecorded_rejections = 0
 
 
 # --- files sent with a message -------------------------------------------------------------------
@@ -89,8 +138,7 @@ def fetch_media(fields: dict[str, str], sid: str, token: str) -> tuple[list[tupl
         for index in range(count):
             media_type = fields.get(f"MediaContentType{index}", "")
             url = fields.get(f"MediaUrl{index}")
-            usable = media_type.startswith("image/") or media_type == "application/pdf"
-            data = _download(http, url) if usable and url else None
+            data = _download(http, url) if media_type in READABLE_TYPES and url else None
             if data is None:
                 skipped += 1
             else:
@@ -152,12 +200,25 @@ def twilio_sender(sid: str, token: str, from_: str, *, http_client: HttpClient |
     return send
 
 
-def send_text(conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, family_id: str | None) -> bool:
-    """Sends `text` in as many messages as it needs. False, with the reason audited, if Twilio would not take one."""
+class Result(enum.Enum):
+    SENT = "sent"
+    REFUSED = "refused"  # Twilio will never take it, so trying again is pointless
+    FAILED = "failed"  # Twilio or the network is in trouble, and a later try may work
+
+
+def _is_refusal(error: Exception) -> bool:
+    # A 4xx is Twilio saying no to this message (outside the 24-hour window, a number that never joined the sandbox).
+    # A rate limit or a timeout is a 4xx too, but it passes.
+    return isinstance(error, TwilioRestException) and 400 <= error.status < 500 and error.status not in (408, 429)
+
+
+def send_text(conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, family_id: str | None) -> Result:
+    """Sends `text` in as many messages as it needs. If Twilio won't take one, it is audited and sending stops."""
     for piece in chunks(text):
         try:
             sender(to, piece)
         except (TwilioException, OSError) as error:
+            refused = _is_refusal(error)
             # Only the kind of error and Twilio's code: the text may carry a confirm link, and the message of a
             # Twilio error names the account.
             audit.record(
@@ -166,27 +227,41 @@ def send_text(conn: sqlite3.Connection, sender: Sender, to: str, text: str, *, f
                 family_id=family_id,
                 actor=CHANNEL,
                 event="whatsapp.send_failed",
-                data={"error": type(error).__name__, "code": getattr(error, "code", None)},
+                data={"error": type(error).__name__, "code": getattr(error, "code", None), "will_retry": not refused},
             )
-            return False
-    return True
+            return Result.REFUSED if refused else Result.FAILED
+    return Result.SENT
 
 
 def deliver_pending(conn: sqlite3.Connection, sender: Sender, family_id: str) -> None:
-    """Sends the WhatsApp rows waiting in the outbox for this family's members, and marks each one that went out.
+    """Sends the WhatsApp rows waiting in the outbox for this family's members, and marks each one that is finished.
 
-    A row Twilio refused stays unsent and is tried again the next time. Its member's later rows wait behind it, so
-    messages never arrive out of order.
+    Skipped if another delivery is running; the next one catches up.
     """
-    with _DELIVERY:
+    state = _state(sender)
+    if not state.delivery.acquire(blocking=False):
+        return
+    try:
         for member in store.members(conn, family_id):
-            addresses = [address for channel, address in store.identities_of(conn, member.id) if channel == CHANNEL]
-            if not addresses:
-                continue
-            for row in outbox.pending(conn, member.id, CHANNEL):
-                if not send_text(conn, sender, addresses[0], row["text"], family_id=family_id):
-                    break
-                outbox.mark_delivered(conn, [row["id"]], clock.now(conn))
+            _deliver_to(conn, sender, state, member.id, family_id)
+    finally:
+        state.delivery.release()
+
+
+def _deliver_to(conn: sqlite3.Connection, sender: Sender, state: _DoorState, member_id: str, family_id: str) -> None:
+    addresses = [address for channel, address in store.identities_of(conn, member_id) if channel == CHANNEL]
+    backed_off_until = state.backed_off_until.get(member_id)
+    if not addresses or (backed_off_until is not None and clock.now(conn) < backed_off_until):
+        return
+    for row in outbox.pending(conn, member_id, CHANNEL):
+        result = send_text(conn, sender, addresses[0], row["text"], family_id=family_id)
+        if result is Result.FAILED:
+            # The rows behind it wait too, so messages never arrive out of order.
+            state.backed_off_until[member_id] = clock.now(conn) + BACKOFF
+            return
+        # Sent, or refused for good. Either way this row is finished and the next one goes: a refused message loses
+        # nothing, because the web copy of every message is always there.
+        outbox.mark_delivered(conn, [row["id"]], clock.now(conn))
 
 
 def deliver_all(conn: sqlite3.Connection, sender: Sender) -> None:

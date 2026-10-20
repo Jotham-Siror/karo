@@ -8,7 +8,6 @@ import logging
 import re
 import shutil
 import threading
-import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -26,6 +25,7 @@ from karo import audit, clock, db, outbox, seed, store
 from karo.agent.claude import FakeClaude, text_response, tool_response
 from karo.config import Settings
 from karo.doors import base, whatsapp
+from karo.doors.base import InboundMessage
 from karo.domain import Payee
 from karo.money import Money
 from karo.providers.standin import StandInProvider
@@ -197,15 +197,19 @@ def test_the_twilio_sender_posts_the_text_from_karos_number_to_the_person():
 
 
 class FakeSender:
-    """What Twilio would be asked to send, in order. Set `fail` to make Twilio refuse."""
+    """What Twilio would be asked to send, in order. `fail` makes it refuse everything, `refuse` one text."""
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.attempts: list[tuple[str, str]] = []  # every call, the refused ones too
         self.fail: Exception | None = None
+        self.refuse: dict[str, Exception] = {}
 
     def __call__(self, to: str, body: str) -> None:
-        if self.fail is not None:
-            raise self.fail
+        self.attempts.append((to, body))
+        error = self.fail if self.fail is not None else self.refuse.get(body)
+        if error is not None:
+            raise error
         self.sent.append((to, body))
 
     def to(self, address: str) -> list[str]:
@@ -286,7 +290,7 @@ def test_a_message_not_really_from_twilio_is_refused_and_leaves_no_trace_of_its_
     assert door.claude.requests == [] and door.sender.sent == []
     assert door.count("inbound_messages") == 0 and door.count("proposals") == 0
     (rejected,) = door.events("inbound.rejected")
-    assert rejected["data"] == {"channel": "whatsapp"}
+    assert rejected["data"] == {"channel": "whatsapp", "count": 1}
     everything_logged = json.dumps(door.events("inbound.rejected"))
     for content in ("Pay the university fees", AMINA, "+254700000101", "SM0001"):
         assert content not in everything_logged
@@ -399,11 +403,13 @@ def test_a_pdf_is_downloaded_with_the_account_login_and_given_to_the_agent(setti
     assert door.sender.sent == [(AMINA, "Got the invoice.")]
 
 
-@pytest.mark.parametrize("how", ["audio_type", "declared_too_big", "streamed_too_big", "download_fails"])
+@pytest.mark.parametrize(
+    "how", ["audio_type", "unreadable_image_type", "declared_too_big", "streamed_too_big", "download_fails"]
+)
 def test_a_file_that_cannot_be_used_is_skipped_and_the_reply_says_so(settings, how):
-    # Catches: a voice note or a huge file being fetched into memory and handed on, or one bad file losing the message.
+    # Catches: a voice note, an HEIC photo or a huge file handed on, or one bad file losing the words sent with it.
     door = Door(settings, [text_response("Noted.")])
-    content_type = "audio/ogg" if how == "audio_type" else "application/pdf"
+    content_type = {"audio_type": "audio/ogg", "unreadable_image_type": "image/heic"}.get(how, "application/pdf")
 
     with respx.mock(assert_all_mocked=True) as network:
         if how == "declared_too_big":
@@ -418,6 +424,22 @@ def test_a_file_that_cannot_be_used_is_skipped_and_the_reply_says_so(settings, h
     assert door.claude.requests[0]["messages"][-1]["content"] == [{"type": "text", "text": "Here is the invoice"}]
     (reply,) = door.sender.to(AMINA)
     assert reply.startswith("Noted.") and "couldn't use 1 file" in reply
+
+
+@pytest.mark.parametrize("media_type", sorted(whatsapp.READABLE_TYPES))
+def test_every_file_type_the_door_lets_through_is_one_the_shared_door_reads(settings, media_type):
+    # Catches: the door's list of file types drifting from doors.base, so a fetched file replaces the whole reply.
+    message = InboundMessage("whatsapp", f"SM-{media_type}", AMINA, "see this", [(media_type, b"x")])
+    with closing(db.connect(settings.db_path)) as conn:
+        reply = base.handle(
+            conn,
+            message,
+            client=FakeClaude([text_response("Seen.")]),
+            provider=StandInProvider.from_config(SECRET, PUBLIC_URL),
+            base_url=PUBLIC_URL,
+            now=datetime.now(UTC),
+        )
+    assert reply == "Seen."
 
 
 def test_a_file_with_no_words_and_nothing_readable_is_answered_not_dropped(settings):
@@ -493,49 +515,109 @@ def test_a_web_confirm_sends_the_waiting_whatsapp_messages_and_marks_them_delive
     assert door.count("outbox", "channel = 'web' AND member_id = 'm_baraka' AND delivered_at IS NULL") == 2
 
 
-def test_a_message_twilio_refuses_stays_in_the_outbox_and_goes_out_next_time(settings):
-    # Catches: a Twilio error losing a message for good (marked delivered), or the error log leaking a secret.
-    door = Door(settings, [text_response("One."), text_response("Two.")])
+def refusal(status: int, code: int = 63016) -> TwilioRestException:
+    uri = f"/Accounts/{TWILIO_SID}/Messages.json"
+    return TwilioRestException(status, uri, "The message body is private text", code)
+
+
+def add_outbox(settings: Settings, *texts: str, member: str = "m_amina") -> None:
     with closing(db.connect(settings.db_path)) as conn:
-        outbox.notify(conn, "m_amina", "Your fee is paid.", datetime.now(UTC))
-    secret_uri = f"/Accounts/{TWILIO_SID}/Messages.json"
-    door.sender.fail = TwilioRestException(400, secret_uri, "The message body is private text", 63016)
+        for text in texts:
+            outbox.notify(conn, member, text, datetime.now(UTC))
 
-    refused = door.receive(inbound(sid="SM-a"))
 
-    assert refused.status_code == 200
-    assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 1
-    failures = door.events("whatsapp.send_failed")
-    assert [f["data"] for f in failures] == [{"code": 63016, "error": "TwilioRestException"}] * 2  # the reply, the row
-    logged = json.dumps(failures)
+def move_the_clock(settings: Settings, seconds: int) -> None:
+    with closing(db.connect(settings.db_path)) as conn:
+        clock.advance(conn, seconds)
+
+
+def test_a_message_twilio_refuses_for_good_is_given_up_once_and_the_next_one_still_goes(settings):
+    # Catches: one refused message (outside the 24-hour window) retried every tick and holding back all behind it.
+    door = Door(settings, [text_response("Reply.")])
+    add_outbox(settings, "Your fee is paid.", "Second note.")
+    door.sender.refuse["Your fee is paid."] = refusal(400)
+
+    door.receive(inbound())
+    for _ in range(2):
+        run_scheduled_tick(settings, door.provider, sender=door.sender)
+
+    assert door.sender.to(AMINA) == ["Reply.", "Second note."]
+    assert [body for _, body in door.sender.attempts].count("Your fee is paid.") == 1
+    assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 0
+    assert door.count("outbox", "channel = 'web' AND delivered_at IS NULL") == 2  # the web copies are still there
+    (failure,) = door.events("whatsapp.send_failed")
+    assert failure["data"] == {"code": 63016, "error": "TwilioRestException", "will_retry": False}
+    logged = json.dumps(failure)
     for private in (TWILIO_SID, TWILIO_TOKEN, "private text", "Your fee is paid", AMINA):
         assert private not in logged
 
-    door.sender.fail = None
-    door.receive(inbound(sid="SM-b"))
 
-    assert door.sender.to(AMINA) == ["Two.", "Your fee is paid."]
+@pytest.mark.parametrize(
+    "trouble",
+    [refusal(503), refusal(429), ConnectionError("network down")],
+    ids=["server_error", "rate_limited", "network"],
+)
+def test_a_temporary_failure_backs_the_member_off_for_five_minutes_then_tries_again(settings, trouble):
+    # Catches: a Twilio outage turning every 30-second tick into another call and another audit row.
+    door = Door(settings)
+    add_outbox(settings, "Your fee is paid.")
+    door.sender.fail = trouble
+
+    for _ in range(3):
+        whatsapp.deliver_for_family(settings, door.sender, FAM)
+
+    assert len(door.sender.attempts) == 1
+    (failure,) = door.events("whatsapp.send_failed")
+    assert failure["data"]["will_retry"] is True
+    assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 1
+
+    door.sender.fail = None
+    move_the_clock(settings, 4 * 60)
+    whatsapp.deliver_for_family(settings, door.sender, FAM)
+    assert door.sender.sent == []  # four minutes in: still backed off
+
+    move_the_clock(settings, 2 * 60)
+    whatsapp.deliver_for_family(settings, door.sender, FAM)
+    assert door.sender.sent == [(AMINA, "Your fee is paid.")]
     assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 0
 
 
-def test_two_deliveries_at_once_send_each_waiting_message_once(settings):
-    # Catches: two people's messages arriving together and both sending the same waiting rows, so Amina gets doubles.
-    with closing(db.connect(settings.db_path)) as conn:
-        for text in ("First.", "Second.", "Third."):
-            outbox.notify(conn, "m_amina", text, datetime.now(UTC))
+def test_one_members_temporary_failure_does_not_hold_back_another_member(settings):
+    # Catches: Amina's phone being unreachable stopping Baraka's messages from going out.
+    door = Door(settings)
+    add_outbox(settings, "For Amina.", member="m_amina")
+    add_outbox(settings, "For Baraka.", member="m_baraka")
+    door.sender.refuse["For Amina."] = refusal(503)
+
+    whatsapp.deliver_for_family(settings, door.sender, FAM)
+
+    assert door.sender.sent == [(BARAKA, "For Baraka.")]
+
+
+def test_a_delivery_that_finds_another_one_running_does_not_wait_for_it(settings):
+    # Catches: worker threads piling up behind a slow Twilio call until the whole app stalls, or a row sent twice.
+    add_outbox(settings, "First.", "Second.")
     sent: list[str] = []
+    started, release = threading.Event(), threading.Event()
 
     def slow_sender(to: str, body: str) -> None:
-        time.sleep(0.05)  # long enough for the other task to read the same rows if nothing made it wait
+        started.set()
+        release.wait(5)
         sent.append(body)
 
-    tasks = [threading.Thread(target=whatsapp.deliver_for_family, args=(settings, slow_sender, FAM)) for _ in range(2)]
-    for task in tasks:
-        task.start()
-    for task in tasks:
-        task.join()
+    first = threading.Thread(target=whatsapp.deliver_for_family, args=(settings, slow_sender, FAM))
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=whatsapp.deliver_for_family, args=(settings, slow_sender, FAM))
+    second.start()
+    second.join(timeout=2)
+    second_is_waiting = second.is_alive()
+    release.set()
+    first.join()
+    second.join()
 
-    assert sorted(sent) == ["First.", "Second.", "Third."]
+    assert not second_is_waiting
+    assert sent == ["First.", "Second."]
 
 
 # --- messages written outside a chat: a payment, a notice, the scheduler, the demo clock -----------
@@ -601,3 +683,48 @@ def test_the_demo_clock_jump_sends_the_messages_it_writes(settings):
     assert browser.post("/demo/next-month").status_code == 303
 
     assert [body for body in door.sender.to(BARAKA) if body.startswith("Reminder:")] != []
+
+
+# --- fix round: the web chat, a turned-away notice, a flood of forgeries ------------------------------
+
+
+def test_a_web_chat_message_sends_the_waiting_whatsapp_messages(settings):
+    # Catches: Amina asking on the web page and her PIN link never reaching her phone.
+    door = Door(settings, split_the_fee(settings))
+    browser = TestClient(door.client.app, base_url=PUBLIC_URL, follow_redirects=False)
+    assert browser.post("/login", data={"password": PASSWORD, "person": "amina"}).status_code == 303
+
+    chat = browser.post("/api/chat", json={"messages": [{"role": "user", "text": "Please split the fee"}]})
+
+    assert chat.status_code == 200
+    (link_message,) = door.sender.to(AMINA)
+    assert CONFIRM_LINK.search(link_message)
+
+
+def test_a_payment_notice_that_is_turned_away_sends_nothing(settings):
+    # Catches: anyone posting junk to the provider webhook making Karo call Twilio and crowd out real work.
+    door = Door(settings)
+    add_outbox(settings, "Your fee is paid.")
+
+    response = door.client.post("/webhooks/standin", content=b'{"event_id": "junk"}')
+
+    assert response.status_code == 401
+    assert door.sender.attempts == []
+    assert door.count("outbox", "channel = 'whatsapp' AND delivered_at IS NULL") == 1
+
+
+def test_a_flood_of_forged_messages_writes_one_audit_row_a_minute_with_the_count(settings):
+    # Catches: anyone who finds the address growing the append-only audit log without limit, burying real events.
+    door = Door(settings)
+    forged = {SIGNATURE: "forged"}
+
+    for _ in range(5):
+        assert door.client.post(WEBHOOK, data=inbound(), headers=forged).status_code == 403
+    move_the_clock(settings, 61)
+    assert door.client.post(WEBHOOK, data=inbound(), headers=forged).status_code == 403
+
+    newest_first = [e["data"] for e in door.events("inbound.rejected")]
+    assert newest_first == [
+        {"channel": "whatsapp", "count": 5},  # the four held back, and the one that opened the next minute
+        {"channel": "whatsapp", "count": 1},
+    ]

@@ -247,8 +247,13 @@ async def _read_chat_request(request: Request) -> tuple[str, str | None, list[tu
     return text if isinstance(text, str) else "", client_id if isinstance(client_id, str) else None, attachments
 
 
-@router.post("/api/chat", dependencies=[Depends(require_member)])
-async def chat(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+@router.post("/api/chat")
+async def chat(
+    request: Request,
+    background: BackgroundTasks,
+    member: Member = Depends(require_member),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
     try:
         text, client_id, attachments = await _read_chat_request(request)
     except BadRequest as problem:
@@ -258,6 +263,7 @@ async def chat(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     message_id = f"{address}:{client_id}" if client_id and _CLIENT_ID.fullmatch(client_id) else db.new_id("web")
     message = InboundMessage(WEB, message_id, address, text, attachments)
     reply = await run_in_threadpool(_reply, conn, request.app.state, message)
+    _deliver_later(request, background, member.family_id)
     return {"text": reply or ALREADY_RECEIVED}
 
 
@@ -487,7 +493,8 @@ async def webhook(
     # The raw bytes: the signature covers exactly what was sent, so the body must not be parsed first.
     body = await request.body()
     result = await run_in_threadpool(_take_notice, conn, provider, request.headers, body)
-    _deliver_later(request, background)
+    if result in _ACCEPTED:
+        _deliver_later(request, background)
     return JSONResponse({"result": result}, status_code=200 if result in _ACCEPTED else 401)
 
 
@@ -500,7 +507,7 @@ async def twilio_webhook(request: Request, background: BackgroundTasks, conn: sq
     fields = whatsapp.text_fields(await request.form())
     signature = request.headers.get("X-Twilio-Signature")
     if fields is None or not whatsapp.signature_is_valid(state.settings, fields, signature):
-        await run_in_threadpool(whatsapp.record_rejection, conn)
+        await run_in_threadpool(whatsapp.record_rejection, conn, state.whatsapp_sender)
         return Response(status_code=403)
     if not (fields.get("MessageSid") and fields.get("From")):
         return Response(status_code=400)
