@@ -10,7 +10,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 from karo import quotes, rates, store
@@ -20,7 +20,7 @@ from karo.providers.base import Provider, payout_name
 # src/karo/comparison.py -> repo root. Found from the package, so it works from any working directory.
 _EXAMPLES_PATH = Path(__file__).resolve().parents[2] / "config" / "route_examples.json"
 
-_PROVIDER_LABELS = {"flutterwave": "Flutterwave", "standin": "Stand-in provider (simulated)"}
+_PROVIDER_LABELS = {"flutterwave": "Flutterwave", "standin": "Test payment (simulated, no real money)"}
 _PROVIDER_SPEED = "about 1 day"
 _BANK_WIRE = "Bank wire"
 
@@ -62,7 +62,8 @@ def compare(
         markup = ((quote.source.decimal / fair - 1) * 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
 
     examples = _examples(fair, target, source)
-    return Comparison((pick, *examples), pick, _line(pick, examples, markup), quote.id, markup)
+    simulated = payout_name(provider) == "standin"
+    return Comparison((pick, *examples), pick, _line(pick, examples, markup, simulated), quote.id, markup)
 
 
 def _label(provider_name: str) -> str:
@@ -84,17 +85,36 @@ def _examples(fair: Decimal, target: Money, source: str) -> list[Option]:
     return options
 
 
-def _line(pick: Option, examples: list[Option], markup: Decimal | None) -> str:
-    """One sentence for the agent to repeat word for word."""
-    line = f"{pick.name}: you pay {pick.you_pay} and {pick.they_receive} arrives in about a day"
-    if markup is None:
-        # Without the market rate the examples are priced from the provider's own cost, so they always come out
-        # dearer. Any saving claimed against them would be a claim against our own rate.
-        return line + "."
+def _line(pick: Option, examples: list[Option], markup: Decimal | None, simulated: bool) -> str:
+    """One plain sentence for the agent to repeat word for word: the price, the arrival and the saving on a wire."""
+    line = f"you pay {_whole(pick.you_pay)} and {_exact(pick.they_receive)} arrives in about a day"
+    lead = "Way to pay"
     wire = next((o for o in examples if o.name.startswith(_BANK_WIRE)), None)
-    if wire is not None:
-        saving = wire.you_pay.minor - pick.you_pay.minor
-        gap = Money(abs(saving), pick.you_pay.currency)
-        line += f", {gap} {'less' if saving >= 0 else 'more'} than a typical bank wire (example figures)"
-    side = "below" if markup < 0 else "above"
-    return line + f"; its rate is {abs(markup)}% {side} the market rate ({rates.ATTRIBUTION})."
+    # Without the market rate the examples are priced from the provider's own cost, so they always come out dearer.
+    # Any saving claimed against them would be a claim against our own rate.
+    if markup is not None and wire is not None:
+        saving = wire.you_pay.decimal - pick.you_pay.decimal
+        gap = _gap(saving, pick.you_pay.currency)
+        if gap is not None:
+            line += f", {gap} {'less' if saving >= 0 else 'more'} than a bank wire"
+        if all(pick.you_pay <= o.you_pay for o in examples):
+            lead = "Cheapest way"
+    line = f"{lead}: {line}."
+    return line + " (Test payment, simulated, no real money.)" if simulated else line
+
+
+def _whole(money: Money) -> str:
+    """Whole units, rounded up, so a price is never shown lower than it is."""
+    return f"{money.currency} {money.decimal.to_integral_value(ROUND_CEILING):,}"
+
+
+def _exact(money: Money) -> str:
+    """Whole units when there are no cents, since the amount that arrives must not be rounded."""
+    units = money.decimal.to_integral_value()
+    return f"{money.currency} {units:,}" if units == money.decimal else str(money)
+
+
+def _gap(saving: Decimal, currency: str) -> str | None:
+    """Whole units, rounded so the gap never flatters: a saving down, an extra cost up. None under one unit."""
+    units = saving.to_integral_value(ROUND_FLOOR) if saving >= 0 else (-saving).to_integral_value(ROUND_CEILING)
+    return f"{currency} {units:,}" if units else None

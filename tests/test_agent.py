@@ -568,13 +568,12 @@ def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can
     fee_id = recorded_fee(conn, provider)
     result = compare_routes(conn, provider, fee_id)
     assert result["line"] == (
-        "Stand-in provider (simulated): you pay KES 1,038,062.29 and GBP 6,000.00 arrives in about a day, "
-        "KES 41,299.78 less than a typical bank wire (example figures); "
-        "its rate is 0.35% above the market rate (Rates by Exchange Rate API)."
+        "Cheapest way: you pay KES 1,038,063 and GBP 6,000 arrives in about a day, KES 41,299 less than a bank wire. "
+        "(Test payment, simulated, no real money.)"
     )
-    assert result["rate_source"] == "Rates by Exchange Rate API"
+    assert "rate_source" not in result
     assert [(o["name"], o["is_example"]) for o in result["options"]] == [
-        ("Stand-in provider (simulated)", False),
+        ("Test payment (simulated, no real money)", False),
         ("Bank wire (example)", True),
         ("Money transfer shop (example)", True),
     ]
@@ -590,6 +589,13 @@ def test_comparing_routes_gives_the_line_the_options_and_a_quote_the_payment_can
     )
     assert proposed["status"] == "awaiting_pin"
     assert "http" not in json.dumps(result)
+
+
+def test_the_result_carries_no_attribution_because_the_line_makes_no_market_rate_claim(conn, provider, exchange_api):
+    # Bug caught: handing the AI an attribution for a market-rate sentence the line no longer contains.
+    exchange_api.get(KES_RATES).respond(json=rates_payload(GBP=0.0058))
+    result = compare_routes(conn, provider, recorded_fee(conn, provider))
+    assert "rate_source" not in result and "market rate" not in result["line"]
 
 
 def test_with_no_market_rate_the_result_has_no_markup_and_no_attribution(conn, provider, exchange_api):
@@ -931,6 +937,57 @@ def test_a_status_shows_only_this_familys_data(conn, provider):
     assert status["fees"] == []
 
 
+def add_saved_recipient(conn, family_id: str, name: str, details: dict) -> None:
+    conn.execute(
+        "INSERT INTO trusted_payees (id, family_id, name, details_json, trusted_since, source) "
+        "VALUES (?, ?, ?, ?, ?, 'added')",
+        (db.new_id("tp"), family_id, name, json.dumps(details, sort_keys=True), clock.iso(NOW)),
+    )
+
+
+PAUL = {"country": "CM", "currency": "XAF", "method": "mtn_cm", "phone": "+237671234567"}
+
+
+def test_the_main_payer_sees_the_saved_recipients_with_name_country_and_method(conn, provider):
+    # Bug caught: "send money abroad" telling Amina she has no saved recipients, because get_status never listed them.
+    add_saved_recipient(conn, FAM, "Paul Mbarga", PAUL)
+    status = run_tool("get_status", {}, ctx_for(conn, provider))
+    assert status["recipients"] == [
+        {"name": "Jabali Otieno", "country": "United Kingdom", "ends_in": "345"},
+        {"name": "Paul Mbarga", "country": "Cameroon", "method": "MTN Mobile Money", "ends_in": "567"},
+    ]
+
+
+def test_a_saved_recipients_account_and_phone_are_never_shown_in_full(conn, provider):
+    # Bug caught: whole phone and account numbers copied into the model's context and the stored conversation.
+    add_saved_recipient(conn, FAM, "Paul Mbarga", PAUL)
+    shown = json.dumps(run_tool("get_status", {}, ctx_for(conn, provider)))
+    for secret in ("70012345", "0012345", "671234567", "1234567", "30-90-11"):
+        assert secret not in shown
+
+
+def test_the_university_from_the_directory_is_not_listed_as_a_recipient(conn, provider):
+    # Bug caught: offering the university as a person to send money to in "Send money abroad".
+    names = [r["name"] for r in run_tool("get_status", {}, ctx_for(conn, provider))["recipients"]]
+    assert "University of Westbridge" not in names
+
+
+def test_another_familys_recipients_are_not_listed(conn, provider):
+    # Bug caught: a recipients query missing its family filter, showing another family's saved people.
+    add_saved_recipient(conn, OTHER, "Wekesa Njoroge", PAUL)
+    names = [r["name"] for r in run_tool("get_status", {}, ctx_for(conn, provider))["recipients"]]
+    assert "Wekesa Njoroge" not in names
+
+
+def test_a_later_message_carries_the_saved_recipients_in_the_status_note(conn, provider):
+    # Bug caught: the injected status note lacking the recipients, so the AI forgets them from the second message on.
+    fake = FakeClaude([text_response("Hi Amina."), text_response("Here is the menu.")])
+    say(conn, provider, fake, "hi")
+    say(conn, provider, fake, "2")
+    names = [r["name"] for r in status_in(note_of(fake.requests[1]))["recipients"]]
+    assert names == ["Jabali Otieno"]
+
+
 # --- the prompt ---------------------------------------------------------------------------------
 
 
@@ -1087,10 +1144,16 @@ def test_the_menus_freeze_item_calls_freeze_at_once_with_no_questions(conn, memb
     assert "call freeze at once, with no questions" in prompt
 
 
-def test_the_students_freeze_item_tells_them_to_reply_stop(conn):
+def test_the_students_freeze_item_tells_them_to_reply_freeze(conn):
     # Bug caught: the student picking "Freeze everything" and being told it is done, when they have no freeze tool.
     student = prompt_for(conn, "m_jabali")
-    assert "reply STOP" in student and "freeze at once" not in student
+    assert "reply FREEZE" in student and "freeze at once" not in student
+
+
+@pytest.mark.parametrize("member", MENUS)
+def test_no_prompt_tells_anyone_to_reply_stop(conn, member):
+    # Bug caught: a person told to reply STOP, which the Twilio sandbox treats as an unsubscribe from Karo.
+    assert "STOP" not in prompt_for(conn, member)
 
 
 def test_the_main_payers_fee_step_says_the_invoice_can_come_as_a_file_or_photo(conn):

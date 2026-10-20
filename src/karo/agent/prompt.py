@@ -68,7 +68,7 @@ _ITEMS = {
     Role.STUDENT: (
         "1: call get_status and give the fees. "
         "2: call get_status and give the allowance. "
-        "3: you cannot freeze Karo from here, so tell them to reply STOP, which stops all money at once."
+        "3: you cannot freeze Karo from here, so tell them to reply FREEZE, which stops all money at once."
     ),
 }
 

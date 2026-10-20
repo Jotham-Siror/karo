@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
+from karo import approvals, audit, collections, comparison, countries, db, outbox, proposals, quotes, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -155,6 +155,26 @@ def _allowance_of(state: FamilyState) -> dict | None:
     return {"payee": order.payee.name, "amount": str(order.amount), "day_of_month": order.day_of_month}
 
 
+def _saved_recipients(ctx: ToolContext) -> list[dict]:
+    """The people abroad the family added, for the main payer to pick from. At most the last 3 digits of a number."""
+    all_countries = countries.load()
+    methods = {m.id: m.label for c in all_countries.values() for m in c.payout_methods}
+    listed = []
+    for trusted in store.added_payees(ctx.conn, ctx.family_id):
+        details = dict(trusted.payee.details)
+        entry = {"name": trusted.payee.name}
+        if "country" in details:
+            country = all_countries.get(details["country"])
+            entry["country"] = country.name if country else details["country"]
+        if "method" in details:
+            entry["method"] = methods.get(details["method"], details["method"])
+        tail = "".join(ch for ch in details.get("phone") or details.get("account_number") or "" if ch.isdigit())[-3:]
+        if tail:
+            entry["ends_in"] = tail
+        listed.append(entry)
+    return listed
+
+
 def _get_status(ctx: ToolContext, _args: dict) -> dict:
     state = store.load_state(ctx.conn, ctx.family_id, ctx.now)
     role = ctx.member.role
@@ -186,6 +206,7 @@ def _get_status(ctx: ToolContext, _args: dict) -> dict:
     return status | {
         "balances": [str(b) for b in state.balances],
         "allowance": _allowance_of(state),
+        "recipients": _saved_recipients(ctx),
         "open_proposals": pending,
     }
 
@@ -339,7 +360,7 @@ def _compare_routes(ctx: ToolContext, args: dict) -> dict:
         )
     except ValueError as exc:  # the provider has no price for this pair of currencies
         raise _BadInput(str(exc)) from exc
-    result = {
+    return {
         "quote_id": found.quote_id,
         "line": found.line,
         "options": [
@@ -353,9 +374,6 @@ def _compare_routes(ctx: ToolContext, args: dict) -> dict:
             for o in found.options
         ],
     }
-    if found.markup_pct is not None:
-        result["rate_source"] = rates.ATTRIBUTION
-    return result
 
 
 def _propose_fee_payment(ctx: ToolContext, args: dict) -> dict:
@@ -595,7 +613,8 @@ _TOOLS: tuple[_Tool, ...] = (
     _Tool(
         "get_status",
         "Look up where things stand: the fees (with their ids), what each relative owes and has paid, the balances, "
-        "whether Karo is frozen, the monthly allowance, and anything waiting for a PIN. Call this before answering "
+        "whether Karo is frozen, the monthly allowance, the saved recipients abroad (the main payer only), and "
+        "anything waiting for a PIN. Call this before answering "
         "any question about money, and whenever you need a fee id. What comes back depends on who is asking.",
         _object(),
         _get_status,

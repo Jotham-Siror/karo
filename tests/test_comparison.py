@@ -164,11 +164,10 @@ def test_the_provider_rate_is_marked_up_over_the_market_by_what_it_costs_extra(c
     assert result.markup_pct == Decimal("2.04")  # KES 1,224,489.80 paid against a fair KES 1,200,000.00
 
 
-def test_a_provider_cheaper_than_the_market_says_below_and_never_shows_a_minus(conn, exchange_api):
-    # Bug caught: "-1.96% above the market rate".
+def test_a_provider_cheaper_than_the_market_has_a_negative_markup_and_its_line_shows_no_minus(conn, exchange_api):
+    # Bug caught: a minus sign in the line a person reads, such as "KES -24,000 less than a bank wire".
     result = compare(conn, provider_at("0.0051"), exchange_api, mid=0.005)
     assert result.markup_pct == Decimal("-1.96")
-    assert "its rate is 1.96% below the market rate" in result.line
     assert re.search(r"-\s*\d", result.line) is None
 
 
@@ -225,38 +224,73 @@ def test_the_line_names_the_side_that_quoted_when_collections_and_payouts_differ
         payouts=provider_at("0.0049"),
     )
     result = compare(conn, hybrid, exchange_api, mid=0.005)
-    assert result.options[0].name == "Stand-in provider (simulated)"
+    assert result.options[0].name == "Test payment (simulated, no real money)"
 
 
-def test_the_line_names_the_provider_the_figures_the_saving_and_the_markup(conn, exchange_api):
-    # Bug caught: a line that doesn't match the figures, or drops the market-rate attribution it must show.
+def test_the_line_is_one_plain_sentence_with_the_price_the_arrival_and_the_saving(conn, exchange_api):
+    # Bug caught: a line that doesn't match the figures, or still carries the jargon the family found too technical.
     result = compare(conn, provider_at("0.0049", name="flutterwave"), exchange_api, mid=0.005)
     assert result.line == (
-        "Flutterwave: you pay KES 1,224,489.80 and GBP 6,000.00 arrives in about a day, "
-        "KES 27,010.20 less than a typical bank wire (example figures); "
-        "its rate is 2.04% above the market rate (Rates by Exchange Rate API)."
+        "Cheapest way: you pay KES 1,224,490 and GBP 6,000 arrives in about a day, KES 27,010 less than a bank wire."
     )
 
 
-def test_the_stand_in_provider_is_labelled_as_simulated(conn, exchange_api):
+def test_the_line_has_no_market_rate_clause_and_so_no_attribution(conn, exchange_api):
+    # Bug caught: the market-rate sentence, or its attribution, left in a line that no longer makes the claim.
+    result = compare(conn, provider_at("0.0049", name="flutterwave"), exchange_api, mid=0.005)
+    assert "market rate" not in result.line and "Exchange Rate API" not in result.line
+    assert "example figures" not in result.line and "typical" not in result.line
+
+
+def test_the_price_is_rounded_up_and_the_saving_down_so_neither_flatters(conn, exchange_api):
+    # Bug caught: rounding to nearest, which shows a price a unit under what it is, or a saving a unit over.
+    result = compare(conn, provider_at("0.00577"), exchange_api, mid=0.005)  # pays KES 1,039,861.36; wire 1,251,500
+    assert "you pay KES 1,039,862 and" in result.line  # up from .36
+    assert "KES 211,638 less than a bank wire" in result.line  # down from 211,638.64
+
+
+def test_what_arrives_keeps_its_cents_when_it_has_any(conn, exchange_api):
+    # Bug caught: "GBP 6,000 arrives" for a fee of GBP 6,000.50.
+    result = compare(conn, provider_at("0.0049"), exchange_api, target=Money.parse("6000.50", "GBP"))
+    assert "and GBP 6,000.50 arrives in about a day" in result.line
+
+
+def test_the_stand_in_provider_is_labelled_as_a_test_payment_with_no_real_money(conn, exchange_api):
     # Bug caught: a demo run looking like a real provider quote.
     result = compare(conn, provider_at("0.0049", name="standin"), exchange_api)
-    assert result.line.startswith("Stand-in provider (simulated): you pay KES 1,224,489.80 ")
+    assert result.line.startswith("Cheapest way: you pay KES 1,224,490 ")
+    assert result.line.endswith(" (Test payment, simulated, no real money.)")
 
 
-def test_a_provider_dearer_than_the_bank_wire_says_how_much_more(conn, exchange_api):
-    # Bug caught: "KES -248,500.00 less than a typical bank wire".
+def test_a_real_provider_line_carries_no_test_payment_note(conn, exchange_api):
+    # Bug caught: telling a family that a real payment is simulated.
+    result = compare(conn, provider_at("0.0049", name="flutterwave"), exchange_api)
+    assert "Test payment" not in result.line and "simulated" not in result.line
+
+
+def test_a_provider_dearer_than_the_bank_wire_says_how_much_more_and_is_not_called_cheapest(conn, exchange_api):
+    # Bug caught: "KES -248,500 less than a bank wire", or the dearer route called the cheapest way.
     result = compare(conn, provider_at("0.0040"), exchange_api, mid=0.005)
-    assert "KES 248,500.00 more than a typical bank wire (example figures)" in result.line
-    assert "less than" not in result.line and re.search(r"-\s*\d", result.line) is None
+    assert "KES 248,500 more than a bank wire" in result.line
+    assert "less than" not in result.line and "Cheapest" not in result.line
+    assert re.search(r"-\s*\d", result.line) is None
+
+
+def test_the_route_is_not_called_the_cheapest_when_a_shop_example_is_cheaper(conn, exchange_api):
+    # Bug caught: claiming "Cheapest way" because it beats the bank wire, when the money shop example is cheaper.
+    # Pays KES 1,250,000, against a wire at 1,251,500 and a shop at 1,237,500.
+    result = compare(conn, provider_at("0.0048"), exchange_api, mid=0.005)
+    assert result.line.startswith("Way to pay: you pay KES 1,250,000 ")
+    assert "KES 1,500 less than a bank wire" in result.line
 
 
 def test_without_the_market_rate_the_line_makes_no_comparison_at_all(conn, exchange_api):
     # Bug caught: a saving stated against our own rate (the examples are priced from it, so it is always "cheaper"),
-    # a markup claim with no market rate behind it, or an attribution for a rate that wasn't used.
+    # a claim of being the cheapest, or a mention of a market rate that wasn't used.
     result = compare(conn, provider_at("0.0049"), exchange_api, mid=None)
     assert result.line == (
-        "Stand-in provider (simulated): you pay KES 1,224,489.80 and GBP 6,000.00 arrives in about a day."
+        "Way to pay: you pay KES 1,224,490 and GBP 6,000 arrives in about a day. "
+        "(Test payment, simulated, no real money.)"
     )
     assert [o.is_example for o in result.options] == [False, True, True]  # the options are still there, as examples
 
@@ -265,7 +299,7 @@ def test_a_family_not_paid_in_kes_gets_no_example_it_cannot_price(conn, exchange
     # Bug caught: the KES fixed fee added to another currency, raising CurrencyMismatch out of the comparison.
     result = compare(conn, provider_at("0.0049"), exchange_api, family_id=OTHER)
     assert [o.is_example for o in result.options] == [False]
-    assert "bank wire" not in result.line
+    assert "bank wire" not in result.line and "Cheapest" not in result.line
 
 
 def test_one_quote_is_saved_for_the_family_and_no_other_family_can_see_it(conn, exchange_api):
