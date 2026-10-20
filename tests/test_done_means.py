@@ -1,6 +1,8 @@
 """One test per "Done means" item in the build plan. Each drives a top-level entry point, not an internal.
 
-Not here yet: the Flutterwave test-mode collection and payout run with saved references (added by Task 11).
+The Flutterwave test-mode run has no test here: it is covered by the saved runs in proof/smoke/. Collections pass there
+(a hosted payment link, and an M-Pesa charge that verifies). Payouts are refused by Flutterwave for this merchant:
+"merchant is not enabled to make transfers".
 """
 
 import hashlib
@@ -30,6 +32,8 @@ from karo.doors import base
 from karo.doors.base import InboundMessage, handle
 from karo.domain import Kind, Payee, Proposal, TrustedPayee
 from karo.money import Money
+from karo.providers.flutterwave import FlutterwaveProvider
+from karo.providers.hybrid import HybridProvider
 from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
 from karo.rules import Outcome
 from karo.web.app import create_app
@@ -45,6 +49,9 @@ WESTBRIDGE = {"country": "GB", "currency": "GBP", "sort_code": "20-40-60", "acco
 PDF = ("application/pdf", b"%PDF-1.4 invoice")
 SHARES = {"Baraka": "3000.00", "Nakato": "2000.00", "Amina": "1000.00"}
 MARKET_RATE_URL = "https://open.er-api.com/v6/latest/"
+FLW_KEY = "FLWSECK_TEST-made-up-key-0000"
+FLW_HASH = "made-up-webhook-hash-0000"
+FLW_API = "https://api.flutterwave.com/v3"
 
 
 def kes(amount: str) -> Money:
@@ -316,7 +323,6 @@ class DroppedPayout(CountingProvider):
 
 
 # --- A payment notice not really from the provider is rejected ----------------------------------
-# The Flutterwave twin of this test sits beside it (added by Task 11).
 
 
 @pytest.mark.parametrize("forgery", ["signed_with_another_secret", "no_signature_at_all"])
@@ -337,6 +343,40 @@ def test_done_means_a_payment_notice_not_from_the_provider_is_rejected_standin(w
     assert world.count("collections", "status = 'succeeded'") == 0
     assert world.ledger_refs() == ["opening_balance"] and world.count("provider_events") == 0
     assert len(events(world.conn, "notice.rejected", None)) == 1
+
+
+@pytest.mark.parametrize("forgery", ["signed_with_another_hash", "no_hash_at_all"])
+def test_done_means_a_payment_notice_not_really_from_flutterwave_is_rejected(make_world, forgery):
+    # Bug it catches: anyone who knows the webhook address crediting a share, even one that was genuinely paid.
+    flutterwave = FlutterwaveProvider(FLW_KEY, FLW_HASH)
+    world = make_world(HybridProvider(collections=flutterwave, payouts=StandInProvider.from_config(SECRET, BASE_URL)))
+    link = {"status": "success", "message": "Hosted Link", "data": {"link": "https://checkout.example.test/pay/x"}}
+    with respx.mock(base_url=FLW_API, assert_all_mocked=True, assert_all_called=False) as network:
+        network.post("/payments").respond(200, json=link)
+        world.split_fee()
+        tx_ref = world.tx_ref_of("m_baraka")
+        owed_minor = world.conn.execute("SELECT amount_minor FROM collections WHERE tx_ref = ?", (tx_ref,)).fetchone()[0]
+        owed = Money(owed_minor, "KES")
+        paid = {"id": 7, "tx_ref": tx_ref, "status": "successful", "currency": "KES", "amount": float(owed.decimal)}
+        # The money did arrive at Flutterwave, so only the hash can stop this notice.
+        recheck = network.get("/transactions/verify_by_reference").respond(
+            200, json={"status": "success", "message": "Transaction fetched successfully", "data": paid}
+        )
+        body = json.dumps({"event": "charge.completed", "data": {"id": 7, "tx_ref": tx_ref}}).encode()
+        headers = {} if forgery == "no_hash_at_all" else {"verif-hash": "not-the-hash"}
+
+        response = world.web.post("/webhooks/flutterwave", content=body, headers=headers)
+
+        assert (response.status_code, response.json()) == (401, {"result": "rejected"})
+        assert not recheck.called  # a notice that fails the hash never gets as far as asking Flutterwave
+        assert world.count("shares", "paid_minor > 0") == 0
+        assert world.count("collections", "status = 'succeeded'") == 0
+        assert world.ledger_refs() == ["opening_balance"] and world.count("provider_events") == 0
+        (rejected,) = events(world.conn, "notice.rejected", None)
+        assert rejected["data"] == {"provider": "flutterwave"}
+        # So the stop came from the hash alone: the same notice carrying it is credited.
+        genuine = world.web.post("/webhooks/flutterwave", content=body, headers={"verif-hash": FLW_HASH})
+        assert (genuine.status_code, genuine.json()) == (200, {"result": "credited"})
 
 
 # --- A message not really from Twilio is rejected ----------------------------------------------

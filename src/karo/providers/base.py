@@ -95,3 +95,8 @@ class Provider(Protocol):
     def parse_notice(self, headers: Mapping[str, str], body: bytes) -> Notice | None:
         """None unless the notice is genuinely from this provider."""
         ...
+
+
+def payout_name(provider: Provider) -> str:
+    """Who sends the money. A provider that takes payments in but hands payouts to another says so in `payout_name`."""
+    return getattr(provider, "payout_name", provider.name)

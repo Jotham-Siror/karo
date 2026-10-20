@@ -15,6 +15,8 @@ import pytest
 from conftest import EXCHANGE_URL, rates_payload
 from karo import audit, comparison, db, rates, store
 from karo.money import Money
+from karo.providers.flutterwave import FlutterwaveProvider
+from karo.providers.hybrid import HybridProvider
 from karo.providers.standin import StandInProvider
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
@@ -214,6 +216,16 @@ def test_without_the_market_rate_the_examples_are_priced_from_the_provider_rate(
         Money.parse("1276969.40", "KES"),
         Money.parse("1262724.50", "KES"),
     ]
+
+
+def test_the_line_names_the_side_that_quoted_when_collections_and_payouts_differ(conn, exchange_api):
+    # Bug caught: a simulated stand-in quote labelled "Flutterwave" because the hybrid is named for its collections.
+    hybrid = HybridProvider(
+        collections=FlutterwaveProvider("FLWSECK_TEST-made-up-key-0000", "made-up-webhook-hash-0000"),
+        payouts=provider_at("0.0049"),
+    )
+    result = compare(conn, hybrid, exchange_api, mid=0.005)
+    assert result.options[0].name == "Stand-in provider (simulated)"
 
 
 def test_the_line_names_the_provider_the_figures_the_saving_and_the_markup(conn, exchange_api):

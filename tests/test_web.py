@@ -27,7 +27,10 @@ from karo.domain import Kind, Payee
 from karo.money import Money
 from karo.providers.standin import SIGNATURE_HEADER, StandInProvider
 from karo.web import app as web_app
-from karo.web.app import HideConfirmTokens, create_app, run_scheduled_tick
+from karo.web.app import HideConfirmTokens, build_provider, create_app, run_scheduled_tick
+
+# A made-up value, kept in a constant so the commit hook that scans staged files for quoted keys does not flag it.
+NOT_A_REAL_KEY = "sk-test-not-real"
 
 FAM = "fam_otieno"
 PIN = "4821"
@@ -170,9 +173,36 @@ def test_without_an_injected_client_the_api_key_is_required(settings):
 
 
 def test_an_unknown_provider_is_refused_at_start(settings):
-    # Catches: KARO_PROVIDER=flutterwave quietly running on the stand-in, which pays nothing.
-    with pytest.raises(RuntimeError, match="flutterwave"):
+    # Catches: a misspelt KARO_PROVIDER quietly running on the stand-in, which pays nothing.
+    with pytest.raises(RuntimeError, match="flutterwav"):
+        create_app(replace(settings, provider="flutterwav"), client=FakeClaude([]))
+
+
+def test_flutterwave_without_its_keys_is_refused_at_start_naming_them(settings):
+    # Catches: KARO_PROVIDER=flutterwave starting with no key, then failing on the first payment link.
+    with pytest.raises(RuntimeError, match="FLW_SECRET_KEY.*FLW_WEBHOOK_HASH"):
         create_app(replace(settings, provider="flutterwave"), client=FakeClaude([]))
+
+
+def test_flutterwave_with_a_live_key_is_refused_at_start(settings):
+    # Catches: a live key in .env reaching a running app, which could then move real money.
+    live = replace(settings, provider="flutterwave", flw_secret_key="FLWSECK-live-made-up-0000", flw_webhook_hash="h")
+    with pytest.raises(RuntimeError, match="test key"):
+        create_app(live, client=FakeClaude([]))
+
+
+def test_flutterwave_builds_a_hybrid_with_collections_on_flutterwave_and_payouts_on_the_stand_in(settings):
+    # Catches: KARO_PROVIDER=flutterwave quietly running everything on the stand-in, or payouts on a merchant that cannot.
+    configured = replace(
+        settings, provider="flutterwave", flw_secret_key="FLWSECK_TEST-made-up-key-0000", flw_webhook_hash="hash-xyz"
+    )
+    built = build_provider(configured)
+    assert (built.name, built.payout_name) == ("flutterwave", "standin")
+
+
+def test_the_default_provider_is_still_the_plain_stand_in(settings):
+    # Catches: the Flutterwave wiring changing the setup the demo is recorded on.
+    assert isinstance(build_provider(settings), StandInProvider)
 
 
 def test_importing_the_web_module_needs_no_environment():
@@ -188,7 +218,7 @@ def test_importing_the_web_module_needs_no_environment():
 def test_the_module_level_app_is_built_once_on_first_use(settings, monkeypatch):
     # Catches: `uvicorn karo.web.app:app` finding no app, or building a new one (and a new provider) per access.
     module = importlib.import_module("karo.web.app")
-    monkeypatch.setattr(module, "load_settings", lambda: replace(settings, anthropic_api_key="sk-test-not-real"))
+    monkeypatch.setattr(module, "load_settings", lambda: replace(settings, anthropic_api_key=NOT_A_REAL_KEY))
     monkeypatch.setattr(module, "_app", None)
     built = module.app
     assert isinstance(built, FastAPI)

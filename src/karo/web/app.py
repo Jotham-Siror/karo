@@ -36,6 +36,7 @@ from karo.doors.base import InboundMessage
 from karo.domain import Member
 from karo.money import Money
 from karo.providers.base import Provider
+from karo.providers.hybrid import flutterwave_hybrid
 from karo.providers.standin import StandInProvider
 
 logger = logging.getLogger(__name__)
@@ -633,8 +634,16 @@ def run_scheduled_tick(settings: Settings, provider: Provider, sender: whatsapp.
 
 
 def build_provider(settings: Settings) -> Provider:
+    if settings.provider == "flutterwave":
+        settings.require("flw_secret_key", "flw_webhook_hash")
+        return flutterwave_hybrid(
+            settings.flw_secret_key,
+            settings.flw_webhook_hash,
+            payouts=settings.flw_payouts,
+            base_url=settings.public_base_url,
+        )
     if settings.provider != "standin":
-        raise RuntimeError(f"KARO_PROVIDER={settings.provider!r} is not available yet. Use 'standin'.")
+        raise RuntimeError(f"KARO_PROVIDER={settings.provider!r} is not available. Use 'standin' or 'flutterwave'.")
     settings.require("standin_secret")
     return StandInProvider.from_config(settings.standin_secret, settings.public_base_url)
 

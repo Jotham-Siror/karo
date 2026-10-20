@@ -15,7 +15,7 @@ from pathlib import Path
 
 from karo import quotes, rates, store
 from karo.money import Money, decimals
-from karo.providers.base import Provider
+from karo.providers.base import Provider, payout_name
 
 # src/karo/comparison.py -> repo root. Found from the package, so it works from any working directory.
 _EXAMPLES_PATH = Path(__file__).resolve().parents[2] / "config" / "route_examples.json"
@@ -52,7 +52,7 @@ def compare(
     source = store.family_config(conn, family_id).policy.home_currency
     quote = quotes.create_quote(conn, provider, family_id=family_id, source_currency=source, target=target, now=now)
     mid = rates.mid_market(conn, source, target.currency, now)
-    pick = Option(_label(provider.name), quote.source, quote.target, _PROVIDER_SPEED, False)
+    pick = Option(_label(payout_name(provider)), quote.source, quote.target, _PROVIDER_SPEED, False)
 
     if mid is None:
         # With no market rate the examples are priced off the provider's own cost, so they still give a sense of scale.
