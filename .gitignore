@@ -26,3 +26,6 @@ build/
 # Runtime files (tunnel log, demo databases)
 data/
 *.log
+
+# Local evidence (smoke tests, proof exports): never committed
+proof/
