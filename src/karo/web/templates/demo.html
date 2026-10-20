@@ -20,9 +20,10 @@
   <button type="submit">Jump to the 1st of next month</button>
 </form>
 
-<form method="post" action="/demo/reset" class="card" onsubmit="return confirm('Start the demo again from the beginning?');">
+<form method="post" action="/demo/reset" class="card" data-confirm="Start the demo again from the beginning?">
   <h2>Start again</h2>
   <p>Deletes everything and sets up the Otieno and Mwangi families again, with the same demo PIN. You stay logged in.</p>
   <button type="submit" class="danger">Reset the demo</button>
 </form>
+<script src="/static/demo.js" defer></script>
 {% endblock %}

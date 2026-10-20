@@ -1,6 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
+  {# First in <head>: a meta policy only covers what comes after it. Styles may be inline because Deep Chat injects
+     inline styles and chat.html has a style attribute; scripts get no such allowance. #}
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; base-uri 'none'; form-action 'self'; object-src 'none'">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{% block title %}Karo{% endblock %}</title>
