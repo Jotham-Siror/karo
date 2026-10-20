@@ -16,7 +16,7 @@
   auxiliaryStyle='.ai-message-text a { color: #28587b; } .user-message-text a { color: #ffffff; }'
   errorMessages='{"displayServiceErrorMessages": true}'
   browserStorage='{{ {"key": storage_key, "maxMessages": 200}|tojson }}'
-  introMessage='{{ {"text": "Hi " ~ member.name ~ ". I'm Karo. Ask me about the fees, or send a photo or PDF of an invoice. Never type your PIN here: Karo will send you a link to the PIN page."}|tojson }}'
+  introMessage='{{ {"text": "Hi " ~ member.name ~ ", I'm Karo. Say hi for the menu, or send an invoice photo or PDF. Never type your PIN here."}|tojson }}'
   style="border-radius: 8px; width: calc(100% - 1rem); height: calc(100% - 1rem); font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;"></deep-chat>
 
 <script type="module" src="https://cdn.jsdelivr.net/npm/deep-chat@2.5.1/dist/deepChat.bundle.js"

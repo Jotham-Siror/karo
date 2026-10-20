@@ -299,8 +299,7 @@ def test_a_confirmed_fee_payment_is_paid_once_and_recorded_everywhere(conn, prov
     assert store.get_fee(conn, FAM, fee_id)["status"] == "paid"
     assert status_of(conn, proposal_id) == "executed"
     receipt = texts(conn, "m_amina")[-1]
-    assert "Paid GBP 6,000.00 to University of Westbridge" in receipt
-    assert "(simulated)" in receipt
+    assert receipt.startswith("Sent ✓ GBP 6,000.00 to University of Westbridge. Cost KES 1,038,062.29. ")
 
 
 def paid_fee(conn, provider):
@@ -309,11 +308,31 @@ def paid_fee(conn, provider):
     return run(conn, provider, proposal_id)
 
 
+def test_the_receipt_is_one_plain_line_with_the_cost_and_the_test_payment_label(conn, provider):
+    # Bug caught: a receipt in system words (reference, provider ID) or spread over lines, hard to read on WhatsApp.
+    paid_fee(conn, provider)
+    receipt = texts(conn, "m_amina")[-1]
+    assert re.fullmatch(
+        r"Sent ✓ GBP 6,000\.00 to University of Westbridge\. Cost KES 1,038,062\.29\. "
+        r"Test payment, simulated, no real money\. Log check [0-9a-f]{12}\.",
+        receipt,
+    )
+
+
+def test_the_receipt_leaves_out_the_reference_and_the_provider_id(conn, provider):
+    # Bug caught: the receipt printing karo-prop_... and SI-karo-... codes that only the log and the table need.
+    paid_fee(conn, provider)
+    receipt = texts(conn, "m_amina")[-1]
+    payout = conn.execute("SELECT reference, provider_id FROM payouts").fetchone()
+    assert payout["reference"] not in receipt and payout["provider_id"] not in receipt
+    assert "Reference" not in receipt and "provider ID" not in receipt
+
+
 def test_the_receipt_ends_with_the_audit_hash_that_closes_the_payout(conn, provider):
     # Bug caught: a "Log check" taken before the payout's audit row, so it points at the wrong place.
     paid_fee(conn, provider)
     receipt = texts(conn, "m_amina")[-1]
-    code = re.search(r"Log check ([0-9a-f]{12})$", receipt).group(1)
+    code = re.search(r"Log check ([0-9a-f]{12})\.$", receipt).group(1)
     assert code == events(conn, "payout.sent")[0]["hash"][:12]
     assert code in {e["hash"][:12] for e in audit.events(conn)}
 
@@ -416,7 +435,7 @@ def test_a_rival_that_sends_again_after_two_minutes_cannot_make_the_provider_pay
     assert (racing.rival.status, first.status) == ("executed", "executed")
     assert provider.payout_calls == 1
     assert len(events(conn, "payout.sent")) == 1
-    assert len([t for t in texts(conn, "m_amina") if t.startswith("Paid ")]) == 1
+    assert len([t for t in texts(conn, "m_amina") if t.startswith("Sent ✓ ")]) == 1
     assert ledger.balance(conn, FAM, "KES") == FUNDS - FEE_COST
 
 
@@ -728,8 +747,8 @@ def test_a_receipt_says_simulated_only_when_the_provider_did(conn, provider):
     scripted = ScriptedProvider(simulated=False)
     run(conn, scripted, confirmed_fee_payment(conn, provider))
     receipt = texts(conn, "m_amina")[-1]
-    assert "SC-1" in receipt
-    assert "simulated" not in receipt
+    assert receipt.startswith("Sent ✓ ")
+    assert "simulated" not in receipt and "Test payment" not in receipt
 
 
 def test_a_fee_cannot_be_paid_a_second_time_by_another_proposal(conn, provider):
@@ -1065,7 +1084,7 @@ def test_the_note_for_a_new_payee_names_them_in_plain_words(conn, provider):
     last = newest_outbox_id(conn)
     run(conn, provider, proposal_id)
     assert sent_since(conn, last) == [
-        ("web", "Done ✓ Jonathan Siror is saved. You can send them money now.")
+        ("web", "Done ✓ Jonathan Siror is saved as a recipient.")
     ]
 
 
@@ -1078,7 +1097,7 @@ def test_a_confirmed_fee_payment_sends_only_its_receipt_on_each_channel(conn, pr
     assert run(conn, provider, proposal_id).status == "executed"
     sent = sent_since(conn, last)
     assert [channel for channel, _ in sent] == ["web", "whatsapp"]
-    assert all(text.startswith("Paid ") for _, text in sent)
+    assert all(text.startswith("Sent ✓ ") for _, text in sent)
 
 
 def test_running_a_kind_again_does_not_tell_the_main_payer_again(conn, provider):

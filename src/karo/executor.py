@@ -337,7 +337,7 @@ def _settle(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
             row = _payout_row(conn, job)
         log_check = _log_check(conn)
     if row["status"] == "succeeded":
-        receipt = _receipt(job, row["provider_id"], bool(row["simulated"]), log_check)
+        receipt = _receipt(job, bool(row["simulated"]), log_check)
         return ExecutionOutcome("executed", receipt, job.payout_id)
     if row["status"] == "failed":
         return ExecutionOutcome("failed", _failure_text(job), job.payout_id)
@@ -392,7 +392,7 @@ def _record(conn: sqlite3.Connection, job: _PayoutJob, result: PayoutResult, now
         store.update_proposal(conn, p.family_id, p.id, status="executed", now=now)
         if p.kind is Kind.PAY_FEE and p.fee_id is not None:
             conn.execute("UPDATE fees SET status = 'paid' WHERE id = ? AND family_id = ?", (p.fee_id, p.family_id))
-        outbox.notify(conn, main.id, _receipt(job, result.provider_id, result.simulated, _log_check(conn)), now)
+        outbox.notify(conn, main.id, _receipt(job, result.simulated, _log_check(conn)), now)
 
 
 def _log_check(conn: sqlite3.Connection) -> str:
@@ -400,12 +400,11 @@ def _log_check(conn: sqlite3.Connection) -> str:
     return conn.execute("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1").fetchone()["hash"][:12]
 
 
-def _receipt(job: _PayoutJob, provider_id: str | None, simulated: bool, log_check: str) -> str:
+def _receipt(job: _PayoutJob, simulated: bool, log_check: str) -> str:
+    """One line. The reference and the provider's id stay in the payouts table, the log and the proof export."""
     p = job.proposal
-    text = f"Paid {p.amount} to {job.payee_name} (cost {p.quote.source}). Reference {job.reference}"
-    if provider_id:
-        text += f", provider ID {provider_id}"
-    return text + (" (simulated)." if simulated else ".") + f" Log check {log_check}"
+    test_payment = " Test payment, simulated, no real money." if simulated else ""
+    return f"Sent ✓ {p.amount} to {job.payee_name}. Cost {p.quote.source}.{test_payment} Log check {log_check}."
 
 
 def _failure_text(job: _PayoutJob) -> str:
@@ -432,14 +431,14 @@ def done_text(p: Proposal, state: FamilyState) -> str:
     payee = p.payee.name if p.payee is not None else "the payee"
     match p.kind:
         case Kind.PAY_FEE | Kind.SEND | Kind.ALLOWANCE_RUN:
-            return f"Paid {p.amount} to {payee}."
+            return f"Sent {p.amount} to {payee}."
         case Kind.ALLOWANCE_SET:
             return f"Allowance set: {p.amount} on the {_ordinal(ALLOWANCE_DAY)} of each month."
         case Kind.SPLIT:
             names = ", ".join(state.member(member_id).name for member_id, _ in p.split)
             return f"Asked {names} for their shares of {p.amount}."
         case Kind.ADD_PAYEE:
-            return f"{payee} is saved. You can send them money now."
+            return f"{payee} is saved as a recipient."
         case Kind.UNFREEZE:
             return "Karo is unfrozen. Money can move again."
         case Kind.CONVERT:

@@ -175,6 +175,8 @@ def _notice(
     """`way_back` is for the end of a confirm. With a web session the page returns to the chat by itself; without one
     (the person came from a WhatsApp link) it offers the way back to WhatsApp."""
     signed_in = _session_member(request, conn) is not None
+    # Only a success leaves the page by itself. A held, stopped or failed result has to stay up long enough to read.
+    returns_itself = way_back and signed_in and tone == "ok"
     return _page(
         request,
         conn,
@@ -184,7 +186,7 @@ def _notice(
         heading=heading,
         message=message,
         tone=tone,
-        auto_return=way_back and signed_in,
+        auto_return=returns_itself,
         whatsapp_url=_whatsapp_url(request) if way_back and not signed_in else None,
     )
 

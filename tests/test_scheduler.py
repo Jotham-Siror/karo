@@ -280,7 +280,7 @@ def test_the_allowance_runs_once_in_a_month_however_many_ticks(conn, provider):
     assert [r["status"] for r in allowance_payouts(conn)] == ["succeeded"]
     assert provider.payout_calls == 1
     assert proposal_statuses(conn, "allowance_run") == ["executed"]
-    assert len([t for t in texts(conn, "m_amina") if t.startswith("Paid")]) == 1
+    assert len([t for t in texts(conn, "m_amina") if t.startswith("Sent ✓")]) == 1
 
 
 def test_the_allowance_needs_no_pin_and_is_logged_as_scheduled(conn, provider):

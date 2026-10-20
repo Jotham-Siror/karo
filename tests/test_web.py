@@ -599,8 +599,8 @@ def test_the_right_pin_pays_and_shows_the_receipt(site):
     token = start(site)
     response = enter(site, token)
     assert response.status_code == 200
-    assert "Paid GBP 6,000.00 to University of Westbridge" in response.text
-    assert "simulated" in response.text
+    assert "Sent ✓ GBP 6,000.00 to University of Westbridge" in response.text
+    assert "Test payment, simulated, no real money." in response.text
     assert status_of_only_proposal(site) == "executed"
     assert [r["status"] for r in site.query("SELECT status FROM payouts")] == ["succeeded"]
 
@@ -611,7 +611,7 @@ def test_a_payment_that_has_to_wait_says_so_after_the_pin(site):
     response = enter(site, token)
     assert response.status_code == 200
     assert "<h1>Waiting</h1>" in response.text and "It can run after" in response.text
-    assert "Paid" not in response.text
+    assert "Sent ✓" not in response.text
     assert site.query("SELECT id FROM payouts") == []
 
 
@@ -638,11 +638,38 @@ def used_at_local(site) -> str:
     return clock.parse(stamp).astimezone(ZoneInfo("Africa/Nairobi")).strftime("%H:%M")
 
 
+def test_a_held_payment_page_stays_put_for_a_browser_with_a_session(site):
+    # Catches: the explanation of a held payment vanishing after 4 seconds, before it can be read.
+    site.login()
+    page = enter(site, start(site, just_trusted=True))
+    assert "<h1>Waiting</h1>" in page.text
+    assert 'http-equiv="refresh"' not in page.text and "Back to the chat" in page.text
+
+
+@pytest.mark.parametrize("status", ["failed", "blocked", "waiting"])
+def test_a_used_link_that_did_not_succeed_stays_put_for_a_browser_with_a_session(site, status):
+    # Catches: a failure or a stop being replaced by the chat after 4 seconds, before it can be read.
+    token = add_jonathan(site)
+    enter(site, token)
+    site.query("UPDATE proposals SET status = ?", status)
+    site.login()
+    page = site.client.get(f"/confirm/{token}").text
+    assert 'http-equiv="refresh"' not in page and "Back to the chat" in page
+
+
+def test_the_chat_intro_says_how_to_start_and_not_to_type_the_pin(site):
+    # Catches: an intro that explains too much, or drops the warning never to type the PIN in the chat.
+    site.login()
+    page = site.client.get("/chat").text
+    assert "Say hi for the menu, or send an invoice photo or PDF. Never type your PIN here." in page
+    assert "Ask me about the fees" not in page
+
+
 def test_the_page_after_the_right_pin_says_done_and_what_was_done(site):
     # Catches: a success page that does not look like success, so the person submits the PIN again.
     page = words(enter(site, add_jonathan(site)))
     assert "<h1>Done ✓</h1>" in page
-    assert "Jonathan Siror is saved. You can send them money now." in page
+    assert "Jonathan Siror is saved as a recipient." in page
 
 
 def test_a_browser_with_a_session_is_sent_back_to_the_chat_after_four_seconds(site):
@@ -684,7 +711,7 @@ def test_a_used_link_says_when_it_was_confirmed_and_what_was_done(site, method):
     enter(site, token)
     again = site.client.get(f"/confirm/{token}") if method == "get" else enter(site, token)
     assert again.status_code == 200
-    expected = f"This was already confirmed at {used_at_local(site)}. Jonathan Siror is saved."
+    expected = f"This was already confirmed at {used_at_local(site)}. Jonathan Siror is saved as a recipient."
     assert expected in words(again)
 
 
@@ -748,7 +775,7 @@ def test_the_outcome_note_goes_out_on_whatsapp_right_after_the_pin(settings):
     )
     site.query("INSERT INTO identities (channel, address, member_id) VALUES ('whatsapp', 'whatsapp:+254700000001', 'm_amina')")
     enter(site, add_jonathan(site))
-    assert ("whatsapp:+254700000001", "Done ✓ Jonathan Siror is saved. You can send them money now.") in sent
+    assert ("whatsapp:+254700000001", "Done ✓ Jonathan Siror is saved as a recipient.") in sent
     waiting = site.query("SELECT id FROM outbox WHERE channel = 'whatsapp' AND delivered_at IS NULL AND text LIKE 'Done ✓%'")
     assert waiting == []
 

@@ -146,8 +146,7 @@ def test_a_confirmed_send_pays_the_saved_recipient_and_the_receipt_says_simulate
     assert propose_send(conn, provider).status == "awaiting_pin"
     outcome = run(conn, provider, confirm(conn))
     assert outcome.status == "executed"
-    assert outcome.message.startswith("Paid XAF 5,000 to Paul Mbarga (cost KES 1,152.08).")
-    assert "(simulated)" in outcome.message
+    assert outcome.message.startswith("Sent ✓ XAF 5,000 to Paul Mbarga. Cost KES 1,152.08. Test payment, simulated, ")
     row = conn.execute("SELECT * FROM payouts").fetchone()
     assert (row["kind"], row["status"], row["amount_minor"], row["currency"]) == ("send", "succeeded", 5000, "XAF")
 
