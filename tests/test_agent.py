@@ -143,6 +143,8 @@ def test_the_main_payer_is_offered_every_tool(conn):
         "compare_routes",
         "propose_fee_payment",
         "propose_allowance",
+        "add_recipient",
+        "propose_transfer",
         "freeze",
         "request_unfreeze",
         "send_reminders",

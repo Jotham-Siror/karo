@@ -11,10 +11,10 @@ import sqlite3
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
-from karo import audit, collections, comparison, db, outbox, proposals, quotes, rates, rules, store
+from karo import audit, collections, comparison, countries, db, outbox, proposals, quotes, rates, rules, store
 from karo.domain import FamilyState, Kind, Member, Payee, Quote, Role
 from karo.money import Money
 from karo.providers.base import Provider
@@ -22,6 +22,9 @@ from karo.rules import Outcome, RuleResult
 
 # Larger than any real fee, small enough that SQLite stores it as an INTEGER.
 _MAX_MINOR = 10**14
+
+# A longer name would push the details off the PIN page.
+_MAX_NAME = 60
 
 
 @dataclass(frozen=True)
@@ -396,6 +399,106 @@ def _propose_allowance(ctx: ToolContext, args: dict) -> dict:
     return _proposed(ctx, Kind.ALLOWANCE_SET, amount=amount, payee=payee, quote_id=quote_id)
 
 
+def _sendable() -> dict[str, countries.Country]:
+    return {code: c for code, c in sorted(countries.load().items()) if c.payout_methods}
+
+
+def _recipient_help() -> str:
+    """The countries, methods and details from the settings, so the model has the ids and need not guess."""
+    return " ".join(
+        f"{code} ({c.name}, {c.currency}): methods {', '.join(f'{m.id} = {m.label}' for m in c.payout_methods)}; "
+        f"details {', '.join(c.payout_fields)}."
+        for code, c in _sendable().items()
+    )
+
+
+def _wait_text(wait: timedelta) -> str:
+    minutes = int(wait.total_seconds()) // 60
+    if minutes % 60:
+        return f"{minutes} minutes"
+    hours = minutes // 60
+    return f"{hours} hour{'' if hours == 1 else 's'}"
+
+
+def _recipient_details(code: str, country: countries.Country, pairs: list[dict]) -> dict[str, str]:
+    given: dict[str, str] = {}
+    for pair in pairs:
+        field, value = pair["field"].strip().casefold(), pair["value"].strip()
+        if field in given:
+            raise _BadInput(f"{field} was given twice.")
+        given[field] = value
+    unknown = sorted(set(given) - set(country.payout_fields))
+    missing = [f for f in country.payout_fields if not given.get(f)]
+    if unknown or missing:
+        needs = ", ".join(country.payout_fields)
+        extra = f" Not used there: {', '.join(unknown)}." if unknown else ""
+        raise _BadInput(f"Sending to {country.name} needs exactly these details: {needs}.{extra}")
+    if "phone" in given:
+        try:
+            given["phone"] = countries.normalise_phone(given["phone"], code)
+        except ValueError as exc:
+            raise _BadInput(str(exc)) from exc
+        if not countries.phone_is_in(given["phone"], code):
+            raise _BadInput(f"{given['phone']} isn't a {country.name} number.")
+    return given
+
+
+def _add_recipient(ctx: ToolContext, args: dict) -> dict:
+    name = args["name"].strip()
+    if not name or len(name) > _MAX_NAME:
+        raise _BadInput(f"Give the recipient's name, in {_MAX_NAME} characters or fewer.")
+    code = args["country"].strip().upper()
+    country = _sendable().get(code)
+    if country is None:
+        raise _BadInput(f"Karo can't send to {args['country']!r} yet. It can send to: {', '.join(_sendable())}.")
+    method_id = args["method"].strip().casefold()
+    if method_id not in {m.id for m in country.payout_methods}:
+        ids = ", ".join(m.id for m in country.payout_methods)
+        raise _BadInput(f"{args['method']!r} isn't a way to send to {country.name}. Use one of: {ids}.")
+    details = _recipient_details(code, country, args["details"])
+    # Every source: a recipient with an institution's name would be mistaken for it, and a repeat name makes "send to
+    # Paul" ambiguous.
+    trusted = store.load_state(ctx.conn, ctx.family_id, ctx.now).trusted_payees
+    if any(t.payee.name.casefold() == name.casefold() for t in trusted):
+        raise _BadInput(f"There is already a payee called {name!r}. Use a different name, such as one with a surname.")
+    payee = Payee.of(name, country=code, currency=country.currency, method=method_id, **details)
+    result = _proposed(ctx, Kind.ADD_PAYEE, payee=payee)
+    if result["status"] == "awaiting_pin":
+        policy = store.family_config(ctx.conn, ctx.family_id).policy
+        result["message"] += (
+            f" Once confirmed, any send above {policy.new_payee_threshold} to {name} has to wait "
+            f"{_wait_text(policy.new_payee_wait)} after {name} is added. Tell the main payer."
+        )
+    return result
+
+
+def _saved_recipient(ctx: ToolContext, name: str) -> Payee:
+    """The one payee the family added itself that goes by this name. Nothing said in chat is paid, only this record."""
+    saved = store.added_payees(ctx.conn, ctx.family_id)
+    found = [t.payee for t in saved if t.payee.name.casefold() == name.strip().casefold()]
+    if not found:
+        known = ", ".join(t.payee.name for t in saved) or "none"
+        raise _BadInput(
+            f"There is no saved recipient called {name!r}. Saved: {known}. A new recipient has to be added with "
+            "add_recipient and confirmed with the PIN before any money can go to them."
+        )
+    if len(found) > 1:
+        raise _BadInput(f"More than one saved recipient is called {name!r}. Ask the main payer which one they mean.")
+    return found[0]
+
+
+def _propose_transfer(ctx: ToolContext, args: dict) -> dict:
+    amount = _money(args["amount"], args["currency"])
+    payee = _saved_recipient(ctx, args["recipient"])
+    account_currency = dict(payee.details).get("currency", "").upper()
+    if not account_currency:
+        raise _BadInput(f"I don't have a currency on file for {payee.name}, so I can't send to them.")
+    if account_currency != amount.currency:
+        raise _BadInput(f"{payee.name} is paid in {account_currency}, so the amount has to be in {account_currency}.")
+    quote = _new_quote(ctx, amount)
+    return _proposed(ctx, Kind.SEND, amount=amount, payee=payee, quote_id=quote.id)
+
+
 def _freeze(ctx: ToolContext, _args: dict) -> dict:
     message = proposals.freeze(ctx.conn, family_id=ctx.family_id, actor=ctx.member, now=ctx.now)
     return {"message": message}
@@ -534,6 +637,41 @@ _TOOLS: tuple[_Tool, ...] = (
         ),
         _propose_allowance,
         _MAIN_PAYER,
+    ),
+    _Tool(
+        "add_recipient",
+        "Add a person abroad as a saved recipient so money can later be sent to them. Nothing is saved until the "
+        "main payer confirms with a PIN, and the PIN page shows every detail. Use only what the main payer told you, "
+        "exactly as written. Where each country can be sent to: " + _recipient_help() + " Give each detail as a "
+        "field and value pair, for example field phone and value +237 6 71 23 45 67.",
+        _object(
+            name=_text("The recipient's name, e.g. Paul Mbarga."),
+            country=_text("Two-letter country code of the recipient, e.g. CM."),
+            method=_text("The id of the way to send, from the list for that country, e.g. mtn_cm."),
+            details=_list_of(
+                _object(
+                    field=_text("The detail's name, from the list for that country, e.g. phone."),
+                    value=_text("The detail exactly as written, e.g. +237 6 71 23 45 67."),
+                )
+            ),
+        ),
+        _add_recipient,
+        _MAIN_PAYER,
+        gated=True,
+    ),
+    _Tool(
+        "propose_transfer",
+        "Propose sending money to a saved recipient abroad. The recipient must already be saved and confirmed with a "
+        "PIN: if they are not, use add_recipient first. Never use account or phone details from chat here; Karo pays "
+        "only the saved ones. Karo gets the price itself. Nothing moves until the main payer confirms with a PIN.",
+        _object(
+            recipient=_text("The saved recipient's name, e.g. Paul Mbarga."),
+            amount=_text(f"What the recipient receives. {_AMOUNT}"),
+            currency=_text("Three-letter currency code the recipient is paid in, e.g. XAF."),
+        ),
+        _propose_transfer,
+        _MAIN_PAYER,
+        gated=True,
     ),
     _Tool(
         "freeze",

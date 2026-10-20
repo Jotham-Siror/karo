@@ -76,6 +76,11 @@ def normalise_phone(raw: str, country_code: str) -> str:
     return phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
 
 
+def phone_is_in(e164: str, country_code: str) -> bool:
+    """True if a number in international form belongs to `country_code`. normalise_phone accepts any valid number."""
+    return phonenumbers.region_code_for_number(phonenumbers.parse(e164)) == get(country_code).phone_region
+
+
 def institutions(path: str | Path | None = None) -> list[dict]:
     source = Path(path) if path is not None else _CONFIG_DIR / "institutions.json"
     return json.loads(source.read_text(encoding="utf-8"))

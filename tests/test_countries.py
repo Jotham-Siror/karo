@@ -162,3 +162,9 @@ def test_a_country_with_no_payout_methods_listed_still_loads(tmp_path):
 def test_a_cameroon_number_is_normalised_to_e164():
     # Bug caught: a Cameroon number being read with another country's dialling code.
     assert countries.normalise_phone("6 71 23 45 67", "CM") == "+237671234567"
+
+
+def test_a_number_belongs_to_the_country_whose_code_it_carries():
+    # Bug caught: telling a Kenyan number from a Cameroon one by the dialling code alone being valid anywhere.
+    assert countries.phone_is_in("+237671234567", "CM") is True
+    assert countries.phone_is_in("+254712345678", "CM") is False
