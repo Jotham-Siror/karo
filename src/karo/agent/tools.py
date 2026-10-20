@@ -454,9 +454,10 @@ def _recipient_details(code: str, country: countries.Country, pairs: list[dict])
 
 
 def _is_plain_name(name: str) -> bool:
-    """Letters in any script, single spaces, and . ' - only. The name heads the PIN message, so it must not be able to
-    carry a number or a line of its own that sits beside the real details."""
-    return any(ch.isalpha() for ch in name) and all(ch.isalpha() or ch in " .'-" for ch in name)
+    """Letters in any script, single spaces, and . ' ’ - only. The name heads the PIN message, so it must not
+    be able to carry a number or a line of its own that sits beside the real details. ’ is what a phone's
+    smart punctuation turns ' into."""
+    return any(ch.isalpha() for ch in name) and all(ch.isalpha() or ch in " .'’-" for ch in name)
 
 
 def _letters(name: str) -> str:
@@ -518,25 +519,30 @@ def _propose_transfer(ctx: ToolContext, args: dict) -> dict:
         raise _BadInput(f"I don't have a currency on file for {payee.name}, so I can't send to them.")
     if account_currency != amount.currency:
         raise _BadInput(f"{payee.name} is paid in {account_currency}, so the amount has to be in {account_currency}.")
-    if _send_awaiting_pin(ctx, amount, payee):
+    under_way = _identical_send_under_way(ctx, amount, payee)
+    if under_way == "awaiting_pin":
         raise _BadInput(
             f"A send of {amount} to {payee.name} is already waiting for the PIN. "
             "Ask the main payer to confirm that one instead of making another."
+        )
+    if under_way is not None:
+        raise _BadInput(
+            f"A send of {amount} to {payee.name} is already confirmed, and is being held or sent. "
+            "Check get_status instead of making another."
         )
     quote = _new_quote(ctx, amount)
     return _proposed(ctx, Kind.SEND, amount=amount, payee=payee, quote_id=quote.id)
 
 
-def _send_awaiting_pin(ctx: ToolContext, amount: Money, payee: Payee) -> bool:
-    """An identical send whose PIN link can still be used. A send has no invoice to tell two apart, so without this a
-    repeated request pays twice. A link nobody used has expired, and the send may be made again."""
-    return any(
-        p.kind is Kind.SEND
-        and (p.amount, p.payee) == (amount, payee)
-        and row["status"] == "awaiting_pin"
-        and approvals.has_live_link(ctx.conn, ctx.family_id, p.id, ctx.now)
-        for p, row in store.open_proposals(ctx.conn, ctx.family_id)
-    )
+def _identical_send_under_way(ctx: ToolContext, amount: Money, payee: Payee) -> str | None:
+    """The status of an identical send that has not finished, else None. A send has no invoice to tell two apart, so
+    without this a repeated request pays twice. A PIN link nobody used has expired, and the send may be made again.
+    Once the PIN is in (confirmed, or waiting out the new-recipient hold) it stays under way until it runs or fails."""
+    for p, row in store.open_proposals(ctx.conn, ctx.family_id):
+        if p.kind is Kind.SEND and (p.amount, p.payee) == (amount, payee):
+            if row["status"] != "awaiting_pin" or approvals.has_live_link(ctx.conn, ctx.family_id, p.id, ctx.now):
+                return row["status"]
+    return None
 
 
 def _freeze(ctx: ToolContext, _args: dict) -> dict:

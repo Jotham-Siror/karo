@@ -17,6 +17,7 @@ from karo.agent.prompt import system_prompt
 from karo.agent.tools import ToolContext, run_tool, tools_for
 from karo.domain import Kind, Payee, Role
 from karo.money import Money
+from karo.providers.base import PayoutResult
 from karo.providers.standin import StandInProvider
 
 NOW = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
@@ -375,7 +376,7 @@ def test_a_name_with_anything_but_letters_spaces_and_dot_apostrophe_hyphen_is_re
     assert (count(conn, "proposals"), texts(conn)) == (0, [])
 
 
-@pytest.mark.parametrize("name", ["N'Goné Ndiaye-Fall", "Dr. Jean-Luc Obiang", "李小龙", "U" * 80])
+@pytest.mark.parametrize("name", ["N'Goné Ndiaye-Fall", "N’Goné Ndiaye-Fall", "Dr. Jean-Luc Obiang", "李小龙", "U" * 80])
 def test_real_names_in_any_script_up_to_80_characters_are_accepted(conn, provider, name):
     # Bug caught: the name rule refusing accents, apostrophes, hyphens or names not written in the Latin alphabet.
     assert add_recipient(conn, provider, name=name)["status"] == "awaiting_pin"
@@ -524,6 +525,44 @@ def test_a_different_amount_or_recipient_may_be_sent_while_another_send_waits(co
     transfer(conn, provider)
     assert transfer(conn, provider, amount="6000")["status"] == "awaiting_pin"
     assert transfer(conn, provider, recipient="Grace Ndong")["status"] == "awaiting_pin"
+
+
+def status_of_sends(conn) -> list[str]:
+    return [r["status"] for r in conn.execute("SELECT status FROM proposals WHERE kind = 'send' ORDER BY rowid")]
+
+
+def test_a_second_identical_send_while_the_first_is_held_by_the_new_recipient_wait_is_refused(conn, provider):
+    # Bug caught: "send it" said again during the 24 hour hold, so both sends pay when the hold ends.
+    save_recipient(conn, since=NOW - timedelta(hours=1))
+    assert transfer(conn, provider, amount="200000")["status"] == "awaiting_pin"
+    run(conn, provider, confirm(conn))
+    assert status_of_sends(conn) == ["waiting"]
+    again = transfer(conn, provider, amount="200000")
+    assert set(again) == {"error"} and "already confirmed" in again["error"]
+    assert (count(conn, "proposals"), count(conn, "quotes")) == (1, 1)
+
+
+def test_a_second_identical_send_after_the_pin_but_before_it_runs_is_refused(conn, provider):
+    # Bug caught: a gap between the PIN and the payout in which the same send could be started again.
+    save_recipient(conn)
+    transfer(conn, provider)
+    confirm(conn)
+    assert status_of_sends(conn) == ["confirmed"]
+    assert "already confirmed" in transfer(conn, provider)["error"]
+
+
+def test_a_send_that_failed_does_not_block_the_same_send_again(conn, provider):
+    # Bug caught: a failed payout leaving its send "in flight" for ever, so the family could never retry it.
+    class Refusing(RecordingProvider):
+        def payout(self, **kwargs):
+            return PayoutResult(kwargs["reference"], None, "failed", True, "Refused.")
+
+    refusing = Refusing(rates=RATES, secret="standin-test-secret", base_url=BASE_URL)
+    save_recipient(conn)
+    transfer(conn, refusing)
+    assert run(conn, refusing, confirm(conn)).status == "failed"
+    assert status_of_sends(conn) == ["failed"]
+    assert transfer(conn, refusing)["status"] == "awaiting_pin"
 
 
 def test_the_same_send_may_be_made_again_once_the_first_has_run(conn, provider):
