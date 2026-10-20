@@ -9,7 +9,7 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 
 - **Repository:** https://github.com/Jotham-Siror/karo
 - **Live demo:** https://karo.linxke.com. It runs from a team laptop through a Cloudflare tunnel, so it may be offline. Running it locally takes about five minutes (see below).
-- **Demo video, PDFs and promo videos:** https://github.com/Jotham-Siror/karo/releases/tag/submission-v1
+- **Demo video, PDFs and promo video:** https://github.com/Jotham-Siror/karo/releases/tag/submission-v2
 - **Technical documentation:** [docs/technical-documentation.md](docs/technical-documentation.md)
 - **Security self-assessment:** [docs/security-self-assessment.md](docs/security-self-assessment.md)
 
@@ -26,7 +26,7 @@ Team Fedha: Maela Mouto, Jotham Siror and May Jelimo, Strathmore University, Nai
 | Part | Status |
 | --- | --- |
 | Chat on the web page | Real |
-| Chat on WhatsApp (Twilio sandbox) | Real: Twilio's sandbox number; every incoming message's signature is checked |
+| Chat on WhatsApp (Twilio sandbox) | Real: Twilio's sandbox number; every incoming message's signature is checked. The demo video's main part is a recording of a real phone on WhatsApp |
 | AI agent | Real: Claude, `claude-opus-5-5` |
 | Relatives paying their share, in the app | Simulated on the stand-in provider. Its checkout page says "simulated, no real money" |
 | Flutterwave test mode | Built into the app as an option (`KARO_PROVIDER=flutterwave`: Flutterwave collects the shares, the stand-in pays out). Proven against Flutterwave by `scripts/smoke_flutterwave.py`: hosted payment links for M-Pesa (KES) and MTN Uganda (UGX), and an M-Pesa test charge confirmed by Flutterwave. Test mode moves no real money |
@@ -78,7 +78,7 @@ Run **one** uvicorn worker. The scheduler and some locks live inside the process
 uv run pytest
 ```
 
-Result at submission: **1,164 passed** (commit `95cc9d4`). The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
+Result at submission: **1,215 passed** (the code at commit `1352c5a`, tag `submission-v2`). The tests run offline: a fake Claude replaces the model, the stand-in replaces the provider, and HTTP calls are mocked.
 
 | File | What it checks |
 | --- | --- |
@@ -113,7 +113,7 @@ Result at submission: **1,164 passed** (commit `95cc9d4`). The tests run offline
 
 ### End-to-end check with the real Claude
 
-With the app running, this drives the 9 demo scenes through the web page and prints PASS or FAIL per scene. It uses the real Claude API, so it costs API credit. It also resets the demo.
+With the app running, this drives the 10 demo scenes through the web page in short casual messages, with the invoices sent as PDFs, and prints PASS or FAIL per scene. It uses the real Claude API, so it costs API credit. It also resets the demo, so never aim it at a demo you want to keep. On the submitted code it passed all ten.
 
 ```bash
 uv run python scripts/e2e_web_check.py http://localhost:8000
@@ -168,7 +168,7 @@ tests/
 | Deep Chat (web chat box, from jsDelivr) | 2.5.1 | MIT |
 | pytest, respx, time-machine (tests only) | 9.1.1, 0.23.1, 3.5.1 | MIT, BSD-3-Clause, MIT |
 
-The two short promo videos use music by Sascha Ende (ende.app), "Happy Beats & Business Moves" Vol. 9 and Vol. 12, licensed CC BY 4.0 (ende.app/standard-license).
+The promo video uses music by Sascha Ende (ende.app), "Happy Beats & Business Moves" Vol. 9 and Vol. 12, licensed CC BY 4.0 (ende.app/standard-license).
 
 Exchange rates by [Exchange Rate API](https://www.exchangerate-api.com) (open.er-api.com). Flutterwave and Twilio are used through their public APIs in test and sandbox modes.
 
