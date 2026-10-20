@@ -67,7 +67,7 @@ _PIN_PAGE_HEADERS = {
 }
 
 _RESULT_HEADINGS = {
-    "executed": ("Done", "ok"),
+    "executed": ("Done ✓", "ok"),
     "pending": ("On its way", "info"),
     "waiting": ("Waiting", "info"),
     "failed": ("That didn't work", "bad"),
@@ -119,9 +119,13 @@ def get_conn(request: Request) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def require_member(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Member:
+def _session_member(request: Request, conn: sqlite3.Connection) -> Member | None:
     address = request.session.get("member_address")
-    member = store.member_for_identity(conn, WEB, address) if address else None
+    return store.member_for_identity(conn, WEB, address) if address else None
+
+
+def require_member(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Member:
+    member = _session_member(request, conn)
     if member is None:
         raise LoginRequired
     return member
@@ -153,6 +157,11 @@ def _page(
     return TEMPLATES.TemplateResponse(request, template, context, status_code=status_code, headers=headers)
 
 
+def _whatsapp_url(request: Request) -> str | None:
+    digits = re.sub(r"[^0-9]", "", request.app.state.settings.twilio_whatsapp_from or "")
+    return f"https://wa.me/{digits}" if digits else None
+
+
 def _notice(
     request: Request,
     conn: sqlite3.Connection,
@@ -161,9 +170,22 @@ def _notice(
     status_code: int = 200,
     heading: str = "",
     tone: str = "info",
+    way_back: bool = False,
 ) -> Response:
+    """`way_back` is for the end of a confirm. With a web session the page returns to the chat by itself; without one
+    (the person came from a WhatsApp link) it offers the way back to WhatsApp."""
+    signed_in = _session_member(request, conn) is not None
     return _page(
-        request, conn, "result.html", status_code, _PIN_PAGE_HEADERS, heading=heading, message=message, tone=tone
+        request,
+        conn,
+        "result.html",
+        status_code,
+        _PIN_PAGE_HEADERS,
+        heading=heading,
+        message=message,
+        tone=tone,
+        auto_return=way_back and signed_in,
+        whatsapp_url=_whatsapp_url(request) if way_back and not signed_in else None,
     )
 
 
@@ -338,12 +360,45 @@ def _confirm_page(
     )
 
 
+# What a used link says when its proposal did not end as done. Each is a sentence of its own after "confirmed at".
+_AFTER_CONFIRM = {
+    "failed": ("It did not go through.", "bad"),
+    "blocked": ("Karo then stopped it, so nothing was done.", "bad"),
+    "waiting": ("It has to wait before it can run.", "info"),
+    "confirmed": ("It is still being processed. You'll get a message when it's done.", "info"),
+}
+
+
+def _at_text(moment: datetime, now: datetime, tz: ZoneInfo) -> str:
+    same_day = moment.astimezone(tz).date() == now.astimezone(tz).date()
+    return moment.astimezone(tz).strftime("%H:%M") if same_day else proposals.when_text(moment, tz)
+
+
+def _link_gone(request: Request, conn: sqlite3.Connection, token: str, now: datetime) -> Response:
+    """A link that can't be used again. If its PIN was entered, say what became of the proposal, so pressing Confirm
+    a second time isn't a dead end. An unknown or expired token gets the plain not-found and nothing more."""
+    used = approvals.used_link(conn, token)
+    found = None if used is None else store.get_proposal(conn, used.family_id, used.proposal_id)
+    if found is None:
+        return _notice(request, conn, EXPIRED, status_code=404)
+    p, row = found
+    if row["status"] == "executed":
+        ending, tone = executor.done_text(p, store.load_state(conn, used.family_id, now)), "ok"
+    elif row["status"] in _AFTER_CONFIRM:
+        ending, tone = _AFTER_CONFIRM[row["status"]]
+    else:
+        return _notice(request, conn, NOT_WAITING, status_code=409)
+    at = _at_text(used.used_at, now, store.family_config(conn, used.family_id).timezone)
+    message = f"This was already confirmed at {at}. {ending}"
+    return _notice(request, conn, message, heading="Already confirmed", tone=tone, way_back=True)
+
+
 @router.get("/confirm/{token}")
 def confirm_page(token: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     now = clock.now(conn)
     link = approvals.open_link(conn, token, now)
     if link is None:
-        return _notice(request, conn, EXPIRED, status_code=404)
+        return _link_gone(request, conn, token, now)
     return _confirm_page(request, conn, link, now)
 
 
@@ -359,7 +414,7 @@ def confirm_submit(
     now = clock.now(conn)
     link = approvals.open_link(conn, token, now)
     if link is None:
-        return _notice(request, conn, EXPIRED, status_code=404)
+        return _link_gone(request, conn, token, now)
     pin = pin.strip()
     if not base.PIN_SHAPE.fullmatch(pin):
         # Not passed on: a typo must not use up one of the three attempts.
@@ -372,7 +427,7 @@ def confirm_submit(
         case "not_awaiting":
             return _notice(request, conn, NOT_WAITING, status_code=409)
         case "invalid_link":
-            return _notice(request, conn, EXPIRED, status_code=404)
+            return _link_gone(request, conn, token, now)
         case "locked":
             return _confirm_page(request, conn, link, now, status_code=429)
         case "wrong_pin":
@@ -420,9 +475,9 @@ def _run_confirmed(
             event="execute.error",
             data={"proposal_id": link.proposal_id, "error": type(error).__name__},
         )
-        return _notice(request, conn, PROCESSING, heading="On its way", tone="info")
+        return _notice(request, conn, PROCESSING, heading="On its way", tone="info", way_back=True)
     heading, tone = _RESULT_HEADINGS.get(outcome.status, ("Not done", "bad"))
-    return _notice(request, conn, outcome.message, heading=heading, tone=tone)
+    return _notice(request, conn, outcome.message, heading=heading, tone=tone, way_back=True)
 
 
 # --- money in: the stand-in checkout and the provider's notices ----------------------------------

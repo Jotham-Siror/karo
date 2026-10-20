@@ -620,10 +620,121 @@ def test_a_link_cannot_be_used_twice(site):
     token = start(site)
     enter(site, token)
     again = enter(site, token)
-    assert again.status_code == 404
-    assert EXPIRED in again.text
-    assert EXPIRED in site.client.get(f"/confirm/{token}").text
+    assert "already confirmed" in again.text
+    assert "already confirmed" in site.client.get(f"/confirm/{token}").text
     assert len(site.query("SELECT id FROM payouts")) == 1
+
+
+JONATHAN = Payee.of("Jonathan Siror", country="GB", currency="GBP", sort_code="11-22-33", account_number="87654321")
+WHATSAPP_FROM = "whatsapp:+14155238886"
+
+
+def add_jonathan(site) -> str:
+    return start(site, kind=Kind.ADD_PAYEE, payee=JONATHAN)
+
+
+def used_at_local(site) -> str:
+    stamp = site.query("SELECT used_at FROM confirm_links")[0]["used_at"]
+    return clock.parse(stamp).astimezone(ZoneInfo("Africa/Nairobi")).strftime("%H:%M")
+
+
+def test_the_page_after_the_right_pin_says_done_and_what_was_done(site):
+    # Catches: a success page that does not look like success, so the person submits the PIN again.
+    page = words(enter(site, add_jonathan(site)))
+    assert "<h1>Done ✓</h1>" in page
+    assert "Jonathan Siror is now a saved recipient." in page
+
+
+def test_a_browser_with_a_session_is_sent_back_to_the_chat_after_four_seconds(site):
+    # Catches: the person left on a finished page with nothing to take them back to the chat.
+    site.login()
+    assert '<meta http-equiv="refresh" content="4;url=/chat">' in enter(site, add_jonathan(site)).text
+
+
+def test_a_browser_without_a_session_is_not_sent_anywhere_on_its_own(site):
+    # Catches: a phone that came from WhatsApp being refreshed to the login page before it can read the result.
+    assert 'http-equiv="refresh"' not in enter(site, add_jonathan(site)).text
+
+
+def test_without_a_session_the_done_page_offers_whatsapp_and_the_chat(settings):
+    # Catches: a person who came from a WhatsApp link with no way to get back to that conversation.
+    site = Site(replace(settings, twilio_whatsapp_from=WHATSAPP_FROM))
+    page = enter(site, add_jonathan(site)).text
+    assert '<a class="button" href="https://wa.me/14155238886">Back to WhatsApp</a>' in page
+    assert '<a class="button" href="/chat">Back to the chat</a>' in page
+
+
+def test_with_a_session_the_done_page_does_not_offer_whatsapp(settings):
+    # Catches: a person already in the web chat being offered a second way back that leaves the page they came to use.
+    site = Site(replace(settings, twilio_whatsapp_from=WHATSAPP_FROM))
+    site.login()
+    assert "wa.me" not in enter(site, add_jonathan(site)).text
+
+
+def test_with_no_whatsapp_number_set_the_done_page_has_no_whatsapp_button(site):
+    # Catches: a button to https://wa.me/None when Twilio is not set up.
+    page = enter(site, add_jonathan(site)).text
+    assert "wa.me" not in page and "Back to the chat" in page
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_a_used_link_says_when_it_was_confirmed_and_what_was_done(site, method):
+    # Catches: a second visit to a used link answered with a bare "not found", as if nothing had happened.
+    token = add_jonathan(site)
+    enter(site, token)
+    again = site.client.get(f"/confirm/{token}") if method == "get" else enter(site, token)
+    assert again.status_code == 200
+    expected = f"This was already confirmed at {used_at_local(site)}. Jonathan Siror is now a saved recipient."
+    assert expected in words(again)
+
+
+def test_a_used_link_does_not_add_the_payee_or_tell_the_chat_again(site):
+    # Catches: pressing Confirm several times adding the payee again or sending the outcome note again.
+    token = add_jonathan(site)
+    for _ in range(5):
+        enter(site, token)
+    assert len(site.query("SELECT id FROM trusted_payees WHERE name = 'Jonathan Siror'")) == 1
+    done = site.query("SELECT id FROM outbox WHERE member_id = 'm_amina' AND channel = 'web' AND text LIKE 'Done:%'")
+    assert len(done) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "words_for_it"),
+    [
+        ("failed", "It did not go through."),
+        ("blocked", "Karo then stopped it, so nothing was done."),
+        ("waiting", "It has to wait before it can run."),
+        ("confirmed", "It is still being processed."),
+    ],
+)
+def test_a_used_link_says_plainly_how_its_proposal_ended(site, status, words_for_it):
+    # Catches: a used link claiming success for a payment that failed, was stopped, or has not finished.
+    token = add_jonathan(site)
+    enter(site, token)
+    site.query("UPDATE proposals SET status = ?", status)
+    page = words(site.client.get(f"/confirm/{token}"))
+    assert words_for_it in page
+    assert "is now a saved recipient" not in page
+
+
+def test_an_expired_link_that_was_never_used_stays_a_plain_not_found(site):
+    # Catches: the used-link page leaking what a proposal was to anyone holding an old, unused link.
+    token = add_jonathan(site)
+    site.query("UPDATE confirm_links SET expires_at = '2000-01-01T00:00:00+00:00'")
+    response = site.client.get(f"/confirm/{token}")
+    assert response.status_code == 404
+    assert EXPIRED in response.text and "Jonathan" not in response.text
+
+
+def test_a_used_link_whose_member_is_in_another_family_stays_a_plain_not_found(site):
+    # Catches: a link row that crosses families showing one family the other family's proposal.
+    token = add_jonathan(site)
+    enter(site, token)
+    (outsider,) = site.query("SELECT id FROM members WHERE family_id = 'fam_mwangi' AND role = 'main_payer'")
+    site.query("UPDATE confirm_links SET member_id = ?", outsider["id"])
+    response = site.client.get(f"/confirm/{token}")
+    assert response.status_code == 404
+    assert EXPIRED in response.text and "Jonathan" not in response.text
 
 
 def test_a_provider_error_after_the_pin_says_the_payment_is_being_processed(make_site):
@@ -1117,7 +1228,7 @@ def test_a_split_whose_links_partly_fail_is_done_and_says_what_is_left(make_site
     site = make_site(provider=DropsTheSecondLink.from_config(SECRET, BASE_URL))
     page = enter(site, split_token(site))
     text = words(page)
-    assert page.status_code == 200 and "<h1>Done</h1>" in page.text
+    assert page.status_code == 200 and "<h1>Done ✓</h1>" in page.text
     assert "Some payment links couldn't be sent yet; Karo will retry when you send reminders." in text
     assert PROCESSING not in text
     assert status_of_only_proposal(site) == "executed"

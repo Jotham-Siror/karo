@@ -473,7 +473,8 @@ def test_done_means_a_retried_payment_pays_once(make_world):
     balance_before = ledger.balance(world.conn, FAM, "KES")
 
     assert world.enter_pin(token).status_code == 200
-    assert world.enter_pin(token).status_code == 404  # the same link again, as a double tap or a retry would
+    again = world.enter_pin(token)  # the same link again, as a double tap or a retry would
+    assert again.status_code == 200 and "already confirmed" in again.text
     executor.execute(
         world.conn, sender, family_id=FAM, proposal_id=proposal_id, now=world.now(), base_url=BASE_URL
     )

@@ -991,3 +991,100 @@ def test_a_conversion_moves_the_ledger_and_is_labelled_simulated(conn, provider)
     (event,) = events(conn, "conversion.done")
     assert event["data"]["simulated"] is True
     assert provider.payout_calls == 0
+
+
+# --- telling the main payer how it ended ------------------------------------------------------
+
+
+def give_whatsapp(conn, member_id: str = "m_amina") -> None:
+    conn.execute(
+        "INSERT INTO identities (channel, address, member_id) VALUES ('whatsapp', 'whatsapp:+254700000001', ?)",
+        (member_id,),
+    )
+
+
+def newest_outbox_id(conn) -> int:
+    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM outbox").fetchone()[0]
+
+
+def sent_since(conn, last_id: int, member_id: str = "m_amina") -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT channel, text FROM outbox WHERE id > ? AND member_id = ? ORDER BY id", (last_id, member_id)
+    )
+    return [(r["channel"], r["text"]) for r in rows]
+
+
+def confirmed_without_receipt(conn, provider, kind: Kind) -> str:
+    """A proposal of a kind that moves no money out, confirmed with the PIN and not yet run."""
+    match kind:
+        case Kind.ADD_PAYEE:
+            payee = Payee.of(
+                "Jonathan Siror", country="GB", currency="GBP", sort_code="11-22-33", account_number="87654321"
+            )
+            propose(conn, provider, kind, payee=payee)
+        case Kind.ALLOWANCE_SET:
+            fund(conn)
+            propose(conn, provider, kind, target="500.00", payee=trusted(conn, "tp_jabali"))
+        case Kind.UNFREEZE:
+            proposals.freeze(conn, family_id=FAM, actor=member(conn, "m_baraka"), now=NOW)
+            propose(conn, provider, kind)
+        case Kind.CONVERT:
+            fund(conn)
+            propose(conn, provider, kind, target="1000.00")
+    return confirm(conn)
+
+
+NO_RECEIPT_KINDS = [Kind.ADD_PAYEE, Kind.ALLOWANCE_SET, Kind.UNFREEZE, Kind.CONVERT]
+
+
+@pytest.mark.parametrize("kind", NO_RECEIPT_KINDS)
+def test_a_kind_with_no_receipt_tells_the_main_payer_once_on_each_channel(conn, provider, kind):
+    # Bug caught: the PIN page saying "Done" while the chat and WhatsApp stay silent, or a message sent twice.
+    give_whatsapp(conn)
+    proposal_id = confirmed_without_receipt(conn, provider, kind)
+    last = newest_outbox_id(conn)
+    assert run(conn, provider, proposal_id).status == "executed"
+    sent = sent_since(conn, last)
+    assert [channel for channel, _ in sent] == ["web", "whatsapp"]
+    assert all(text.startswith("Done: ") for _, text in sent)
+
+
+@pytest.mark.parametrize("kind", NO_RECEIPT_KINDS)
+def test_the_outcome_note_has_no_link_and_no_token(conn, provider, kind):
+    # Bug caught: a confirm-link URL leaking into a second outbox message, where it would be shown again and again.
+    proposal_id = confirmed_without_receipt(conn, provider, kind)
+    last = newest_outbox_id(conn)
+    run(conn, provider, proposal_id)
+    note = " ".join(text for _, text in sent_since(conn, last))
+    assert note and "/confirm/" not in note and "http" not in note
+
+
+def test_the_note_for_a_new_payee_names_them_in_plain_words(conn, provider):
+    # Bug caught: a note in system words ("trusted payee") that the family has to translate.
+    proposal_id = confirmed_without_receipt(conn, provider, Kind.ADD_PAYEE)
+    last = newest_outbox_id(conn)
+    run(conn, provider, proposal_id)
+    assert sent_since(conn, last) == [
+        ("web", "Done: Jonathan Siror is now a saved recipient. You can ask me to send money to them now.")
+    ]
+
+
+def test_a_confirmed_fee_payment_sends_only_its_receipt_on_each_channel(conn, provider):
+    # Bug caught: a "Done" note on top of the receipt, so the main payer is told the same payment twice.
+    give_whatsapp(conn)
+    fund(conn)
+    proposal_id = confirmed_fee_payment(conn, provider)
+    last = newest_outbox_id(conn)
+    assert run(conn, provider, proposal_id).status == "executed"
+    sent = sent_since(conn, last)
+    assert [channel for channel, _ in sent] == ["web", "whatsapp"]
+    assert all(text.startswith("Paid ") for _, text in sent)
+
+
+def test_running_a_kind_again_does_not_tell_the_main_payer_again(conn, provider):
+    # Bug caught: a retry of an executed proposal sending the "Done" note a second time.
+    proposal_id = confirmed_without_receipt(conn, provider, Kind.ADD_PAYEE)
+    run(conn, provider, proposal_id)
+    last = newest_outbox_id(conn)
+    assert run(conn, provider, proposal_id).status == "not_confirmed"
+    assert sent_since(conn, last) == []

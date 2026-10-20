@@ -1,7 +1,12 @@
 {% extends "base.html" %}
 {% block title %}{{ heading or "Karo" }} · Karo{% endblock %}
+{% block head_extra %}{% if auto_return %}<meta http-equiv="refresh" content="4;url=/chat">{% endif %}{% endblock %}
 {% block content %}
 {% if heading %}<h1>{{ heading }}</h1>{% endif %}
 <p class="notice {{ tone }}">{{ message }}</p>
-<p><a class="button" href="/chat">Back to the chat</a></p>
+<p>
+  {% if whatsapp_url %}<a class="button" href="{{ whatsapp_url }}">Back to WhatsApp</a>{% endif %}
+  <a class="button" href="/chat">Back to the chat</a>
+</p>
+{% if auto_return %}<p class="hint">Taking you back to the chat in a few seconds.</p>{% endif %}
 {% endblock %}

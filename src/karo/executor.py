@@ -230,11 +230,11 @@ def _carry_out(
         case Kind.ALLOWANCE_SET:
             return _allowance_set(conn, p, state, by, now)
         case Kind.ADD_PAYEE:
-            return _add_payee(conn, p, by, now)
+            return _add_payee(conn, p, state, by, now)
         case Kind.UNFREEZE:
-            return _unfreeze(conn, p, by, now)
+            return _unfreeze(conn, p, state, by, now)
         case Kind.CONVERT:
-            return _convert(conn, p, by, now)
+            return _convert(conn, p, state, by, now)
     return ExecutionOutcome("unsupported", "That kind of request can't be run yet.")
 
 
@@ -421,13 +421,41 @@ def _executed(conn: sqlite3.Connection, p: Proposal, now: datetime, message: str
     return ExecutionOutcome("executed", message)
 
 
+def done_text(p: Proposal, state: FamilyState) -> str:
+    """What a proposal that ran has done, in plain words. The reply to the PIN page, the note in the chat and the page
+    for a link used twice all say it the same way."""
+    payee = p.payee.name if p.payee is not None else "the payee"
+    match p.kind:
+        case Kind.PAY_FEE | Kind.SEND | Kind.ALLOWANCE_RUN:
+            return f"Paid {p.amount} to {payee}."
+        case Kind.ALLOWANCE_SET:
+            return f"The monthly allowance is now {p.amount} to {payee}, paid on day {ALLOWANCE_DAY}."
+        case Kind.SPLIT:
+            names = ", ".join(state.member(member_id).name for member_id, _ in p.split)
+            return f"Asked {names} for their shares of {p.amount}."
+        case Kind.ADD_PAYEE:
+            return f"{payee} is now a saved recipient. You can ask me to send money to them now."
+        case Kind.UNFREEZE:
+            return "Karo is unfrozen. Money can move again."
+        case Kind.CONVERT:
+            return f"Converted {p.quote.source} into {p.quote.target} (simulated: no real money moved)."
+    return "That has been done."
+
+
+def _done(conn: sqlite3.Connection, p: Proposal, state: FamilyState, now: datetime) -> ExecutionOutcome:
+    """For a kind with no receipt or payment link of its own: the main payer is told in the chat and on WhatsApp too,
+    because the PIN page is the only other place the result shows and she may have left it."""
+    message = done_text(p, state)
+    outbox.notify(conn, state.main_payer.id, f"Done: {message}", now)
+    return _executed(conn, p, now, message)
+
+
 def _split(
     conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime
 ) -> ExecutionOutcome | _SplitDone:
     fee = None if p.fee_id is None else store.get_fee(conn, p.family_id, p.fee_id)
     what = "the fees" if fee is None else f"the {fee['payee_name']} fees"
     asker = state.main_payer
-    names = []
     for member_id, amount in p.split:
         conn.execute(
             "INSERT INTO shares (id, family_id, fee_id, member_id, amount_minor, currency, created_at) "
@@ -435,7 +463,6 @@ def _split(
             (db.new_id("sh"), p.family_id, p.fee_id, member_id, amount.minor, amount.currency, iso(now)),
         )
         relative = state.member(member_id)
-        names.append(relative.name)
         if relative.id == asker.id:
             notice = f"Your own share of {what} is {amount}. A payment link will follow."
         else:
@@ -455,7 +482,7 @@ def _split(
             "shares": [{"member_id": member_id, "amount": str(amount)} for member_id, amount in p.split],
         },
     )
-    outcome = _executed(conn, p, now, f"Asked {', '.join(names)} for their shares of {p.amount}.")
+    outcome = _executed(conn, p, now, done_text(p, state))
     return outcome if p.fee_id is None else _SplitDone(outcome, p.fee_id)
 
 
@@ -484,12 +511,10 @@ def _allowance_set(
             "day_of_month": ALLOWANCE_DAY,
         },
     )
-    return _executed(
-        conn, p, now, f"The monthly allowance is now {p.amount} to {target.payee.name}, paid on day {ALLOWANCE_DAY}."
-    )
+    return _done(conn, p, state, now)
 
 
-def _add_payee(conn: sqlite3.Connection, p: Proposal, by: str, now: datetime) -> ExecutionOutcome:
+def _add_payee(conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime) -> ExecutionOutcome:
     payee_id = db.new_id("tp")
     conn.execute(
         "INSERT INTO trusted_payees (id, family_id, name, details_json, trusted_since, source) "
@@ -504,16 +529,16 @@ def _add_payee(conn: sqlite3.Connection, p: Proposal, by: str, now: datetime) ->
         event="payee.added",
         data={"proposal_id": p.id, "payee_id": payee_id, "name": p.payee.name},
     )
-    return _executed(conn, p, now, f"{p.payee.name} is now a trusted payee.")
+    return _done(conn, p, state, now)
 
 
-def _unfreeze(conn: sqlite3.Connection, p: Proposal, by: str, now: datetime) -> ExecutionOutcome:
+def _unfreeze(conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime) -> ExecutionOutcome:
     conn.execute("UPDATE families SET frozen = 0 WHERE id = ?", (p.family_id,))
     audit.record(conn, at=now, family_id=p.family_id, actor=by, event="family.unfrozen", data={"proposal_id": p.id})
-    return _executed(conn, p, now, "Karo is unfrozen. Money can move again.")
+    return _done(conn, p, state, now)
 
 
-def _convert(conn: sqlite3.Connection, p: Proposal, by: str, now: datetime) -> ExecutionOutcome:
+def _convert(conn: sqlite3.Connection, p: Proposal, state: FamilyState, by: str, now: datetime) -> ExecutionOutcome:
     quote = p.quote
     ledger.post(
         conn,
@@ -532,4 +557,4 @@ def _convert(conn: sqlite3.Connection, p: Proposal, by: str, now: datetime) -> E
         event="conversion.done",
         data={"proposal_id": p.id, "from": str(quote.source), "to": str(quote.target), "simulated": True},
     )
-    return _executed(conn, p, now, f"Converted {quote.source} into {quote.target} (simulated: no real money moved).")
+    return _done(conn, p, state, now)

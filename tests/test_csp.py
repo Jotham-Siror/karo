@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 # The fixtures and the PIN-page helper are the web tests' own: one way to build the app, not two.
-from test_web import make_site, seeded_db, settings, site, start  # noqa: F401
+from test_web import add_jonathan, enter, make_site, seeded_db, settings, site, start  # noqa: F401
 
 TEMPLATES = Path(__file__).parent.parent / "src" / "karo" / "web" / "templates"
 PAGE_TEMPLATES = sorted(p for p in TEMPLATES.glob("*.html") if p.name != "base.html")
@@ -70,6 +70,14 @@ def test_the_policy_blocks_plugins_and_a_changed_base_address(site):
 def test_the_policy_falls_back_to_this_site_for_anything_it_does_not_name(site):
     # Catches: a source type missing from the list (frames, media, workers) being open to every site.
     assert policy_of(page_at(site, "/"))["default-src"] == "'self'"
+
+
+def test_the_policy_is_still_the_first_element_on_the_page_that_returns_to_the_chat(site):
+    # Catches: the refresh meta placed ahead of the policy meta, which would leave that page outside the policy.
+    site.login()
+    page = enter(site, add_jonathan(site)).text
+    assert 'http-equiv="refresh"' in page
+    policy_of(page)
 
 
 def test_every_page_template_gets_the_policy_from_the_base_template():
